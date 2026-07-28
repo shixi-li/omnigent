@@ -48,6 +48,7 @@ class AcpAgentEntry:
         in ``session/new``; see :class:`omnigent.inner.acp_executor.AcpAgentConfig`).
     :param session_id_mode: ``"server"`` (default) or ``"client"``.
     :param send_model: Send the model in ``session/new`` (Qwen-shaped agents).
+    :param omnigent_mcp: Lend Omnigent's builtin MCP relay in ``session/new``.
     """
 
     slug: str
@@ -56,6 +57,7 @@ class AcpAgentEntry:
     model: str | None = None
     session_id_mode: str = "server"
     send_model: bool = False
+    omnigent_mcp: bool = True
 
 
 def slugify(name: str) -> str:
@@ -117,6 +119,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 model=model.strip() if isinstance(model, str) and model.strip() else None,
                 session_id_mode=mode if mode in ("server", "client") else "server",
                 send_model=bool(raw.get("send_model", False)),
+                omnigent_mcp=bool(raw.get("omnigent_mcp", True)),
             )
         )
     return entries
@@ -154,6 +157,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["session_id_mode"] = e.session_id_mode
         if e.send_model:
             item["send_model"] = True
+        if not e.omnigent_mcp:
+            item["omnigent_mcp"] = False
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
 

@@ -1579,6 +1579,7 @@ def _build_acp_spawn_env(
         env["HARNESS_ACP_SESSION_ID_MODE"] = agent.session_id_mode
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
+        env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
 
         model = _resolve_spec_model(spec)
         if model is not None and not model.startswith(("databricks-", "databricks/")):
