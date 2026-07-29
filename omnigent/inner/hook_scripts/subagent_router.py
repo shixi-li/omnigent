@@ -1,7 +1,8 @@
 """Shared subagent-routing decision logic for harness hooks.
 
-Stdlib-only on purpose: the Claude-native hook runs as a per-spawn
-subprocess (``python -I -m
+Stdlib-only on purpose (bar the equally light
+:mod:`omnigent.claude_model_vocabulary`): the Claude-native hook runs as
+a per-spawn subprocess (``python -I -m
 omnigent.inner.hook_scripts.claude_router_hook``) and blocks the spawn,
 so importing anything heavier would show up as spawn latency. The
 claude-agent-sdk executor imports the same functions for its in-process
@@ -20,9 +21,12 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES, claude_model_alias
 
 # Advertisement file written by the runner's subagent-routing endpoint,
 # mirroring the ``tool_relay.json`` discovery pattern.
@@ -57,6 +61,12 @@ _FORK_SUFFIXES = ("-fork", "_fork", ":fork")
 # extraction call), but a spawn must not hang forever on a wedged
 # runner.
 REQUEST_TIMEOUT_S = 30.0
+
+# Claude Code's Agent/Task ``model`` parameter is a closed enum of family
+# aliases — a servable catalog id ("databricks-claude-sonnet-5") fails its
+# schema and the spawn dies. Same vocabulary as ``/model``, so the
+# translation lives in one place.
+AGENT_TOOL_MODEL_ALIASES: tuple[str, ...] = CLAUDE_MODEL_ALIASES
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,27 @@ def resolve_parent_model(bridge_dir: str | Path | None) -> str | None:
     """
     model = _read_bridge_config(bridge_dir).get("launch_model")
     return model if isinstance(model, str) and model else None
+
+
+def resolve_model_vocabulary_env(bridge_dir: str | Path | None) -> Mapping[str, str] | None:
+    """
+    Resolve the session's alias pinning for model translation.
+
+    :param bridge_dir: Claude-native bridge directory whose
+        ``bridge.json`` records the launch env's model keys.
+    :returns: The recorded ``{env var: model id}`` mapping, or ``None``
+        to fall back to this process's environment (a hook subprocess
+        inherits the CLI's).
+    """
+    model_env = _read_bridge_config(bridge_dir).get("model_env")
+    if not isinstance(model_env, dict):
+        return None
+    resolved = {
+        str(key): str(value)
+        for key, value in model_env.items()
+        if isinstance(key, str) and isinstance(value, str) and value
+    }
+    return resolved or None
 
 
 def _read_bridge_config(
@@ -279,6 +310,23 @@ def _deny(reason: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # hook 
     }
 
 
+def claude_agent_tool_model(
+    model: str,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """
+    Translate a servable model id into Claude's Agent-tool vocabulary.
+
+    :param model: Model id from the routing decision, or an alias.
+    :param env: Environment mapping holding the workspace's alias
+        pinning. ``None`` uses :data:`os.environ`.
+    :returns: An accepted alias, or ``None`` when the id maps to nothing
+        Claude would accept — callers must then leave the spawn alone
+        rather than inject a value the CLI rejects.
+    """
+    return claude_model_alias(model, env)
+
+
 def redirect_reason(harness: str, model: str) -> str:
     """
     Build the cross-harness redirect instruction shown to the model.
@@ -296,12 +344,20 @@ def redirect_reason(harness: str, model: str) -> str:
 def decision_to_hook_output(
     decision: dict[str, Any],  # type: ignore[explicit-any]  # JSON response body
     tool_input: dict[str, Any],  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
+    *,
+    model_translator: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook output JSON
     """
     Map a ``route-subagent`` decision to Claude ``PreToolUse`` output.
 
     :param decision: Decoded endpoint response.
     :param tool_input: Original ``tool_input``, preserved on rewrite.
+    :param model_translator: Converts the decision's servable model id
+        into the spawn tool's own ``model`` vocabulary, returning ``None``
+        when it maps to nothing the tool accepts (the spawn is then
+        allowed unchanged — a degraded model beats a dead spawn, and an
+        unacceptable value beats neither). ``None`` injects the id as-is,
+        which is what codex's ``spawn_agent`` expects.
     :returns: Hook output, or ``None`` for "no opinion" (allow the spawn
         unchanged with no emitted decision).
     """
@@ -310,7 +366,14 @@ def decision_to_hook_output(
     rationale = decision.get("rationale")
     rationale = rationale if isinstance(rationale, str) else ""
     if action == "rewrite" and isinstance(model, str) and model:
-        return _allow_with_model(tool_input, model, rationale)
+        if model_translator is None:
+            return _allow_with_model(tool_input, model, rationale)
+        translated = model_translator(model)
+        if translated is None:
+            return None
+        if translated != model:
+            rationale = f"{rationale} (applied as {translated!r})".strip()
+        return _allow_with_model(tool_input, translated, rationale)
     if action == "redirect":
         harness = decision.get("harness")
         if isinstance(harness, str) and harness and isinstance(model, str) and model:
@@ -342,8 +405,9 @@ def route_pre_tool_use(
     :param parent_model: Model the parent session runs on, when known.
     :param timeout: Socket timeout in seconds.
     :returns: Hook output, or ``None`` for "no opinion" — every failure
-        (no advertisement, unreachable router, malformed response) lands
-        here so a spawn is never blocked by routing infrastructure.
+        (no advertisement, unreachable router, malformed response, a model
+        id with no Agent-tool alias) lands here so a spawn is never
+        blocked by routing infrastructure.
     """
     if not is_agent_tool(payload.get("tool_name")):
         return None
@@ -364,4 +428,10 @@ def route_pre_tool_use(
     decision = request_decision(endpoint, session_id, body, timeout=timeout)
     if decision is None:
         return None
-    return decision_to_hook_output(decision, tool_input)
+    # Claude's Agent tool takes family aliases, not catalog ids.
+    vocabulary_env = resolve_model_vocabulary_env(bridge_dir or router_dir)
+    return decision_to_hook_output(
+        decision,
+        tool_input,
+        model_translator=lambda model: claude_agent_tool_model(model, vocabulary_env),
+    )

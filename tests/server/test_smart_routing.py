@@ -111,6 +111,41 @@ def test_infer_models_pi() -> None:
     assert any("gpt" in m for m in models)
 
 
+def test_model_lists_cover_current_claude_generations() -> None:
+    """A stale list turns a live model into an unservable arm (sonnet-5 → haiku)."""
+    models = infer_models("claude-sdk")
+    assert models is not None
+    assert "databricks-claude-sonnet-5" in models
+
+
+def test_model_lists_ordered_by_capability_within_each_family() -> None:
+    """Curated order must agree with the capability ranking the seam uses."""
+    from omnigent.server.smart_routing import MODEL_LISTS, _capability_key, _model_family
+
+    for family, models in MODEL_LISTS.items():
+        for vendor in {_model_family(m) for m in models}:
+            same_vendor = [m for m in models if _model_family(m) == vendor]
+            keys = [_capability_key(m) for m in same_vendor]
+            assert keys == sorted(keys), f"{family}/{vendor} is not cheapest → most capable"
+
+
+def test_catalog_models_for_harness_matches_worker_rows() -> None:
+    from omnigent.server.smart_routing import catalog_models_for_harness
+
+    catalog = {
+        "self": ["databricks-claude-sonnet-5"],
+        "codex": ["databricks-gpt-5-5"],
+    }
+    # A worker row for the counterpart family, matched by family not id.
+    assert catalog_models_for_harness(catalog, "codex-native") == ["databricks-gpt-5-5"]
+    # "self" only counts for the session's own harness.
+    assert catalog_models_for_harness(catalog, "claude-native") is None
+    assert catalog_models_for_harness(catalog, "claude-native", allow_self=True) == [
+        "databricks-claude-sonnet-5"
+    ]
+    assert catalog_models_for_harness(None, "claude-native", allow_self=True) is None
+
+
 def test_infer_models_unknown_harness() -> None:
     assert infer_models("cursor") is None
     assert infer_models("antigravity") is None
@@ -1504,6 +1539,32 @@ def test_unservable_opus_substitutes_most_capable_claude() -> None:
 def test_unservable_cheap_claude_arm_avoids_the_flagship() -> None:
     catalog = ("databricks-claude-opus-4-7", "databricks-claude-sonnet-4-6")
     assert _substitute("claude-sonnet-5", catalog, "claude-sdk") == "databricks-claude-sonnet-4-6"
+
+
+def test_cheap_arm_never_falls_below_its_own_class() -> None:
+    """A sonnet-class arm takes the older sonnet, not the cheapest real model."""
+    catalog = (
+        "databricks-claude-haiku-4-5",
+        "databricks-claude-sonnet-4-6",
+        "databricks-claude-opus-4-8",
+    )
+    assert _substitute("claude-sonnet-5", catalog, "claude-sdk") == "databricks-claude-sonnet-4-6"
+
+
+def test_cheap_arm_falls_back_to_cheapest_when_nothing_at_or_below() -> None:
+    catalog = ("databricks-claude-opus-4-7", "databricks-claude-opus-4-8")
+    assert _substitute("claude-sonnet-5", catalog, "claude-sdk") == "databricks-claude-opus-4-7"
+
+
+def test_sonnet_5_is_applied_exactly_when_servable() -> None:
+    """The live-catalog case: exact prefix restore, no substitution at all."""
+    catalog = (
+        "databricks-claude-haiku-4-5",
+        "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
+        "databricks-claude-opus-4-8",
+    )
+    assert _substitute("claude-sonnet-5", catalog, "claude-sdk") == "databricks-claude-sonnet-5"
 
 
 def test_config_supplied_menu_without_tiers_defaults_to_capable() -> None:

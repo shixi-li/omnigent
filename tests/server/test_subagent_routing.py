@@ -123,6 +123,28 @@ def test_candidate_models_stays_in_family_by_default() -> None:
     assert CLAUDE_MODEL in candidates["claude-native"]
 
 
+def test_candidate_models_prefers_the_live_catalog() -> None:
+    """A model the workspace serves today must not look unservable."""
+    catalog = {"self": ["databricks-claude-sonnet-5", "databricks-claude-opus-4-8"]}
+    candidates = candidate_models("claude-native", catalog=catalog)
+    assert candidates == {
+        "claude-native": ["databricks-claude-sonnet-5", "databricks-claude-opus-4-8"]
+    }
+
+
+def test_candidate_models_falls_back_to_the_static_table_per_harness() -> None:
+    catalog = {"self": ["databricks-claude-sonnet-5"]}
+    candidates = candidate_models("claude-native", cross_harness=True, catalog=catalog)
+    assert candidates["claude-native"] == ["databricks-claude-sonnet-5"]
+    # No codex row in the catalog — the static table fills that harness in.
+    assert GPT_MODEL in candidates["codex-native"]
+
+
+def test_candidate_models_ignores_an_empty_catalog() -> None:
+    candidates = candidate_models("claude-native", catalog={})
+    assert CLAUDE_MODEL in candidates["claude-native"]
+
+
 def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
     candidates = candidate_models("claude-native", cross_harness=True)
     assert set(candidates) == {"claude-native", "codex-native"}
@@ -147,6 +169,25 @@ async def test_same_family_pick_rewrites() -> None:
     assert decision.raw_model == CLAUDE_MODEL
     assert decision.rationale == "deep reasoning"
     assert len(decision.decision_id) == 36
+
+
+@pytest.mark.asyncio
+async def test_live_catalog_pick_is_applied_exactly() -> None:
+    """A live-catalog model is offered and applied verbatim — no substitution."""
+    client = _FakeRoutingClient(
+        RoutingResult(model="databricks-claude-sonnet-5", rationale="r", harness="claude-sdk")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(),
+        caps=_FakeCaps(routing_client=client),
+        catalog={"self": ["databricks-claude-sonnet-5", "databricks-claude-opus-4-8"]},
+    )
+    assert client.calls[0][1] == {
+        "claude-native": ["databricks-claude-sonnet-5", "databricks-claude-opus-4-8"]
+    }
+    assert decision.action == "rewrite"
+    assert decision.model == "databricks-claude-sonnet-5"
 
 
 @pytest.mark.asyncio

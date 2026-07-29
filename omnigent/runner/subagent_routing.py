@@ -206,6 +206,13 @@ class SubagentRouteRequest:
 class SubagentRouteDecision:
     """The verdict a hook script enforces on a spawn.
 
+    ``model`` is always a servable catalog id (e.g.
+    ``"databricks-claude-sonnet-5"``) — never a harness's own tool
+    vocabulary. Translating it is the harness hook's job: Claude Code's
+    Agent/Task ``model`` parameter, for instance, only accepts the tier
+    aliases ``sonnet``/``opus``/``haiku``/``fable`` and rejects a catalog id
+    outright, so its hook inverse-maps before rewriting ``updatedInput``.
+
     :param action: ``"allow"`` (spawn unchanged), ``"rewrite"`` (same
         harness, injected model), ``"redirect"`` (cross-harness — deny
         and tell the model to use ``sys_session_send``) or ``"deny"``.
@@ -405,7 +412,12 @@ def _harness_family(harness: str) -> str | None:
     return _HARNESS_FAMILY.get(harness)
 
 
-def candidate_models(harness: str, *, cross_harness: bool = False) -> dict[str, list[str]]:
+def candidate_models(
+    harness: str,
+    *,
+    cross_harness: bool = False,
+    catalog: Mapping[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
     """Build the harness → models map offered to the router.
 
     In-family by default: a Claude Code session must not be told to move a
@@ -417,16 +429,23 @@ def candidate_models(harness: str, *, cross_harness: bool = False) -> dict[str, 
 
     :param harness: Requesting harness id, e.g. ``"codex-native"``.
     :param cross_harness: ``True`` to also offer the counterpart family.
+    :param catalog: Live per-session model catalog keyed by worker name
+        (:func:`omnigent.server.smart_routing.fetch_runner_models`). Preferred
+        over the static table so a model generation the workspace serves today
+        isn't treated as unservable; the static table fills any harness the
+        catalog has no row for.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
-    from omnigent.server.smart_routing import infer_models
+    from omnigent.server.smart_routing import catalog_models_for_harness, infer_models
 
     offered = (harness, _COUNTERPART_HARNESS.get(harness)) if cross_harness else (harness,)
     result: dict[str, list[str]] = {}
     for candidate in offered:
         if candidate is None or candidate in result:
             continue
-        models = infer_models(candidate)
+        models = catalog_models_for_harness(
+            catalog, candidate, allow_self=candidate == harness
+        ) or infer_models(candidate)
         if models:
             result[candidate] = list(models)
     return result
@@ -470,6 +489,7 @@ async def resolve_subagent_route(
     *,
     caps: Any = None,
     available_models: dict[str, list[str]] | None = None,
+    catalog: Mapping[str, list[str]] | None = None,
     cross_harness: bool = False,
     persist: Callable[[RoutingDecisionData], Awaitable[None]] | None = None,
     now: float | None = None,
@@ -482,6 +502,9 @@ async def resolve_subagent_route(
         process-global caps.
     :param available_models: Candidate harness → models map. ``None``
         derives it from the requesting harness.
+    :param catalog: Live per-session model catalog, preferred over the
+        static table when deriving candidates. Ignored when
+        *available_models* is given.
     :param cross_harness: ``True`` when the session may move a subagent to
         the counterpart harness family (auto-harness sessions only).
         Ignored when *available_models* is given.
@@ -498,7 +521,7 @@ async def resolve_subagent_route(
     clock = time.time() if now is None else now
 
     decision = await _decide(
-        session_id, req, caps, settings, available_models, cross_harness, clock
+        session_id, req, caps, settings, available_models, catalog, cross_harness, clock
     )
     emit_routing_event(
         ROUTING_EVENT_DECISION,
@@ -527,6 +550,7 @@ async def _decide(
     caps: Any,
     settings: _Settings,
     available_models: dict[str, list[str]] | None,
+    catalog: Mapping[str, list[str]] | None,
     cross_harness: bool,
     clock: float,
 ) -> SubagentRouteDecision:
@@ -549,7 +573,7 @@ async def _decide(
     candidates = (
         available_models
         if available_models is not None
-        else candidate_models(req.harness, cross_harness=cross_harness)
+        else candidate_models(req.harness, cross_harness=cross_harness, catalog=catalog)
     )
     if not candidates:
         return _fail_mode_decision(settings, f"no candidate models for harness {req.harness}")

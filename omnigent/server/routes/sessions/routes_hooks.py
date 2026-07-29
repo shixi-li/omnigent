@@ -1139,6 +1139,31 @@ def register_hooks_routes(
             media_type="application/json",
         )
 
+    async def _route_subagent_catalog(session_id: str) -> dict[str, list[str]] | None:
+        """
+        Fetch the session's live model catalog for subagent routing.
+
+        :param session_id: Parent session/conversation id.
+        :returns: Worker → servable model ids, or ``None`` when the runner
+            is unreachable (callers fall back to the static table).
+        """
+        from omnigent.server.smart_routing import fetch_runner_models
+
+        try:
+            runner_client = await _get_runner_client(
+                session_id, runner_router or get_server_runner_router()
+            )
+            if runner_client is None:
+                return None
+            return await fetch_runner_models(session_id, runner_client)
+        except Exception:
+            _logger.debug(
+                "route-subagent: live catalog unavailable for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
     @router.post(
         "/sessions/{session_id}/hooks/route-subagent",
         # Internal runner relay — hidden from the public API reference.
@@ -1239,10 +1264,15 @@ def register_hooks_routes(
         cross_harness = conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1" or (
             parent is not None and parent.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
         )
+        # Offer the live catalog: the static table lags model generations, and
+        # a pick the workspace serves must not look unservable and get
+        # substituted down a tier.
+        catalog = await _route_subagent_catalog(session_id)
         decision = await resolve_subagent_route(
             session_id,
             route_request,
             caps=get_caps(),
+            catalog=catalog,
             cross_harness=cross_harness,
             persist=store_persister(session_id, conversation_store),
         )

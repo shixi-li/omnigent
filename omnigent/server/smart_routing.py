@@ -30,12 +30,17 @@ ROUTES_SELECT_PATH = "routes:select"
 
 # ── Model lists per harness family ──────────────────────────────────────────
 #
-# Ordered cheapest → most powerful within each family.
+# Ordered cheapest → most powerful within each family, and kept in step with
+# the model generations actually served today: a stale list makes a router pick
+# look unservable and pushes it through the substitution path (a routed
+# sonnet-5 landing on haiku). Live per-session catalogs win wherever one is in
+# reach (:func:`fetch_runner_models`); this table is the fallback.
 
 MODEL_LISTS: dict[str, list[str]] = {
     "claude": [
         "databricks-claude-haiku-4-5",
         "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
         "databricks-claude-opus-4-8",
     ],
     "gpt": [
@@ -50,9 +55,10 @@ MODEL_LISTS: dict[str, list[str]] = {
         "databricks-claude-haiku-4-5",
         "databricks-gpt-5-4-mini",
         "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
         "databricks-gpt-5-4",
-        "databricks-claude-opus-4-8",
         "databricks-gpt-5-5",
+        "databricks-claude-opus-4-8",
     ],
 }
 
@@ -77,6 +83,50 @@ def infer_models(harness: str | None) -> list[str] | None:
     if family is None:
         return None
     return MODEL_LISTS.get(family)
+
+
+def catalog_models_for_harness(
+    catalog: Mapping[str, list[str]] | None,
+    harness: str,
+    *,
+    allow_self: bool = False,
+) -> list[str] | None:
+    """Pull *harness*'s models out of a live runner catalog.
+
+    Catalog rows are keyed by WORKER name (sub-agent names plus ``"self"``),
+    not harness id, so match a harness id first, then a worker whose harness
+    shares the family, then — only for the session's own harness — the
+    ``"self"`` row.
+
+    :param catalog: :func:`fetch_runner_models` result, or ``None``.
+    :param harness: Harness id whose models are wanted, e.g.
+        ``"claude-native"``.
+    :param allow_self: ``True`` when *harness* is the catalog session's own
+        harness, so its ``"self"`` row applies.
+    :returns: Servable model ids, or ``None`` when the catalog has no row
+        for this harness.
+    """
+    if not catalog:
+        return None
+    own = catalog.get(harness)
+    if own:
+        return list(own)
+    family = _HARNESS_FAMILY.get(harness)
+    for worker, models in catalog.items():
+        if not models:
+            continue
+        worker_harness = _WORKER_NAME_TO_HARNESS.get(worker)
+        if worker_harness is None:
+            continue
+        if worker_harness == harness or (
+            family is not None and _HARNESS_FAMILY.get(worker_harness) == family
+        ):
+            return list(models)
+    if allow_self:
+        models = catalog.get("self")
+        if models:
+            return list(models)
+    return None
 
 
 # ── RoutingClient protocol ──────────────────────────────────────────────────
@@ -842,9 +892,13 @@ class TaskV1RouteOptionSource:
         The router requires (and selects) arms this workspace may not serve,
         e.g. ``gpt-5-6-sol``. Stay in the arm's family, then substitute by the
         arm's tier: a capable arm takes the most capable servable id, a cheap
-        arm the cheapest one that is still a real coding model (a nano endpoint
-        only when nothing else exists). Capability comes from
-        :func:`_capability_key`, never from catalog order.
+        arm the nearest one at or below its own class — never the globally
+        cheapest, so a sonnet-class arm lands on an older sonnet rather than
+        falling to haiku. The arm's own class is only known when the curated
+        ordering lists it (:data:`MODEL_LISTS`); an unlisted cheap arm keeps
+        the cheapest real coding model (a nano endpoint only when nothing else
+        exists). Capability comes from :func:`_capability_key`, never from
+        catalog order.
         """
         pool = list(catalog.get(harness or "", []))
         if not pool:
@@ -856,8 +910,25 @@ class TaskV1RouteOptionSource:
         ranked = sorted(pool, key=_capability_key)
         if self._arm_tier(arm) == ARM_TIER_CHEAP:
             sensible = [m for m in ranked if _size_class(_bare_id(m)) >= _MIN_SENSIBLE_SIZE_CLASS]
-            return (sensible or ranked)[0]
+            candidates = sensible or ranked
+            at_or_below = self._at_or_below(arm, candidates)
+            if at_or_below:
+                return at_or_below[-1]
+            return candidates[0]
         return ranked[-1]
+
+    @staticmethod
+    def _at_or_below(arm: str, ranked: Sequence[str]) -> list[str]:
+        """Models no more capable than *arm*, when the arm's class is known.
+
+        Empty when the curated ordering doesn't list the arm: its class can't
+        be placed, so the caller falls back to cheapest-sensible.
+        """
+        bare = _bare_id(arm).lower()
+        if _listed_rank(bare, _model_family(arm)) < 0:
+            return []
+        arm_key = _capability_key(arm)
+        return [m for m in ranked if _capability_key(m) <= arm_key]
 
     def _arm_tier(self, arm: str) -> str:
         """Return the tier of *arm*, defaulting unknown arms to capable."""

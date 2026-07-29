@@ -67,7 +67,7 @@ def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.Mo
         _payload(),
         {
             "action": "rewrite",
-            "model": "routed-model",
+            "model": "databricks-claude-haiku-4-5",
             "raw_model": "router-vocab-model",
             "rationale": "cheapest arm",
             "decision_id": "dec-1",
@@ -80,10 +80,98 @@ def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.Mo
             "updatedInput": {
                 "subagent_type": "code-reviewer",
                 "prompt": "review the diff",
-                "model": "routed-model",
+                # Claude's Agent tool takes tier aliases, never catalog ids.
+                "model": "haiku",
             },
-            "permissionDecisionReason": "cheapest arm",
+            "permissionDecisionReason": "cheapest arm (applied as 'haiku')",
         }
+    }
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("databricks-claude-sonnet-5", "sonnet"),
+        ("databricks-claude-sonnet-4-6", "sonnet"),
+        ("databricks-claude-haiku-4-5", "haiku"),
+        ("databricks-claude-opus-4-8", "opus"),
+        ("databricks-claude-fable-5", "fable"),
+        ("system.ai.claude-sonnet-5", "sonnet"),
+        ("claude-opus-4-8[1m]", "opus"),
+        ("sonnet", "sonnet"),
+        ("databricks-gpt-5-5", None),
+        ("mystery-model", None),
+        ("", None),
+    ],
+)
+def test_agent_tool_model_translation(model: str, expected: str | None) -> None:
+    assert subagent_router.claude_agent_tool_model(model, env={}) == expected
+
+
+def test_agent_tool_model_prefers_workspace_alias_pinning() -> None:
+    # The workspace pins "sonnet" to a model whose own name says otherwise;
+    # the env mapping is authoritative over the name heuristic.
+    env = {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-mystery-9"}
+    assert subagent_router.claude_agent_tool_model("databricks-claude-mystery-9", env=env) == (
+        "sonnet"
+    )
+
+
+def test_untranslatable_model_allows_spawn_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An id with no Agent-tool alias must not be injected — the CLI 400s."""
+    router_dir = _advertise(tmp_path)
+    for env_var in ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"):
+        monkeypatch.delenv(env_var, raising=False)
+    out, _requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "rewrite", "model": "mystery-model", "rationale": "r", "decision_id": "d"},
+    )
+    assert out is None
+
+
+def test_bridge_recorded_pinning_gates_the_translation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch pinning recorded on the bridge decides what's spellable."""
+    router_dir = _advertise(tmp_path)
+    (tmp_path / "bridge.json").write_text(
+        json.dumps(
+            {
+                "active_session_id": "conv_abc",
+                # Only opus is pinned to a gateway id, so a routed sonnet has
+                # no accepted spelling — "sonnet" would resolve to a vendor id
+                # the gateway rejects.
+                "model_env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
+            }
+        )
+    )
+    decision = {
+        "action": "rewrite",
+        "model": "databricks-claude-sonnet-5",
+        "rationale": "r",
+        "decision_id": "d",
+    }
+    out, _requests = _run_hook(monkeypatch, router_dir, _payload(), decision)
+    assert out is None
+
+    decision["model"] = "databricks-claude-opus-4-8"
+    out, _requests = _run_hook(monkeypatch, router_dir, _payload(), decision)
+    assert out is not None
+    assert out["hookSpecificOutput"]["updatedInput"]["model"] == "opus"
+
+
+def test_codex_style_output_keeps_the_catalog_id() -> None:
+    """Without a translator the servable id is injected verbatim (codex)."""
+    decision = {"action": "rewrite", "model": "databricks-gpt-5-5", "rationale": "r"}
+    output = subagent_router.decision_to_hook_output(decision, {"task_name": "t"})
+    assert output is not None
+    assert output["hookSpecificOutput"]["updatedInput"] == {
+        "task_name": "t",
+        "model": "databricks-gpt-5-5",
     }
 
 
@@ -221,10 +309,15 @@ def test_legacy_task_tool_name_is_routed(tmp_path: Path, monkeypatch: pytest.Mon
         monkeypatch,
         router_dir,
         _payload(tool_name="Task"),
-        {"action": "rewrite", "model": "routed-model", "rationale": "", "decision_id": "d"},
+        {
+            "action": "rewrite",
+            "model": "databricks-claude-sonnet-5",
+            "rationale": "",
+            "decision_id": "d",
+        },
     )
     assert out is not None
-    assert out["hookSpecificOutput"]["updatedInput"]["model"] == "routed-model"
+    assert out["hookSpecificOutput"]["updatedInput"]["model"] == "sonnet"
 
 
 def test_malformed_stdin_allows_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,14 +416,15 @@ async def test_sdk_callback_maps_rewrite(tmp_path: Path, monkeypatch: pytest.Mon
         timeout: float = 0.0,
     ) -> dict[str, Any]:
         bodies.append(body)
-        return {"action": "rewrite", "model": "routed-model", "rationale": "r"}
+        return {"action": "rewrite", "model": "databricks-claude-sonnet-5", "rationale": "r"}
 
     monkeypatch.setattr(subagent_router, "request_decision", fake_request)
     options = _install()
     assert options.hooks is not None
     callback = options.hooks["PreToolUse"][0].hooks[0]
     output = await callback(_payload(), "toolu_1", {"signal": None})
-    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "routed-model"
+    # The SDK callback shares the hook's translation: alias, not catalog id.
+    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "sonnet"
     assert bodies[0]["harness"] == "claude-sdk"
     assert bodies[0]["parent_model"] == "parent-model"
 
