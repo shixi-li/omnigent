@@ -214,6 +214,18 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
+// The Auto Harness's Permissions vocabulary: Default only. A mode picked here
+// would have to apply to whichever harness the router picks, and no
+// cross-harness mapping exists yet — so the row stays locked and the create
+// call sends no override, leaving each CLI on the machine's own configuration.
+const AUTO_PERMISSION_MODES: readonly { value: string; label: string; description: string }[] = [
+  {
+    value: CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    label: "Default",
+    description: "The picked harness keeps its own configured permissions",
+  },
+];
+
 // Cursor execution modes. "default" sends no flags; other values map to CLI
 // args passed via terminal_launch_args. Keep in sync with `cursor-agent --help`.
 const CURSOR_NATIVE_DEFAULT_EXEC_MODE = "default";
@@ -1365,13 +1377,6 @@ function HarnessConfigModal({
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
     }
-    if (autoRouting) {
-      // One permission value for whichever harness the router picks. Remembered
-      // under the sentinel's own key — a bundle agent has no native harness to
-      // key it on, and the value must not leak into a real harness's knobs.
-      setPermissionMode(draftPermission);
-      writeHarnessOption(AUTO_HARNESS_ID, { mode: draftPermission });
-    }
     // Intelligent Routing rides the Model dropdown on both routable harnesses
     // (Claude Code and Codex), so commit it outside the per-capability branches.
     if (smartRoutingEligible) setCostControlMode(draftRouting);
@@ -1398,16 +1403,19 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {/* Fully-auto: the router owns harness + model, so the only knob is
-          the permission value propagated to whichever harness it picks. */}
+          {/* Fully-auto: the router owns harness + model, so the only row left is
+          Permissions — and it is locked to Default until a cross-harness
+          permission mapping exists. Default means "send no override", so the
+          picked harness inherits the machine's own Claude Code / Codex config. */}
           {autoRouting && (
             <ConfigRow label="Permissions" description="What the agent can do without asking">
               <DescribedSelect
-                value={draftPermission}
-                onValueChange={setDraftPermission}
-                options={CLAUDE_NATIVE_PERMISSION_MODES}
+                value={CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE}
+                onValueChange={() => {}}
+                options={AUTO_PERMISSION_MODES}
                 testId="new-chat-landing-config-permission"
                 ariaLabel="Permissions"
+                disabled
               />
             </ConfigRow>
           )}
@@ -2258,14 +2266,9 @@ export function NewChatLandingScreen() {
     selectedAgent.harness in brainHarnessLabels;
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (autoRoutingSelected) {
-      return [
-        {
-          label: "Permissions",
-          value:
-            CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ??
-            permissionMode,
-        },
-      ];
+      // Locked to Default in the modal, so report the constant — never a mode
+      // left over in state from a previously selected native harness.
+      return [{ label: "Permissions", value: AUTO_PERMISSION_MODES[0].label }];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -2397,17 +2400,13 @@ export function NewChatLandingScreen() {
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNativeHarness, claudeModelOptions]);
-  // The Auto Harness carries one permission value for whichever harness the
-  // router picks, remembered under the sentinel's own key (a bundle agent has no
-  // native harness to key it on). Seeded on entering fully-auto.
+  // The Auto Harness pins permissions to Default (no override sent), so entering
+  // fully-auto resets the mode rather than restoring one: nothing is remembered
+  // for the sentinel, and a value left over from a previously selected native
+  // harness must not ride along into the router's pick.
   useEffect(() => {
     if (pickedHarness !== AUTO_HARNESS_ID) return;
-    const stored = readHarnessOptions(AUTO_HARNESS_ID);
-    setPermissionMode(
-      stored.mode != null && CLAUDE_NATIVE_PERMISSION_MODES.some((m) => m.value === stored.mode)
-        ? stored.mode
-        : CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
-    );
+    setPermissionMode(CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE);
   }, [pickedHarness]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must

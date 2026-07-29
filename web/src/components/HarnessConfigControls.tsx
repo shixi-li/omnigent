@@ -76,6 +76,8 @@ export function ConfigRow({
  * @param testId Trigger test id.
  * @param ariaLabel Accessible name for the trigger (the visible ConfigRow
  *   label is visual-only, so pass it here to name the control for AT).
+ * @param disabled Locks the control: the value shows but the list can't open.
+ *   Used for a row whose value isn't the user's to choose (yet).
  */
 export function DescribedSelect({
   value,
@@ -83,12 +85,14 @@ export function DescribedSelect({
   options,
   testId,
   ariaLabel,
+  disabled,
 }: {
   value: string;
   onValueChange: (value: string) => void;
   options: readonly { value: string; label: string; description: string }[];
   testId: string;
   ariaLabel: string;
+  disabled?: boolean;
 }) {
   const [previewed, setPreviewed] = useState<string | null>(null);
   const detail = options.find((o) => o.value === (previewed ?? value))?.description;
@@ -96,6 +100,7 @@ export function DescribedSelect({
     <Select
       value={value}
       onValueChange={onValueChange}
+      disabled={disabled}
       // Reset the preview when the list closes so the next open starts on the
       // selected option's blurb.
       onOpenChange={(next) => {

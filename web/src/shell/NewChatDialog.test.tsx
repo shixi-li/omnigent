@@ -149,6 +149,8 @@ const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
 
 const RECENT_KEY = "omnigent:recent-workspaces";
+// Per-harness remembered option knobs (see lib/modePreferences).
+const HARNESS_OPTIONS_KEY = "omnigent:last-mode-by-harness";
 
 /**
  * Build a minimal Conversation for the directory-conflict helpers/warning.
@@ -3001,14 +3003,30 @@ describe("NewChatLandingScreen Auto harness", () => {
     expect(screen.queryByTestId("new-chat-landing-config-harness")).toBeNull();
   });
 
-  it("keeps the picked permission value across reopens", () => {
+  it("locks Permissions to Default — no other mode is selectable", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    pickSelectOption("new-chat-landing-config-permission", "Plan");
-    saveConfig();
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission).toBeDisabled();
+    // A disabled trigger can't open, so no other mode is reachable.
+    openSelect("new-chat-landing-config-permission");
+    expect(screen.queryByRole("option", { name: "Plan" })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Bypass permissions" })).toBeNull();
+  });
+
+  it("ignores a stale non-default mode stored for the auto sentinel", () => {
+    // Nothing writes this key for "auto" anymore, but an older build could have.
+    // It must never be restored — the row is Default, and the create sends no
+    // override, so a stale "plan" can't leak into the router's pick.
+    localStorage.setItem(HARNESS_OPTIONS_KEY, JSON.stringify({ auto: { mode: "plan" } }));
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain("Plan");
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission.textContent).not.toContain("Plan");
   });
 
   it("leaves Auto via the picker: re-selecting the agent restores its own harness", () => {
@@ -3044,5 +3062,74 @@ describe("NewChatLandingScreen Auto harness", () => {
     const body = JSON.parse((call[1] as RequestInit).body as string);
     expect(body.harness_override).toBe("auto");
     expect(body.cost_control_mode_override).toBe("on");
+  });
+
+  it("sends no permission override for Auto, even after a stale mode was stored", async () => {
+    // Permissions are inherited from the machine's own Claude Code / Codex
+    // config, which is expressed by sending nothing: the permission mode rides
+    // `terminal_launch_args` as ["--permission-mode", mode], and the default
+    // omits the field entirely (same as launching claude-code on Default).
+    localStorage.setItem(HARNESS_OPTIONS_KEY, JSON.stringify({ auto: { mode: "plan" } }));
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_auto" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAutoHarness();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const raw = (call[1] as RequestInit).body as string;
+    const body = JSON.parse(raw);
+    // Anchor on a required field so the absence checks can't pass vacuously.
+    expect(body.harness_override).toBe("auto");
+    expect(body.terminal_launch_args).toBeUndefined();
+    // No permission field of any spelling rides along.
+    expect(raw).not.toContain("permission");
+    expect(raw).not.toContain("plan");
+  });
+});
+
+describe("claude-code default permission mode (payload anchor for Auto)", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("omits terminal_launch_args when the permission mode is left on Default", async () => {
+    // The behavior Auto matches: Default = inherit the machine's own config, so
+    // the create call carries no permission flag at all.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_claude" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAgent("a1");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const raw = (call[1] as RequestInit).body as string;
+    expect(JSON.parse(raw).agent_id).toBe("a1");
+    expect(JSON.parse(raw).terminal_launch_args).toBeUndefined();
+    expect(raw).not.toContain("permission");
   });
 });
