@@ -609,3 +609,72 @@ Stack: `./run-server.sh` / `./run-host.sh` / `./run-frontend.sh` in
    `system.ai.gpt-5-4-mini` (or `routing.selection_model` pinned to one they
    do have); a workspace without it breaks routing invisibly — L3 probe +
    `last_error` surfacing cover it.
+
+## 10. Product UX decisions (Bryan, 2026-07-29)
+
+Resolves the **NewChatDialog reconciliation** open item in §8 (previously
+blocked on the Ajay/Tomu design call) and supersedes the §4 P6 instruction to
+"leave the dead `smartRoutingEligible` sentinel untouched". Decisions 1–3 are
+shipped on `routing-mvp`; decision 5 is in flight.
+
+1. **Intelligent Routing is a Model choice in the per-harness config modal.**
+   *Configure Claude Code* / *Configure Codex* (new-chat landing) offer
+   "Intelligent Routing" in the Model ("Underlying LLM") dropdown, gated on the
+   server's `smart_routing_enabled` capability and only for `claude-code` and
+   `codex`. Picking it disables the Effort row to an em-dash ("—") — the router
+   picks effort per task, so showing a live value would lie; the Permissions row
+   is unchanged. The session is created with `cost_control_mode_override: "on"`
+   and **no** model/effort pin, i.e. exactly the per-turn routing path already
+   wired at `smart_routing.py:823` ← `orchestration.py:3748` (§3). Rationale:
+   routing is a property of *which model runs*, so it belongs in the Model
+   dropdown rather than as a fourth control users must discover. **SHIPPED**
+   (web `374d267c`, `320b6b59`).
+
+2. **Fully-auto mode is named just "Auto".**  The composer harness chip and the
+   harness dropdown item read "Auto"; the modal title is "Configure Auto". The
+   label iterated "Intelligent Routing" → "Auto Harness" → "Auto" — the long
+   forms crowded the chip and read like jargon. The meaning lives in the
+   hover/description line: "Harness and model picked per task by intelligent
+   routing". Rationale: the chip is a glance-level affordance; explanation
+   belongs in the description, not the label. **SHIPPED**.
+
+3. **Configure Auto shows only Permissions, locked to a disabled "Default".**
+   No Model or Effort rows (the router owns both), and the create payload
+   carries **no permission override at all** — the picked harness inherits the
+   machine's own Claude Code / Codex default config, byte-identical to launching
+   `claude-code` natively on its default permission mode. A cross-harness common
+   permission mapping was researched today (Claude permission modes vs Codex
+   `approval_policy` × `sandbox` × permission profiles; proposal: Read Only /
+   Default / Auto / Full Access) and is **deliberately deferred** — the four-way
+   mapping has enough asymmetry that shipping it wrong would silently loosen
+   sandboxing. Showing the row disabled keeps the slot visible for when the
+   mapping lands and unlocks the remaining options. **SHIPPED** (`320b6b59`);
+   the mapping write-up lives in the session scratchpad and moves into
+   `designs/` when adopted.
+
+4. **In-session principle: main-agent routing is a session-start concept.**
+   Routing fires on the first message and pins the model for the session, so an
+   in-session "Model = Intelligent Routing" toggle would imply a switch that
+   cannot take effect. This is why `costRoutingEligible` deliberately stays off
+   for native sessions — the dead sentinel in §3
+   (`HarnessConfigControls.tsx:17`, `NewChatDialog.tsx:2165`) is now
+   intentional, not an oversight. The in-session control is instead a
+   per-session **Subagent routing** setting (decision 5), which *is* meaningful
+   mid-flight because it only affects future spawns.
+
+5. **New per-session setting `subagent_routing_override` (`"on"` / `"off"` /
+   `null`).**  The in-session gear for Claude Code, Codex (native + SDK) and
+   Auto sessions gains a "Subagent routing: Intelligent Routing / Default" row,
+   toggleable at any time and effective on the next spawn. `null` (default)
+   **inherits the session-start choice**: an IR main agent routes its subagents,
+   a manually pinned model does not. Implementation consequences: the §5.1 relay
+   gate must re-check the setting **per call** rather than at launch — this also
+   fixes a launch-time lock-in bug where a routed session enforced subagent
+   routing forever — and the §4 P3/P4 hooks must be installed whenever the
+   server has routing capability, since a session that starts unrouted can be
+   toggled on later. **IN FLIGHT** (server + web agents).
+
+6. **Closes the Jul 28 meeting-note requirement** "toggle for subagent routing
+   as well as main agent routing", which the CUJ audit flagged as unimplemented:
+   decision 1 covers main-agent routing at session start, decision 5 covers
+   subagent routing at any time.
