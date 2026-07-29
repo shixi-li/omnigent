@@ -1137,3 +1137,69 @@ def register_hooks_routes(
             content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",
         )
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-subagent",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_subagent_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model/harness a native subagent spawn may use.
+
+        The runner's loopback router (advertised to harness
+        ``PreToolUse`` hooks via ``subagent_router.json``) relays here
+        because ``RuntimeCaps.routing_client`` only lives in the server
+        process. Request and response follow the frozen route-subagent
+        contract; every verdict also lands as a ``routing_decision``
+        transcript item.
+
+        :param request: FastAPI request — body is the route-subagent
+            request JSON.
+        :param session_id: Parent session/conversation id from the path.
+        :returns: The route-subagent decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness``.
+        """
+        from omnigent.runner.subagent_routing import (
+            SubagentRouteRequest,
+            resolve_subagent_route,
+            store_persister,
+        )
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-subagent body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-subagent body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = SubagentRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        decision = await resolve_subagent_route(
+            session_id,
+            route_request,
+            caps=get_caps(),
+            persist=store_persister(session_id, conversation_store),
+        )
+        return Response(
+            content=json.dumps(decision.to_payload()),
+            media_type="application/json",
+        )
