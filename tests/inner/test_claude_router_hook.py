@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+import io
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
+
+
+def _advertise(tmp_path: Path, *, session_id: str | None = "conv_abc") -> Path:
+    payload: dict[str, Any] = {"url": "http://127.0.0.1:9999", "token": "tok"}
+    if session_id is not None:
+        payload["session_id"] = session_id
+    (tmp_path / subagent_router.ADVERTISEMENT_FILE).write_text(json.dumps(payload))
+    return tmp_path
+
+
+def _payload(
+    *,
+    tool_name: str = "Agent",
+    subagent_type: str = "code-reviewer",
+    prompt: str = "review the diff",
+) -> dict[str, Any]:
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": {"subagent_type": subagent_type, "prompt": prompt},
+        "tool_use_id": "toolu_1",
+    }
+
+
+def _run_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    router_dir: Path,
+    payload: dict[str, Any],
+    decision: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    seen: list[dict[str, Any]] = []
+
+    def fake_request(
+        endpoint: subagent_router.RouterEndpoint,
+        session_id: str,
+        body: dict[str, Any],
+        *,
+        timeout: float = 0.0,
+    ) -> dict[str, Any] | None:
+        seen.append({"endpoint": endpoint, "session_id": session_id, "body": body})
+        return decision
+
+    monkeypatch.setattr(subagent_router, "request_decision", fake_request)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    assert claude_router_hook.main(["--bridge-dir", str(router_dir)]) == 0
+    raw = out.getvalue()
+    return (json.loads(raw) if raw else None), seen
+
+
+def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    router_dir = _advertise(tmp_path)
+    out, _requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {
+            "action": "rewrite",
+            "model": "routed-model",
+            "raw_model": "router-vocab-model",
+            "rationale": "cheapest arm",
+            "decision_id": "dec-1",
+        },
+    )
+    assert out == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "subagent_type": "code-reviewer",
+                "prompt": "review the diff",
+                "model": "routed-model",
+            },
+            "permissionDecisionReason": "cheapest arm",
+        }
+    }
+
+
+def test_redirect_denies_with_sys_session_send_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router_dir = _advertise(tmp_path)
+    out, _requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {
+            "action": "redirect",
+            "model": "other-model",
+            "harness": "codex",
+            "rationale": "cross-harness pick",
+            "decision_id": "dec-2",
+        },
+    )
+    assert out == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Router selected codex/other-model. Use sys_session_send with "
+                "args.harness=codex, args.model=other-model instead."
+            ),
+        }
+    }
+
+
+def test_deny_carries_router_rationale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    router_dir = _advertise(tmp_path)
+    out, _requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "deny", "model": None, "rationale": "router unreachable", "decision_id": "d"},
+    )
+    assert out == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "router unreachable",
+        }
+    }
+
+
+def test_allow_emits_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    router_dir = _advertise(tmp_path)
+    out, _requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "allow", "model": None, "rationale": "", "decision_id": "d"},
+    )
+    assert out is None
+
+
+def test_fork_typed_spawn_reports_fork_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router_dir = _advertise(tmp_path)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(subagent_type="fork"),
+        {"action": "allow", "rationale": "", "decision_id": "d"},
+    )
+    body = requests[0]["body"]
+    assert body == {
+        "harness": "claude-native",
+        "task_name": "fork",
+        "prompt": "review the diff",
+        "fork": True,
+        "parent_model": None,
+    }
+
+
+def test_non_fork_spawn_reports_fork_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router_dir = _advertise(tmp_path)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "allow", "rationale": "", "decision_id": "d"},
+    )
+    body = requests[0]["body"]
+    assert body["fork"] is False
+    assert body["task_name"] == "code-reviewer"
+
+
+def test_endpoint_down_allows_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    router_dir = _advertise(tmp_path)
+    out, _requests = _run_hook(monkeypatch, router_dir, _payload(), None)
+    assert out is None
+
+
+def test_missing_advertisement_allows_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(subagent_router.ROUTER_DIR_ENV_VAR, raising=False)
+    monkeypatch.delenv(subagent_router.BRIDGE_DIR_ENV_VAR, raising=False)
+
+    def unreachable(*args: object, **kwargs: object) -> dict[str, Any] | None:
+        raise AssertionError("router must not be called without an advertisement")
+
+    monkeypatch.setattr(subagent_router, "request_decision", unreachable)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    assert claude_router_hook.main(["--bridge-dir", str(tmp_path)]) == 0
+    assert out.getvalue() == ""
+
+
+def test_other_tools_are_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    router_dir = _advertise(tmp_path)
+
+    def unreachable(*args: object, **kwargs: object) -> dict[str, Any] | None:
+        raise AssertionError("non-spawn tools must not reach the router")
+
+    monkeypatch.setattr(subagent_router, "request_decision", unreachable)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload(tool_name="Bash"))))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    assert claude_router_hook.main(["--bridge-dir", str(router_dir)]) == 0
+    assert out.getvalue() == ""
+
+
+def test_legacy_task_tool_name_is_routed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    router_dir = _advertise(tmp_path)
+    out, _requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(tool_name="Task"),
+        {"action": "rewrite", "model": "routed-model", "rationale": "", "decision_id": "d"},
+    )
+    assert out is not None
+    assert out["hookSpecificOutput"]["updatedInput"]["model"] == "routed-model"
+
+
+def test_malformed_stdin_allows_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    assert claude_router_hook.main([]) == 0
+    assert out.getvalue() == ""
+
+
+def test_session_id_falls_back_to_bridge_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router_dir = _advertise(tmp_path, session_id=None)
+    (tmp_path / "bridge.json").write_text(
+        json.dumps({"active_session_id": "conv_from_bridge", "launch_model": "parent-model"})
+    )
+    monkeypatch.delenv(subagent_router.SESSION_ID_ENV_VAR, raising=False)
+    monkeypatch.delenv(subagent_router.NATIVE_SESSION_ID_ENV_VAR, raising=False)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "allow", "rationale": "", "decision_id": "d"},
+    )
+    request = requests[0]
+    assert request["session_id"] == "conv_from_bridge"
+    assert request["body"]["parent_model"] == "parent-model"
+
+
+def test_malformed_advertisement_is_treated_as_absent(tmp_path: Path) -> None:
+    (tmp_path / subagent_router.ADVERTISEMENT_FILE).write_text("{not json")
+    assert subagent_router.read_router_endpoint(tmp_path) is None
+    (tmp_path / subagent_router.ADVERTISEMENT_FILE).write_text(json.dumps({"url": "u"}))
+    assert subagent_router.read_router_endpoint(tmp_path) is None
+
+
+def test_redirect_without_target_fails_open() -> None:
+    decision = {"action": "redirect", "model": None, "harness": None, "rationale": "x"}
+    assert subagent_router.decision_to_hook_output(decision, {}) is None
+
+
+class _FakeHookMatcher:
+    def __init__(self, *, matcher: str | None = None, hooks: list[Any], timeout: float) -> None:
+        self.matcher = matcher
+        self.hooks = hooks
+        self.timeout = timeout
+
+
+class _FakeSDK:
+    HookMatcher = _FakeHookMatcher
+
+
+class _FakeOptions:
+    hooks: dict[str, list[Any]] | None = None
+
+
+def _install() -> _FakeOptions:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    options = _FakeOptions()
+    ClaudeSDKExecutor()._install_subagent_router_hook(_FakeSDK(), options, "parent-model")  # type: ignore[arg-type]
+    return options
+
+
+def test_sdk_hook_registered_when_router_advertised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _advertise(tmp_path)
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    options = _install()
+    assert options.hooks is not None
+    matcher = options.hooks["PreToolUse"][0]
+    assert matcher.matcher == subagent_router.AGENT_TOOL_MATCHER
+    assert matcher.timeout == subagent_router.REQUEST_TIMEOUT_S
+
+
+def test_sdk_hook_not_registered_without_advertisement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    options = _install()
+    assert options.hooks is None
+
+
+async def test_sdk_callback_maps_rewrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _advertise(tmp_path)
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    bodies: list[dict[str, Any]] = []
+
+    def fake_request(
+        endpoint: subagent_router.RouterEndpoint,
+        session_id: str,
+        body: dict[str, Any],
+        *,
+        timeout: float = 0.0,
+    ) -> dict[str, Any]:
+        bodies.append(body)
+        return {"action": "rewrite", "model": "routed-model", "rationale": "r"}
+
+    monkeypatch.setattr(subagent_router, "request_decision", fake_request)
+    options = _install()
+    assert options.hooks is not None
+    callback = options.hooks["PreToolUse"][0].hooks[0]
+    output = await callback(_payload(), "toolu_1", {"signal": None})
+    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "routed-model"
+    assert bodies[0]["harness"] == "claude-sdk"
+    assert bodies[0]["parent_model"] == "parent-model"
+
+
+async def test_sdk_callback_allows_unchanged_when_router_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _advertise(tmp_path)
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(
+        subagent_router,
+        "request_decision",
+        lambda *args, **kwargs: None,
+    )
+    options = _install()
+    assert options.hooks is not None
+    callback = options.hooks["PreToolUse"][0].hooks[0]
+    assert await callback(_payload(), None, {"signal": None}) == {}
+
+
+@pytest.mark.parametrize(
+    ("subagent_type", "expected"),
+    [
+        ("fork", True),
+        ("Fork", True),
+        ("research-fork", True),
+        ("plugin:fork", True),
+        ("code-reviewer", False),
+        ("", False),
+    ],
+)
+def test_fork_detection(subagent_type: str, expected: bool) -> None:
+    assert subagent_router.is_fork_spawn({"subagent_type": subagent_type}) is expected

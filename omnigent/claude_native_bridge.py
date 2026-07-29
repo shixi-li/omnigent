@@ -60,6 +60,9 @@ if TYPE_CHECKING:
 
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.hook_scripts.subagent_router import (
+    AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
+)
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 from omnigent.tools.base import Tool, ToolContext
@@ -1125,6 +1128,7 @@ def build_hook_settings(
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_effort: str | None = None,
+    subagent_router_dir: Path | None = None,
 ) -> dict[str, Any]:
     """
     Build invocation-local Claude Code hook settings.
@@ -1153,6 +1157,10 @@ def build_hook_settings(
         for the same re-exec hardening.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
+    :param subagent_router_dir: Directory where the runner advertises its
+        ``route-subagent`` endpoint (``subagent_router.json``). When set,
+        a ``PreToolUse`` hook routes native subagent spawns; ``None``
+        leaves spawns unrouted.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1337,6 +1345,34 @@ def build_hook_settings(
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
+    if subagent_router_dir is not None:
+        # Route natively spawned subagents (the Task/Agent tool) through
+        # the runner's route-subagent endpoint. Settings-level hooks also
+        # apply to nested spawns, so a routed subagent's own spawns are
+        # routed too. The script fails open — an unreachable endpoint
+        # emits no output and the spawn proceeds unchanged.
+        router_command_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.inner.hook_scripts.claude_router_hook",
+            "--bridge-dir",
+            str(bridge_dir),
+            "--router-dir",
+            str(subagent_router_dir),
+        ]
+        router_hook: dict[str, Any] = {
+            "type": "command",
+            "command": shlex.join(router_command_parts),
+            # Bounded well under Claude's default so a wedged runner
+            # delays a spawn rather than stalling the turn. The router
+            # itself makes an LLM extraction call, so a couple of
+            # seconds is normal.
+            "timeout": 30,
+        }
+        hooks.setdefault("PreToolUse", []).append(
+            {"matcher": CLAUDE_SUBAGENT_TOOL_MATCHER, "hooks": [router_hook]}
+        )
     settings: dict[str, Any] = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model
