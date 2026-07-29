@@ -125,3 +125,109 @@ describe("RoutingDecisionCard — session-level auto-routing", () => {
     expect(screen.getByText(/"rationale"/)).toBeInTheDocument();
   });
 });
+
+describe("routing decision — harness / scope / raw pick", () => {
+  it("chip: renders harness and the sub-agent scope badge", () => {
+    render(
+      <RoutingDecisionChip
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="short task"
+        agent="researcher"
+        harness="claude-native"
+        scope="native_subagent"
+      />,
+    );
+    const chip = screen.getByTestId("routing-decision-chip");
+    // Harness + which sub-agent the decision covers: without them a
+    // native-subagent decision is indistinguishable from a session one.
+    expect(chip).toHaveTextContent("claude-native");
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent("subagent: researcher");
+  });
+
+  it("chip: session/turn scopes get no sub-agent badge", () => {
+    render(
+      <RoutingDecisionChip
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        harness="codex"
+        scope="turn"
+      />,
+    );
+    expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+  });
+
+  it("chip: shows the raw router pick when it differs from the applied model", () => {
+    render(
+      <RoutingDecisionChip
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        rawModel="gpt-5-6-sol"
+      />,
+    );
+    // The router's vocabulary pick had no endpoint and was mapped to a
+    // servable id — both must be visible or the mapping is invisible.
+    expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
+    expect(screen.getByTestId("routing-decision-chip")).toHaveTextContent("sonnet");
+  });
+
+  it("chip: hides the raw pick when it resolves to the same short name", () => {
+    render(
+      <RoutingDecisionChip
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        rawModel="claude-sonnet-5"
+      />,
+    );
+    expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+  });
+
+  it("chip: renders exactly as before when no new field is set", () => {
+    render(<RoutingDecisionChip model="databricks-claude-opus-4-8" applied rationale="deep" />);
+    const chip = screen.getByTestId("routing-decision-chip");
+    expect(chip).toHaveTextContent("Intelligent model router");
+    expect(chip).toHaveTextContent("opus");
+    expect(screen.queryByTestId("routing-decision-harness")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+  });
+
+  it("card: renders harness, scope badge, raw pick, and the extras in the raw JSON", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="short task"
+        agent="researcher"
+        harness="codex-native"
+        scope="child_session"
+        decisionId="dec_123"
+        rawModel="gpt-5-6-sol"
+        attemptedOverride="databricks-claude-opus-4-8"
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex-native");
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent("subagent: researcher");
+    expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
+    // Identity + attempted override are audit data — they belong in the
+    // expandable verdict, not the glance row.
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"decision_id"/)).toBeInTheDocument();
+    expect(screen.getByText(/"attempted_override"/)).toBeInTheDocument();
+  });
+
+  it("card: omits the new rows and JSON keys when the fields are absent", () => {
+    render(
+      <RoutingDecisionCard model="databricks-claude-opus-4-8" applied rationale="deep reasoning" />,
+    );
+    expect(screen.queryByTestId("routing-decision-harness")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.queryByText(/"harness"/)).toBeNull();
+    expect(screen.queryByText(/"raw_model"/)).toBeNull();
+  });
+});

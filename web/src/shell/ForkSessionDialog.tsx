@@ -32,6 +32,8 @@ import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import { recordForkFromRoutedSession } from "@/lib/routingTelemetry";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -193,6 +195,9 @@ export function ForkSessionForm({
   // so no extra enabled-gating on visibility is needed.)
   const { data: agents } = useAvailableAgents({ enabled: true });
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
+  // Source snapshot (already cached by the session page) — read only to tell
+  // whether the fork leaves an intelligent-routing session, for telemetry.
+  const { session: sourceSession } = useSession(sourceSessionId);
 
   // Hosts for the picker — only for a coding source (a non-coding fork
   // never shows the host field).
@@ -386,6 +391,9 @@ export function ForkSessionForm({
         switching ? agentChoice : undefined,
         upToResponseId ?? undefined,
       );
+      if (sourceSession?.costControlModeOverride === "on") {
+        recordForkFromRoutedSession(sourceSessionId, fork.id);
+      }
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)

@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
+import type { RoutingDecisionExtras } from "./routingDecision";
 import type { RememberScope, Response } from "./types";
 
 /**
@@ -201,7 +202,7 @@ export function slashCommandEchoItemId(slashItemId: string): string {
  * server keeps the matching `routing_decision` item out of the model's
  * history.
  */
-export interface RoutingDecisionBlock {
+export interface RoutingDecisionBlock extends RoutingDecisionExtras {
   type: "routing_decision";
   ctx: BlockContext;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */

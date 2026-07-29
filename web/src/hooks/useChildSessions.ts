@@ -51,6 +51,14 @@ export interface ChildSessionInfo {
    * the Agents rail renders an "awaiting input" badge for it.
    */
   pending_elicitations_count: number;
+  /**
+   * Model the intelligent router picked for this sub-agent, e.g.
+   * ``"databricks-claude-sonnet-5"``. ``null``/absent when the child was
+   * not routed (routing off, or a server that predates the field).
+   */
+  routed_model?: string | null;
+  /** Identity of the routing decision behind ``routed_model``. */
+  routing_decision_id?: string | null;
 }
 
 /**
@@ -69,6 +77,8 @@ interface ChildSessionWire {
   busy: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
+  routed_model?: string | null;
+  routing_decision_id?: string | null;
 }
 
 interface ChildSessionsResponse {
@@ -180,6 +190,8 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     busy: row.busy,
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
+    routed_model: row.routed_model ?? null,
+    routing_decision_id: row.routing_decision_id ?? null,
   }));
 }
 

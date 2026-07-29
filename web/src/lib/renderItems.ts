@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import { type RoutingDecisionExtras, routingExtras } from "./routingDecision";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -144,14 +145,14 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string }
   | { kind: "compaction"; itemId: string }
-  | {
+  | ({
       kind: "routing_decision";
       itemId: string;
       model: string;
       applied: boolean;
       rationale: string;
       agent?: string;
-    };
+    } & RoutingDecisionExtras);
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
 const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "reasoning_block"]);
@@ -450,6 +451,7 @@ function walkBubbles(
         applied: b.applied,
         rationale: b.rationale,
         ...(b.agent !== undefined && { agent: b.agent }),
+        ...routingExtras(b),
       });
       i += 1;
       continue;

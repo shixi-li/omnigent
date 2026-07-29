@@ -3033,6 +3033,11 @@ export const BubbleView = memo(
           applied={bubble.applied}
           rationale={bubble.rationale}
           agent={bubble.agent}
+          harness={bubble.harness}
+          scope={bubble.scope}
+          decisionId={bubble.decisionId}
+          rawModel={bubble.rawModel}
+          attemptedOverride={bubble.attemptedOverride}
         />
       );
     }

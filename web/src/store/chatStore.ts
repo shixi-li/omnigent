@@ -78,6 +78,7 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+import { recordRoutingDisabledMidSession } from "@/lib/routingTelemetry";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -1788,6 +1789,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         costControlModeOverride: mode,
         ...(clearModel ? { modelOverride: null } : {}),
       });
+      // Telemetry after the PATCH settles: a rolled-back flip never happened.
+      if (previous === "on" && mode !== "on") {
+        recordRoutingDisabledMidSession(conversationId, mode === "off" ? "off" : "default");
+      }
       if (get().conversationId !== conversationId) return;
       set({
         costControlModeOverride: session.costControlModeOverride ?? null,

@@ -1,0 +1,91 @@
+// Shared shape for the additive intelligent-routing decision fields.
+//
+// The server's `RoutingDecisionData` grew harness/scope/decision identity
+// alongside the original `model`/`applied`/`rationale`/`agent`. Every hop of
+// the transcript pipeline (SSE event → block → bubble → chip/card) carries
+// them through unchanged, so the shape lives here once instead of being
+// re-declared five times. All fields are optional: legacy rows (and any
+// deployment running an older server) render exactly as before.
+
+/** Where a routing decision was taken. Absent on legacy rows. */
+export type RoutingScope = "session" | "turn" | "child_session" | "native_subagent";
+
+export interface RoutingDecisionExtras {
+  /** Harness the decision routes to, e.g. `"claude-native"`. */
+  harness?: string | null;
+  /** Decision scope, e.g. `"native_subagent"` for an in-harness Task spawn. */
+  scope?: RoutingScope | null;
+  /** Server-side decision identity, cross-referenced by routing telemetry. */
+  decisionId?: string | null;
+  /** Router-vocabulary pick before catalog resolution, e.g. `"gpt-5-6-sol"`. */
+  rawModel?: string | null;
+  /** LLM-supplied `args.model` the router overrode, when there was one. */
+  attemptedOverride?: string | null;
+}
+
+const SCOPES = new Set<string>(["session", "turn", "child_session", "native_subagent"]);
+
+/** Scopes whose decision belongs to a sub-agent rather than the session itself. */
+const SUBAGENT_SCOPES = new Set<RoutingScope>(["child_session", "native_subagent"]);
+
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Read the additive routing fields off a snake_case wire record (an SSE
+ * `routing_decision` payload or a stored transcript item).
+ *
+ * Unknown/blank values are dropped rather than coerced, so a partial or
+ * older payload yields an empty object and the UI falls back to the
+ * original four-field rendering.
+ *
+ * @param rec - Raw wire record, e.g. `{model: "…", raw_model: "gpt-5-6-sol"}`.
+ * @returns Only the fields actually present.
+ */
+export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDecisionExtras {
+  const scope = str(rec.scope);
+  return {
+    ...(str(rec.harness) !== undefined && { harness: str(rec.harness) }),
+    ...(scope !== undefined && SCOPES.has(scope) && { scope: scope as RoutingScope }),
+    ...(str(rec.decision_id) !== undefined && { decisionId: str(rec.decision_id) }),
+    ...(str(rec.raw_model) !== undefined && { rawModel: str(rec.raw_model) }),
+    ...(str(rec.attempted_override) !== undefined && {
+      attemptedOverride: str(rec.attempted_override),
+    }),
+  };
+}
+
+/**
+ * Copy the set routing extras out of an already-parsed carrier, for the
+ * camelCase hops (event → block → bubble). Unset fields stay unset so
+ * spreading never introduces `undefined` keys.
+ *
+ * @param source - Any carrier of the extras, e.g. a `RoutingDecisionBlock`.
+ * @returns Only the fields actually present.
+ */
+export function routingExtras(source: RoutingDecisionExtras): RoutingDecisionExtras {
+  return {
+    ...(source.harness != null && { harness: source.harness }),
+    ...(source.scope != null && { scope: source.scope }),
+    ...(source.decisionId != null && { decisionId: source.decisionId }),
+    ...(source.rawModel != null && { rawModel: source.rawModel }),
+    ...(source.attemptedOverride != null && { attemptedOverride: source.attemptedOverride }),
+  };
+}
+
+/**
+ * Badge text for a sub-agent-scoped decision, e.g. `"subagent: researcher"`.
+ *
+ * @param scope - Decision scope; only the sub-agent scopes get a badge.
+ * @param agent - Sub-agent name carried on the decision, when known.
+ * @returns The badge text, or `null` for session/turn decisions.
+ */
+export function subagentScopeLabel(
+  scope: RoutingScope | null | undefined,
+  agent: string | null | undefined,
+): string | null {
+  if (scope == null || !SUBAGENT_SCOPES.has(scope)) return null;
+  const name = agent?.trim();
+  return name ? `subagent: ${name}` : "subagent";
+}

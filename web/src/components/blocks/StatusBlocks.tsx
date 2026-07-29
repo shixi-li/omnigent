@@ -20,6 +20,7 @@ import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elem
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
+import { type RoutingDecisionExtras, subagentScopeLabel } from "@/lib/routingDecision";
 import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
@@ -117,18 +118,41 @@ export function CompactionMarker() {
   );
 }
 
-interface RoutingDecisionChipProps {
+interface RoutingDecisionChipProps extends RoutingDecisionExtras {
   model: string;
   applied: boolean;
   rationale: string;
+  /** Sub-agent name, used with `scope` for the sub-agent badge. */
+  agent?: string;
+}
+
+/**
+ * Short raw-pick name when the router's own vocabulary pick differs from the
+ * model actually applied (an unservable arm mapped to a servable id), else
+ * `null` — the common case where both names collapse to the same tier.
+ */
+function rawPickName(model: string, rawModel: string | null | undefined): string | null {
+  if (!rawModel) return null;
+  const raw = shortModelName(rawModel);
+  return raw === shortModelName(model) ? null : raw;
 }
 
 /**
  * Muted inline chip announcing the intelligent model router's pick at
  * the start of a turn.
  */
-export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisionChipProps) {
+export function RoutingDecisionChip({
+  model,
+  applied,
+  rationale,
+  agent,
+  harness,
+  scope,
+  rawModel,
+}: RoutingDecisionChipProps) {
   const short = shortModelName(model);
+  const rawShort = rawPickName(model, rawModel);
+  const scopeLabel = subagentScopeLabel(scope, agent);
   const lead = applied ? short : `would have picked ${short}`;
   const summary = `Intelligent model router · ${lead}`;
   return (
@@ -143,7 +167,25 @@ export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisi
         <span>
           Intelligent model router{" · "}
           {!applied && <span>would have picked </span>}
+          {rawShort ? (
+            <span className="text-muted-foreground/70" data-testid="routing-decision-raw-model">
+              {rawShort}
+              {" → "}
+            </span>
+          ) : null}
           <span className="font-medium text-foreground">{short}</span>
+          {harness ? (
+            <span data-testid="routing-decision-harness">
+              {" · "}
+              {harness}
+            </span>
+          ) : null}
+          {scopeLabel ? (
+            <span data-testid="routing-decision-scope">
+              {" · "}
+              {scopeLabel}
+            </span>
+          ) : null}
         </span>
       </span>
       {rationale ? <span className="text-muted-foreground/70">{rationale}</span> : null}
@@ -151,7 +193,7 @@ export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisi
   );
 }
 
-interface RoutingDecisionCardProps {
+interface RoutingDecisionCardProps extends RoutingDecisionExtras {
   model: string;
   applied: boolean;
   rationale: string;
@@ -174,12 +216,34 @@ export function RoutingDecisionCard({
   applied,
   rationale,
   agent,
+  harness,
+  scope,
+  decisionId,
+  rawModel,
+  attemptedOverride,
 }: RoutingDecisionCardProps) {
   const short = shortModelName(model);
+  const rawShort = rawPickName(model, rawModel);
+  const scopeLabel = subagentScopeLabel(scope, agent);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
-    () => JSON.stringify({ model, applied, rationale, ...(agent ? { agent } : {}) }, null, 2),
-    [model, applied, rationale, agent],
+    () =>
+      JSON.stringify(
+        {
+          model,
+          applied,
+          rationale,
+          ...(agent ? { agent } : {}),
+          ...(harness ? { harness } : {}),
+          ...(scope ? { scope } : {}),
+          ...(decisionId ? { decision_id: decisionId } : {}),
+          ...(rawModel ? { raw_model: rawModel } : {}),
+          ...(attemptedOverride ? { attempted_override: attemptedOverride } : {}),
+        },
+        null,
+        2,
+      ),
+    [model, applied, rationale, agent, harness, scope, decisionId, rawModel, attemptedOverride],
   );
   return (
     <Collapsible
@@ -195,6 +259,16 @@ export function RoutingDecisionCard({
         <BrainCircuitIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="font-medium">Intelligent routing</span>
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
+        {harness ? (
+          <span className="text-muted-foreground" data-testid="routing-decision-harness">
+            · {harness}
+          </span>
+        ) : null}
+        {scopeLabel ? (
+          <span className="text-muted-foreground" data-testid="routing-decision-scope">
+            · {scopeLabel}
+          </span>
+        ) : null}
         <CollapsibleTrigger
           className="ml-auto cursor-pointer rounded p-0.5 text-muted-foreground hover:text-foreground"
           aria-label="Show raw routing verdict"
@@ -205,7 +279,22 @@ export function RoutingDecisionCard({
       </div>
       <div className="flex items-center gap-2 text-xs">
         <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
-        <span className="ml-auto shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground">
+        {rawShort ? (
+          // Router vocabulary pick that had to be mapped to a servable id —
+          // show what the router said next to what actually ran.
+          <span
+            className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground"
+            data-testid="routing-decision-raw-model"
+          >
+            {rawShort} →
+          </span>
+        ) : null}
+        <span
+          className={cn(
+            "shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground",
+            !rawShort && "ml-auto",
+          )}
+        >
           {short}
         </span>
       </div>

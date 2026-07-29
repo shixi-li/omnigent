@@ -66,6 +66,7 @@ import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { ChatHeader } from "./ChatHeader";
+import { SessionWarningBanner } from "./SessionWarningBanner";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -1333,6 +1334,7 @@ export function AppShell() {
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
                 />
+                <SessionWarningBanner warnings={activeSession?.warnings} />
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>
