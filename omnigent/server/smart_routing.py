@@ -401,6 +401,32 @@ DEFAULT_ROUTER_NAME = "task_v1"
 _TASK_V1_CLAUDE_ARMS: tuple[str, ...] = ("claude-opus-4-8", "claude-sonnet-5")
 _TASK_V1_CODEX_ARMS: tuple[str, ...] = ("glm-5-2", "gpt-5-6-sol", "gpt-5-6-luna")
 
+# Where an arm sits in its scenario's cost/capability spread. Only two classes
+# are needed: a substitute for a cheap arm must not cost more than the arm, and
+# a substitute for a capable arm must not be weaker than the workspace can do.
+ARM_TIER_CHEAP = "cheap"
+ARM_TIER_CAPABLE = "capable"
+
+# Arm tiers live beside the menus so a future task_v2 menu ships its own.
+# task_v1: luna is the cheap arm, sol the default/anchor, glm-5-2 the
+# routed/delegate arm; sonnet-5 is cc's cheap default and opus-4-8 its
+# escalation. Arms with no entry — including whole menus supplied via
+# ``routing.scenario_menus`` — are treated as capable-tier, since substituting
+# something too capable degrades cost, not correctness.
+TASK_V1_ARM_TIERS: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        DEFAULT_ROUTER_NAME: MappingProxyType(
+            {
+                "gpt-5-6-luna": ARM_TIER_CHEAP,
+                "gpt-5-6-sol": ARM_TIER_CAPABLE,
+                "glm-5-2": ARM_TIER_CAPABLE,
+                "claude-sonnet-5": ARM_TIER_CHEAP,
+                "claude-opus-4-8": ARM_TIER_CAPABLE,
+            }
+        )
+    }
+)
+
 # Keyed by router version: routers are frozen per version, so pinning
 # ``routing.router_name`` pins the menu that goes with it. A router name with
 # no entry here (e.g. the older ``task_v0``) gets no injected arms — the
@@ -557,14 +583,58 @@ def _model_family(model: str) -> str:
     return "other"
 
 
-def _shared_prefix_len(left: str, right: str) -> int:
-    """Length of the longest common prefix of two model ids."""
-    count = 0
-    for a, b in zip(left, right, strict=False):
-        if a != b:
-            break
-        count += 1
-    return count
+# Capability ranking for substitute picks.
+#
+# Live catalogs arrive in whatever order the workspace lists endpoints (roughly
+# alphabetical), so list position says nothing about capability. Rank on the id
+# itself instead: a size class from the name, then the version number, then the
+# curated :data:`MODEL_LISTS` position, then the id for total ordering.
+
+# Size classes read off name segments. Higher is more capable. ``max`` is
+# deliberately absent: vendors use it both for a flagship and for the top of an
+# older generation (``gpt-5-1-codex-max``), so it falls to the default class and
+# is ordered by version instead.
+_SIZE_CLASS_SEGMENTS: tuple[tuple[str, int], ...] = (
+    ("nano", 0),
+    ("mini", 1),
+    ("haiku", 1),
+    ("lite", 1),
+    ("flash", 1),
+    ("opus", 3),
+    ("pro", 3),
+    ("ultra", 3),
+)
+_DEFAULT_SIZE_CLASS = 2
+# Below this class a model is too small to stand in for a real coding arm.
+_MIN_SENSIBLE_SIZE_CLASS = 1
+
+
+def _size_class(bare: str) -> int:
+    """Classify a bare model id by name segment, cheapest class first."""
+    segments = set(bare.lower().split("-"))
+    for segment, size in _SIZE_CLASS_SEGMENTS:
+        if segment in segments:
+            return size
+    return _DEFAULT_SIZE_CLASS
+
+
+def _version_key(bare: str) -> tuple[int, ...]:
+    """Numeric segments of a bare id, e.g. ``gpt-5-5`` → ``(5, 5)``."""
+    return tuple(int(part) for part in bare.lower().split("-") if part.isdigit())
+
+
+def _listed_rank(bare: str, family: str) -> int:
+    """Position in the family's curated ordering, or ``-1`` when unlisted."""
+    for index, model in enumerate(MODEL_LISTS.get(family, ())):
+        if _bare_id(model).lower() == bare:
+            return index
+    return -1
+
+
+def _capability_key(model: str) -> tuple[int, tuple[int, ...], int, str]:
+    """Sort key ordering model ids cheapest → most capable."""
+    bare = _bare_id(model).lower()
+    return (_size_class(bare), _version_key(bare), _listed_rank(bare, _model_family(model)), bare)
 
 
 def _redirect_incompatible_pick(harness: str | None, model: str) -> str | None:
@@ -605,16 +675,21 @@ class TaskV1RouteOptionSource:
         *,
         router_name: str = DEFAULT_ROUTER_NAME,
         scenario_menus: Mapping[str, Mapping[str, tuple[str, ...]]] = TASK_V1_MENUS,
+        arm_tiers: Mapping[str, Mapping[str, str]] = TASK_V1_ARM_TIERS,
         model_prefixes: Sequence[str] = (),
     ) -> None:
         """
         :param router_name: Router strategy name; selects the menu set.
         :param scenario_menus: Router version → scenario → required arms.
+        :param arm_tiers: Router version → arm → tier, used when an arm has no
+            local endpoint (see :data:`TASK_V1_ARM_TIERS`). Arms missing from
+            the mapping are treated as capable-tier.
         :param model_prefixes: Catalog prefixes to strip on the way out and
             restore on the way back, e.g. ``["databricks-", "system.ai."]``.
         """
         self._router_name = router_name
         self._menus = scenario_menus
+        self._arm_tiers = arm_tiers
         self._model_prefixes = tuple(model_prefixes)
 
     def to_router_id(self, model: str) -> str:
@@ -762,25 +837,32 @@ class TaskV1RouteOptionSource:
         harness: str | None,
         catalog: dict[str, list[str]],
     ) -> str | None:
-        """Map an arm with no endpoint here to the closest servable id.
+        """Map an arm with no endpoint here to a servable id of the same tier.
 
         The router requires (and selects) arms this workspace may not serve,
-        e.g. ``gpt-5-6-sol``. Prefer the same family, then the id sharing the
-        longest prefix with the arm, breaking ties toward the more capable
-        model (catalog lists run cheapest → most powerful).
+        e.g. ``gpt-5-6-sol``. Stay in the arm's family, then substitute by the
+        arm's tier: a capable arm takes the most capable servable id, a cheap
+        arm the cheapest one that is still a real coding model (a nano endpoint
+        only when nothing else exists). Capability comes from
+        :func:`_capability_key`, never from catalog order.
         """
         pool = list(catalog.get(harness or "", []))
         if not pool:
             pool = [m for models in catalog.values() for m in models]
         same_family = [m for m in pool if _model_family(m) == _model_family(arm)]
         pool = same_family or pool
-        best: str | None = None
-        best_score = -1
-        for model in pool:
-            score = _shared_prefix_len(self.to_router_id(model), arm)
-            if score >= best_score:
-                best, best_score = model, score
-        return best
+        if not pool:
+            return None
+        ranked = sorted(pool, key=_capability_key)
+        if self._arm_tier(arm) == ARM_TIER_CHEAP:
+            sensible = [m for m in ranked if _size_class(_bare_id(m)) >= _MIN_SENSIBLE_SIZE_CLASS]
+            return (sensible or ranked)[0]
+        return ranked[-1]
+
+    def _arm_tier(self, arm: str) -> str:
+        """Return the tier of *arm*, defaulting unknown arms to capable."""
+        tiers = self._arm_tiers.get(self._router_name, {})
+        return tiers.get(arm, ARM_TIER_CAPABLE)
 
 
 def _routing_settings() -> RoutingSettings:
@@ -1204,9 +1286,7 @@ async def route_turn(
         )
         return None, None
 
-    _logger.info(
-        "smart_routing: routing turn session=%s harness=%s", session_id, harness
-    )
+    _logger.info("smart_routing: routing turn session=%s harness=%s", session_id, harness)
     # Prefer live runner catalog — but only the "self" worker entry.
     # The catalog includes sub-agent workers (claude_code, pi, codex…);
     # for brain-turn routing we only want the models this session's own

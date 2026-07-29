@@ -7,6 +7,7 @@ LLMRoutingClient, and the public ``route_turn`` entry point.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1416,6 +1417,107 @@ def test_route_option_source_redirects_excluded_pick_off_pi() -> None:
     )
     assert gpt is not None and gpt.harness == "codex"
     assert claude is not None and claude.harness == "claude-sdk"
+
+
+# ── Tier-aware substitution for unservable arms ────────────────────────────
+#
+# A live ucode workspace lists codex endpoints roughly alphabetically, so list
+# position carries no cost/capability signal and no id shares more than the
+# "gpt-5-" prefix with the gpt-5.6 arms.
+
+_UCODE_CODEX_CATALOG: tuple[str, ...] = (
+    "gpt-5-1-codex-max",
+    "gpt-5-1-codex-mini",
+    "gpt-5-2",
+    "gpt-5-3-codex",
+    "gpt-5-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+)
+
+
+def _substitute(arm: str, models: Sequence[str], harness: str = "codex") -> str:
+    from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
+
+    source = TaskV1RouteOptionSource(model_prefixes=["databricks-", "system.ai."])
+    resolved = source.resolve_selection(RoutePick(model=arm), [harness], {harness: list(models)})
+    assert resolved is not None, f"{arm} resolved to nothing"
+    assert resolved.raw_model == arm
+    return resolved.model
+
+
+def test_capable_arm_substitutes_most_capable_not_last_in_catalog() -> None:
+    """sol is task_v1's anchor arm, so it must not land on a nano endpoint."""
+    assert _substitute("gpt-5-6-sol", _UCODE_CODEX_CATALOG) == "gpt-5-5"
+
+
+def test_cheap_arm_substitutes_cheapest_sensible_model() -> None:
+    """luna is the cheap arm: the mini class, not gpt-5-5 and not nano."""
+    assert _substitute("gpt-5-6-luna", _UCODE_CODEX_CATALOG) == "gpt-5-mini"
+
+
+def test_cheap_arm_falls_back_to_nano_when_nothing_bigger() -> None:
+    assert _substitute("gpt-5-6-luna", ("gpt-5-nano",)) == "gpt-5-nano"
+
+
+def test_delegate_arm_substitutes_same_family_capable_model() -> None:
+    """glm-5-2 has no local endpoint and no tier entry demoting it."""
+    assert _substitute("glm-5-2", _UCODE_CODEX_CATALOG) == "gpt-5-5"
+
+
+def test_substitution_is_independent_of_catalog_order() -> None:
+    import random
+
+    shuffled = list(_UCODE_CODEX_CATALOG)
+    picks = set()
+    for seed in range(25):
+        random.Random(seed).shuffle(shuffled)
+        picks.add((_substitute("gpt-5-6-sol", shuffled), _substitute("gpt-5-6-luna", shuffled)))
+    assert picks == {("gpt-5-5", "gpt-5-mini")}
+
+
+def test_servable_pick_keeps_exact_catalog_id() -> None:
+    """The prefix-restore path is untouched: a servable arm is applied as-is."""
+    assert (
+        _substitute(
+            "gpt-5-5", ("databricks-gpt-5-nano", "databricks-gpt-5-5", "databricks-gpt-5-mini")
+        )
+        == "databricks-gpt-5-5"
+    )
+
+
+def test_claude_arms_unaffected_when_servable() -> None:
+    catalog = ("databricks-claude-sonnet-5", "databricks-claude-opus-4-8")
+    assert _substitute("claude-sonnet-5", catalog, "claude-sdk") == "databricks-claude-sonnet-5"
+    assert _substitute("claude-opus-4-8", catalog, "claude-sdk") == "databricks-claude-opus-4-8"
+
+
+def test_unservable_opus_substitutes_most_capable_claude() -> None:
+    catalog = (
+        "databricks-claude-haiku-4-5",
+        "databricks-claude-sonnet-4-6",
+        "databricks-claude-opus-4-7",
+    )
+    assert _substitute("claude-opus-4-8", catalog, "claude-sdk") == "databricks-claude-opus-4-7"
+
+
+def test_unservable_cheap_claude_arm_avoids_the_flagship() -> None:
+    catalog = ("databricks-claude-opus-4-7", "databricks-claude-sonnet-4-6")
+    assert _substitute("claude-sonnet-5", catalog, "claude-sdk") == "databricks-claude-sonnet-4-6"
+
+
+def test_config_supplied_menu_without_tiers_defaults_to_capable() -> None:
+    from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
+
+    source = TaskV1RouteOptionSource(
+        router_name="task_v9",
+        scenario_menus={"task_v9": {"codex": ("mystery-arm",)}},
+    )
+    resolved = source.resolve_selection(
+        RoutePick(model="mystery-arm"), ["codex"], {"codex": list(_UCODE_CODEX_CATALOG)}
+    )
+    assert resolved is not None
+    assert resolved.model == "gpt-5-5"
 
 
 # ── RoutingSettings parsing (cli) ─────────────────────────────────────────
