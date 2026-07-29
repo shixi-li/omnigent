@@ -10,14 +10,14 @@ Living checklist, maintained by the lead session. Legend:
 "UI" = what chips/dropdowns/panels display. "Process" = what the harness
 process actually runs (rollout files, panes, config, spawned models).
 
-Last updated: 2026-07-29 late evening.
+Last updated: 2026-07-29 late evening (sticky IR + toggle user-confirmed).
 
 ## 1. Claude Code CUJ (IR main session)
 
 | Layer | Status | Evidence / notes |
 |---|---|---|
 | IR selectable in Configure Claude Code, Effort greys | ✅ user | 2026-07-29 |
-| Sticky IR default next session, same harness | ⬜ | shipped `2a415cf4`; not re-confirmed live |
+| Sticky IR default next session, same harness | ✅ user | 2026-07-29 |
 | Session created with routing flag, no pin | ✅ evidence | DB session_overrides |
 | Router decision + chip (below message) | ✅ user | rationale correct (task_v1 cc) |
 | Gateway env prepared at launch (ucode) | ✅ evidence | `configured=True`, ANTHROPIC_BASE_URL, apiKeyHelper |
@@ -48,11 +48,11 @@ Last updated: 2026-07-29 late evening.
 |---|---|---|
 | Claude subagent decisions (chips per spawn) | ✅ user | decisions fire |
 | **Claude subagent spawns get the routed model** | ❌ | **user-verified broken**: stale static catalog downgraded sonnet-5→haiku, then Agent tool rejected `databricks-*` id — spawns failed. Fix in flight |
-| Same-harness constraint (no codex suggestions in CC) | ⬜ | shipped w/ tests after user report; not re-confirmed live |
+| Same-harness constraint (no codex suggestions in CC) | 🟡 | user: "seems like it's being followed" — not deliberately exercised yet |
 | **Codex subagent hooks execute at all** | ❌ | evidence: no canary, no spawn audit in bridge dir — codex silently skipped hooks (trust gate). Spawns run, but unrouted. Fix in flight (`fix-codex-enforcement`) |
 | Canary → `subagent_routing_unenforced` warning banner | ❌ | watcher posted nothing (warnings=[]) exactly when it should have. Same fix agent |
-| In-session Subagent routing row (IR/Default, inherit) | ⬜ | shipped `1d030f22`; not confirmed live |
-| Mid-session toggle affects next spawn | ⬜ | server gate shipped `0fb7ea95` w/ tests |
+| In-session Subagent routing row (IR/Default, inherit) | ✅ user | toggle enables/disables routing as expected |
+| Mid-session toggle affects next spawn (process level) | 🟡 | user observed toggling works; per-spawn process effect blocked on the claude/codex apply fixes for a clean read |
 | Fork spawns exempt (v1 policy) | ⬜ | test-pinned only |
 
 ## 5. Visibility & telemetry
