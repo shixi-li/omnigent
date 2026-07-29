@@ -96,7 +96,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 // create-session fetch assertions only observe the POST/PATCH calls they own.
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
-  useBrainHarnessLabels: () => ({
+  // Mirrors the real hook: the "auto" sentinel leads the map only when the
+  // server enables routing, so the Auto-harness tests exercise the real gate.
+  useBrainHarnessLabels: (smartRoutingEnabled = false) => ({
+    ...(smartRoutingEnabled ? { auto: "Auto" } : {}),
     "claude-sdk": "Claude SDK",
     codex: "Codex",
     cursor: "Cursor",
@@ -2811,5 +2814,235 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Intelligent Routing (per-harness Model option) + the fully-auto Auto harness
+//
+// Two distinct products of the router, deliberately separate in the UI:
+//  - "Intelligent Routing" is a Model choice on the two native harnesses whose
+//    running CLI takes a per-turn model switch (claude-native / codex-native).
+//    It sends cost_control_mode_override: "on" with NO model_override.
+//  - "Auto" is a harness choice on bundle agents: the router picks harness AND
+//    model, so its config modal has nothing but Permissions.
+// ---------------------------------------------------------------------------
+
+describe("NewChatLandingScreen intelligent routing", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("offers Intelligent Routing in the Claude Code Model dropdown when the server enables it", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getByRole("option", { name: "Intelligent Routing" })).toBeTruthy();
+    // The harness's own models stay offered alongside it.
+    expect(screen.getByRole("option", { name: "Opus 4.8" })).toBeTruthy();
+  });
+
+  it("hides Intelligent Routing when the server flag is off", () => {
+    renderLanding({ smart_routing_enabled: false });
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.queryByRole("option", { name: "Intelligent Routing" })).toBeNull();
+    expect(screen.getByRole("option", { name: "Default" })).toBeTruthy();
+  });
+
+  it("offers Intelligent Routing as Codex's only Model choice besides Default", () => {
+    // Codex resolves its model catalog inside the running CLI, so the
+    // pre-launch row offers just the two choices the create call can express.
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getByRole("option", { name: "Intelligent Routing" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Default" })).toBeTruthy();
+  });
+
+  it("gives Codex no Model row at all when the server flag is off", () => {
+    renderLanding({ smart_routing_enabled: false });
+    openAgentConfig("a2");
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    // Its Approval row is untouched.
+    expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
+  });
+
+  it("gives a non-routable harness no Model option even with the flag on", () => {
+    mockAgents([
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a_cursor");
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-config-cursor-mode")).toBeTruthy();
+  });
+
+  it("freezes Effort to an em-dash while Intelligent Routing is selected", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    // Pin an effort first, so the em-dash can't pass vacuously on an unset row.
+    pickSelectOption("new-chat-landing-config-effort", "High");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("High");
+    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    const effort = screen.getByTestId("new-chat-landing-config-effort");
+    expect(effort).toBeDisabled();
+    expect(effort.textContent).toContain("—");
+    expect(effort.textContent).not.toContain("High");
+  });
+
+  it("sends cost_control_mode_override 'on' and no model/effort override when routing is picked", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentConfig("a1");
+    // Pin a model + effort first so the routing pick has something to clear.
+    pickSelectOption("new-chat-landing-config-model", "Opus 4.8");
+    pickSelectOption("new-chat-landing-config-effort", "High");
+    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    saveConfig();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(
+        authenticatedFetchMock.mock.calls.some(
+          ([url, init]) => url === "/v1/sessions" && (init as RequestInit | undefined)?.body,
+        ),
+      ).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    // Anchor on a required field so the absence checks can't pass vacuously.
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBe("on");
+    // The router picks the model (and its effort) per turn, so neither may be
+    // pinned — a model_override would suppress per-turn routing server-side.
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("NewChatLandingScreen Auto harness", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    mockAgents([
+      {
+        id: "ag_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "pi",
+        skills: [],
+      },
+    ]);
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  /** Select the Auto harness from the bundle agent's Agent Harness row. */
+  function selectAutoHarness(): void {
+    openAgentConfig("ag_polly");
+    pickSelectOption("new-chat-landing-config-harness", "Auto");
+    saveConfig();
+  }
+
+  it("describes what Auto does next to its harness row", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("ag_polly");
+    openSelect("new-chat-landing-config-harness");
+    const auto = screen.getByTestId("new-chat-landing-harness-auto");
+    expect(auto.textContent).toContain("Auto");
+    expect(auto.textContent).toContain("Harness and model picked per task by intelligent routing");
+  });
+
+  it("reads 'Auto' on the composer chip, with the behavior as hover text", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).toContain("Auto");
+    // The agent it falls back to must not be named — the router owns the pick.
+    expect(chip.textContent).not.toContain("Polly");
+    expect(chip).toHaveAttribute(
+      "title",
+      "Harness and model picked per task by intelligent routing",
+    );
+  });
+
+  it("shows only Permissions in the Auto config modal, titled 'Configure Auto'", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByText("Configure Auto")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
+    // Every harness-specific knob is undecidable before the router picks.
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-harness")).toBeNull();
+  });
+
+  it("keeps the picked permission value across reopens", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    pickSelectOption("new-chat-landing-config-permission", "Plan");
+    saveConfig();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain("Plan");
+  });
+
+  it("leaves Auto via the picker: re-selecting the agent restores its own harness", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Auto");
+    selectAgent("ag_polly");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
+    // The Agent Harness row is back, so the full modal is reachable again.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-harness")).toBeTruthy();
+  });
+
+  it("sends harness_override 'auto' with cost_control_mode_override 'on'", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_auto" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAutoHarness();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.harness_override).toBe("auto");
+    expect(body.cost_control_mode_override).toBe("on");
   });
 });

@@ -17,6 +17,9 @@ export const MODEL_SELECT_DEFAULT = "__default__";
 export const MODEL_SELECT_SMART = "__smart__";
 // Sentinel for the "no explicit effort" (—) choice, same reasoning.
 export const EFFORT_SELECT_NONE = "__none__";
+// Shown in the frozen Effort row when the router picks the model per turn, so
+// no effort can apply. Rendered as the Select's placeholder (value "").
+export const EFFORT_UNAVAILABLE_PLACEHOLDER = "—";
 
 // Claude-native reasoning-effort options for the new-session / scheduled-task
 // model+effort pickers. There is deliberately no hardcoded effort default: an

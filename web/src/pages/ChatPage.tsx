@@ -73,7 +73,11 @@ import {
 } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
-import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
+import {
+  BRAIN_HARNESS_LABELS,
+  INTELLIGENT_ROUTING_LABEL,
+  useBrainHarnessLabels,
+} from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -169,6 +173,7 @@ import { Switch } from "@/components/ui/switch";
 import {
   ConfigRow,
   EFFORT_SELECT_NONE,
+  EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
 } from "@/components/HarnessConfigControls";
@@ -5590,13 +5595,16 @@ function SessionConfigModal({
           no Model dropdown to fold it into (e.g. Polly). Agents that render a
           Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
           {costRoutingEligible && !showModels && (
-            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
+            <ConfigRow
+              label={INTELLIGENT_ROUTING_LABEL}
+              description="Auto-pick the model per turn by task"
+            >
               <div className="flex h-8 items-center justify-end">
                 <Switch
                   size="sm"
                   checked={draftRoutingOn}
                   data-testid="composer-config-smart-routing"
-                  aria-label="Smart Routing"
+                  aria-label={INTELLIGENT_ROUTING_LABEL}
                   onCheckedChange={(next) => {
                     setDraftRoutingOn(next);
                     // Routing picks the model + effort per turn, so an explicit
@@ -5619,7 +5627,7 @@ function SessionConfigModal({
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
                   {costRoutingEligible && (
-                    <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
+                    <SelectItem value={MODEL_SELECT_SMART}>{INTELLIGENT_ROUTING_LABEL}</SelectItem>
                   )}
                   <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
                   {modelSelectOptions.map((m) => (
@@ -5639,10 +5647,11 @@ function SessionConfigModal({
           {showEffort && (
             <ConfigRow label="Effort" description="Reasoning depth vs. speed">
               <Select
-                value={draftEffort ?? EFFORT_SELECT_NONE}
+                // Routing picks the model (and its effort) per turn, so an
+                // explicit effort is meaningless: the row is frozen and reads as
+                // an em-dash placeholder (Radix shows it for the empty value).
+                value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
-                // Smart Routing picks the model + effort per turn, so an
-                // explicit effort can't apply — freeze it to Default.
                 disabled={draftRoutingOn}
               >
                 <SelectTrigger
@@ -5650,7 +5659,7 @@ function SessionConfigModal({
                   data-testid="composer-config-effort"
                   aria-label="Effort"
                 >
-                  <SelectValue />
+                  <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
@@ -5829,18 +5838,21 @@ function useSessionConfigSummary({
   const rows: { label: string; value: string }[] = [];
   if (harnessLabel) rows.push({ label: "Harness", value: harnessLabel });
   if (showModels) {
-    rows.push({ label: "Model", value: routingOn ? "Smart Routing" : (modelLabel ?? "Default") });
+    rows.push({
+      label: "Model",
+      value: routingOn ? INTELLIGENT_ROUTING_LABEL : (modelLabel ?? "Default"),
+    });
   }
-  // Suppress Effort while Smart Routing is on: the router picks the model and
-  // its effort per turn, so a pinned effort doesn't apply and would mislead.
+  // Suppress Effort while routing is on: the router picks the model and its
+  // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
-  // Routable agents with no Model row surface Smart Routing as a standalone row;
+  // Routable agents with no Model row surface routing as a standalone row;
   // those with a Model dropdown fold it into Model above (shown as the value).
   if (costRoutingEligible && !showModels && routingOn) {
-    rows.push({ label: "Smart Routing", value: "On" });
+    rows.push({ label: INTELLIGENT_ROUTING_LABEL, value: "On" });
   }
   return rows;
 }
@@ -5975,15 +5987,15 @@ function ComposerModelEffortLabel({
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  // Smart Routing picks the model + effort per turn, so the label reads
-  // "Smart Routing" with no pinned model/effort — matching the gear tooltip.
+  // Routing picks the model + effort per turn, so the label reads
+  // "Intelligent Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
     return (
       <span
         data-testid="composer-model-effort-label"
         className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
       >
-        <span className="text-foreground">Smart Routing</span>
+        <span className="text-foreground">{INTELLIGENT_ROUTING_LABEL}</span>
       </span>
     );
   }

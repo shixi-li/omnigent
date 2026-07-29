@@ -91,11 +91,29 @@ function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T): T 
  */
 export const AUTO_HARNESS_ID = "auto";
 
+/**
+ * User-facing name for the per-harness Model option where the router picks the
+ * model per turn (the ``__smart__`` sentinel). One constant so the composer
+ * label, the Model dropdown and the gear tooltip can't drift.
+ */
+export const INTELLIGENT_ROUTING_LABEL = "Intelligent Routing";
+
+/**
+ * User-facing name for the fully-auto harness ({@link AUTO_HARNESS_ID}), where
+ * the router picks the harness AND the model. Deliberately distinct from
+ * {@link INTELLIGENT_ROUTING_LABEL} — they are different products of the router.
+ */
+export const AUTO_HARNESS_LABEL = "Auto";
+
+/** One-line behavior blurb for {@link AUTO_HARNESS_LABEL}, shown next to the
+ *  harness-picker row and as the composer chip's hover text. */
+export const AUTO_HARNESS_DESCRIPTION = "Harness and model picked per task by intelligent routing";
+
 export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<string, string> {
   const base = useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS);
   if (!smartRoutingEnabled) return base;
   // Prepend the "auto" sentinel so it appears first in the picker.
-  return { [AUTO_HARNESS_ID]: "Auto", ...base };
+  return { [AUTO_HARNESS_ID]: AUTO_HARNESS_LABEL, ...base };
 }
 
 const _NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};
