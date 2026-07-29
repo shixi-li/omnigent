@@ -49,8 +49,8 @@ Last updated: 2026-07-29 late evening (sticky IR + toggle user-confirmed).
 | Claude subagent decisions (chips per spawn) | ✅ user | decisions fire |
 | **Claude subagent spawns get the routed model** | ❌ | **user-verified broken**: stale static catalog downgraded sonnet-5→haiku, then Agent tool rejected `databricks-*` id — spawns failed. Fix in flight |
 | Same-harness constraint (no codex suggestions in CC) | 🟡 | user: "seems like it's being followed" — not deliberately exercised yet |
-| **Codex subagent hooks execute at all** | ❌ | evidence: no canary, no spawn audit in bridge dir — codex silently skipped hooks (trust gate). Spawns run, but unrouted. Fix in flight (`fix-codex-enforcement`) |
-| Canary → `subagent_routing_unenforced` warning banner | ❌ | watcher posted nothing (warnings=[]) exactly when it should have. Same fix agent |
+| **Codex subagent hooks execute at all** | 🟡 | fix landed `e32c4925` (persisted per-hook trust — the bypass flag is a no-op for app-server); needs host restart + live re-test |
+| Canary → `subagent_routing_unenforced` warning banner | 🟡 | fix landed `e32c4925` (advertisement-armed, first-turn-anchored); needs live re-test |
 | In-session Subagent routing row (IR/Default, inherit) | ✅ user | toggle enables/disables routing as expected |
 | Mid-session toggle affects next spawn (process level) | 🟡 | user observed toggling works; per-spawn process effect blocked on the claude/codex apply fixes for a clean read |
 | Fork spawns exempt (v1 policy) | ⬜ | test-pinned only |
