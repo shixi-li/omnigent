@@ -5723,6 +5723,12 @@ def subagent_routing_armed(bridge_dir: Path) -> bool:
     that relays them, so gating on decisions makes "the gate never ran"
     undetectable.
 
+    "Armed" is not "expected to enforce": hooks are installed on every
+    native session so the setting can be flipped mid-session, so a posted
+    warning is re-checked against the session's *effective* subagent-routing
+    state where it reaches a client (see
+    ``_visible_session_warnings`` in the server's session orchestration).
+
     :param bridge_dir: Native Codex bridge directory.
     :returns: ``True`` when the router advertisement is present.
     """

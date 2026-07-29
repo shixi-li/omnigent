@@ -575,12 +575,51 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
 # ── Session warnings channel ───────────────────────────────────────
 
 
+async def _post_routing_unenforced_warning(client: httpx.AsyncClient, session_id: str) -> None:
+    """Post the warning a codex forwarder sends when the canary never fired.
+
+    :param client: Test HTTP client.
+    :param session_id: Session to post the warning for.
+    """
+    posted = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_warning",
+            "data": {
+                "warnings": [
+                    {
+                        "code": "subagent_routing_unenforced",
+                        "harness": "codex-native",
+                        "reason": "SessionStart canary did not fire",
+                    }
+                ]
+            },
+        },
+    )
+    assert posted.status_code in (200, 201, 202), posted.text
+
+
+async def _snapshot_warning_codes(client: httpx.AsyncClient, session_id: str) -> list[str]:
+    """Return the warning codes the session snapshot exposes.
+
+    :param client: Test HTTP client.
+    :param session_id: Session to read.
+    :returns: ``code`` of each warning on the snapshot.
+    """
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    return [w["code"] for w in snapshot.json()["warnings"]]
+
+
 async def test_session_warning_event_lands_on_the_snapshot(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     agent = await create_test_agent(client, name="routing-warning")
-    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "subagent_routing_override": "on"},
+    )
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["id"]
 
@@ -611,3 +650,117 @@ async def test_session_warning_event_lands_on_the_snapshot(
             "reason": "SessionStart canary did not fire",
         }
     ]
+
+
+async def test_routing_unenforced_warning_is_hidden_when_routing_is_off(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Routing off ⇒ no banner, even though the canary never fired.
+
+    Hooks and the router advertisement are installed on every native
+    session (so the setting can be toggled mid-session), so the runner-side
+    watcher posts this warning regardless. A session that never asked for
+    subagent routing must not be told routing is unenforced.
+    """
+    session_id = await _session_with_routing_flags(client, agent_name="routing-warn-off")
+    await _post_routing_unenforced_warning(client, session_id)
+    assert await _snapshot_warning_codes(client, session_id) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "cost_control", "subagent_routing"),
+    [
+        ("explicit-on", None, "on"),
+        ("inherit-on", "on", None),
+        ("explicit-on-beats-cost-off", "off", "on"),
+    ],
+)
+async def test_routing_unenforced_warning_shows_when_routing_is_on(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    cost_control: str | None,
+    subagent_routing: str | None,
+) -> None:
+    """Routing on (explicitly or inherited) ⇒ the banner is published."""
+    session_id = await _session_with_routing_flags(
+        client,
+        agent_name=f"routing-warn-{case}",
+        cost_control=cost_control,
+        subagent_routing=subagent_routing,
+    )
+    await _post_routing_unenforced_warning(client, session_id)
+    assert await _snapshot_warning_codes(client, session_id) == ["subagent_routing_unenforced"]
+
+
+async def test_routing_unenforced_warning_follows_a_mid_session_toggle(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The banner appears on toggle-on and clears on toggle-off, with no re-post.
+
+    Clearing semantics: the recorded warning is a durable observation
+    ("the hooks never ran"); whether it is *shown* is re-derived from the
+    session's current effective routing state every time a snapshot is
+    built. So a user who turns routing on sees it without waiting for the
+    watcher's next post, and a user who turns it back off stops seeing it.
+    """
+    session_id = await _session_with_routing_flags(client, agent_name="routing-warn-toggle")
+    await _post_routing_unenforced_warning(client, session_id)
+    assert await _snapshot_warning_codes(client, session_id) == []
+
+    on = await client.patch(f"/v1/sessions/{session_id}", json={"subagent_routing_override": "on"})
+    assert on.status_code == 200, on.text
+    # No second event was posted — the toggle alone reveals the warning.
+    assert await _snapshot_warning_codes(client, session_id) == ["subagent_routing_unenforced"]
+
+    off = await client.patch(
+        f"/v1/sessions/{session_id}", json={"subagent_routing_override": "off"}
+    )
+    assert off.status_code == 200, off.text
+    assert await _snapshot_warning_codes(client, session_id) == []
+
+
+async def test_subagent_warning_visibility_inherits_the_parent_setting(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A sub-agent with no override of its own follows its parent's mode."""
+    agent = await create_test_agent(client, name="routing-warn-child")
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert created.status_code == 201, created.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="reviewer:auth",
+        parent_conversation_id=created.json()["id"],
+        agent_id=agent["id"],
+    )
+
+    await _post_routing_unenforced_warning(client, child.id)
+    assert await _snapshot_warning_codes(client, child.id) == ["subagent_routing_unenforced"]
+
+    # The child's own explicit "off" wins over the inherited "on".
+    conv_store.update_conversation(child.id, subagent_routing_override="off")
+    assert await _snapshot_warning_codes(client, child.id) == []
+
+
+async def test_unrelated_warning_codes_are_never_filtered(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The gate only suppresses the routing warning, not the whole channel."""
+    session_id = await _session_with_routing_flags(client, agent_name="routing-warn-other")
+    posted = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_warning",
+            "data": {"warnings": [{"code": "some_other_condition", "harness": "codex-native"}]},
+        },
+    )
+    assert posted.status_code in (200, 201, 202), posted.text
+    assert await _snapshot_warning_codes(client, session_id) == ["some_other_condition"]

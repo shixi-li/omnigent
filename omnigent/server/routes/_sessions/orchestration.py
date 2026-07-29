@@ -6775,6 +6775,16 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    # A sub-agent inherits its parent's routing state, so deciding whether
+    # its routing warnings still apply needs the parent's mode. One indexed
+    # read, gated to sessions that have a parent.
+    parent_cost_control_mode: str | None = None
+    if conv.parent_conversation_id is not None:
+        parent_conv = await asyncio.to_thread(
+            conv_store.get_conversation, conv.parent_conversation_id
+        )
+        if parent_conv is not None:
+            parent_cost_control_mode = parent_conv.cost_control_mode_override
     return _build_session_response(
         conv,
         items,
@@ -6798,6 +6808,7 @@ async def _get_session_snapshot(
         ),
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
+        parent_cost_control_mode=parent_cost_control_mode,
     )
 
 
