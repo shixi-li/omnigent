@@ -799,8 +799,9 @@ class ChildSessionSummary(BaseModel):
         inherits the parent/spec model.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
-        ``RoutingDecisionData.decision_id``. ``None`` until decision ids
-        are joined onto child rows.
+        ``RoutingDecisionData.decision_id``. Read from the child's
+        ``omnigent.routing.decision_id`` label, stamped when routing pins
+        the model. ``None`` when the child was not routed.
     """
 
     id: str
