@@ -12,18 +12,25 @@ from typing import Any
 
 import pytest
 
+from omnigent.entities.conversation import RoutingDecisionData
 from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
-    SubagentDecisionRecord,
     SubagentRouteDecision,
     SubagentRouteRequest,
     candidate_models,
     clear_cache,
+    ensure_session_router,
     make_server_relay_resolver,
     persist_subagent_decision,
     read_advertisement,
+    relayed_decisions,
     resolve_subagent_route,
+    routed_models,
+    router_dir_for_session,
+    routing_enabled,
     session_picks,
+    session_router_env,
+    shutdown_session_router,
     start_subagent_router,
     write_advertisement,
 )
@@ -282,9 +289,9 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
     client = _FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
-    records: list[SubagentDecisionRecord] = []
+    records: list[RoutingDecisionData] = []
 
-    async def _persist(record: SubagentDecisionRecord) -> None:
+    async def _persist(record: RoutingDecisionData) -> None:
         records.append(record)
 
     decision = await resolve_subagent_route(
@@ -294,7 +301,7 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
         persist=_persist,
     )
     assert len(records) == 1
-    data = records[0].to_item_data()
+    data = records[0].model_dump()
     assert data["scope"] == "native_subagent"
     assert data["decision_id"] == decision.decision_id
     assert data["raw_model"] == CLAUDE_MODEL
@@ -307,9 +314,9 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
 @pytest.mark.asyncio
 async def test_deny_is_persisted_unapplied() -> None:
     client = _FakeRoutingClient(error=RuntimeError("router down"))
-    records: list[SubagentDecisionRecord] = []
+    records: list[RoutingDecisionData] = []
 
-    async def _persist(record: SubagentDecisionRecord) -> None:
+    async def _persist(record: RoutingDecisionData) -> None:
         records.append(record)
 
     caps = _FakeCaps(
@@ -324,13 +331,14 @@ async def test_deny_is_persisted_unapplied() -> None:
 @pytest.mark.asyncio
 async def test_persist_appends_routing_decision_item() -> None:
     store = _FakeStore()
-    record = SubagentDecisionRecord(
+    record = RoutingDecisionData(
         model=CLAUDE_MODEL,
         applied=True,
         rationale="deep reasoning",
         decision_id="dec_1",
         harness="claude-native",
         raw_model="claude-opus-4-8",
+        scope="native_subagent",
     )
     await persist_subagent_decision("conv_1", store, record)
     assert len(store.appended) == 1
@@ -356,7 +364,7 @@ async def test_persist_failure_does_not_break_the_decision() -> None:
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
 
-    async def _persist(record: SubagentDecisionRecord) -> None:
+    async def _persist(record: RoutingDecisionData) -> None:
         await persist_subagent_decision("conv_1", _BoomStore(), record)
 
     decision = await resolve_subagent_route(
@@ -527,3 +535,62 @@ async def test_loopback_endpoint_applies_fail_mode_when_resolver_errors(tmp_path
         assert payload["action"] == "deny"
     finally:
         router.close()
+
+
+# ── Enablement gate + session router lifecycle (P7) ─────────────────
+
+
+def test_routing_enabled_reads_the_session_toggle() -> None:
+    assert routing_enabled("on") is True
+    assert routing_enabled("off") is False
+    assert routing_enabled(None) is False
+    assert routing_enabled(None, parent_cost_control_mode="on") is True
+
+
+def test_routing_enabled_requires_a_client_when_caps_are_given() -> None:
+    assert routing_enabled("on", caps=_FakeCaps(routing_client=None)) is False
+    assert routing_enabled("on", caps=_FakeCaps(routing_client=object())) is True
+
+
+def test_router_dir_for_session_is_owner_only(tmp_path: Path) -> None:
+    path = router_dir_for_session("conv_router_dir")
+    assert path.is_dir()
+    assert path.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_session_router_is_idempotent_and_advertises_everywhere(
+    tmp_path: Path,
+) -> None:
+    class _DeadClient:
+        async def post(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("server down")
+
+    first_dir = tmp_path / "a"
+    second_dir = tmp_path / "b"
+
+    async def _run() -> None:
+        router = ensure_session_router(
+            "conv_lifecycle",
+            bridge_dir=first_dir,
+            server_client=_DeadClient(),
+        )
+        again = ensure_session_router(
+            "conv_lifecycle",
+            bridge_dir=second_dir,
+            server_client=_DeadClient(),
+        )
+        assert again is router
+        # Same rendezvous advertised in both directories.
+        assert read_advertisement(first_dir) == read_advertisement(second_dir)
+        env = session_router_env("conv_lifecycle")
+        assert env["OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"] == "conv_lifecycle"
+        assert env["OMNIGENT_CODEX_SUBAGENT_ROUTER_DIR"] == str(first_dir)
+        shutdown_session_router("conv_lifecycle")
+        assert session_router_env("conv_lifecycle") == {}
+
+    asyncio.run(_run())
+
+
+def test_relayed_decisions_start_empty() -> None:
+    assert relayed_decisions("conv_never_routed") == ()
+    assert routed_models("conv_never_routed") == frozenset()

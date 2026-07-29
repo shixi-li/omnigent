@@ -69,6 +69,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
@@ -5454,33 +5455,68 @@ async def _emit_server_routing_decision(
     verdict: dict[str, Any],
     *,
     agent: str | None = None,
-) -> None:
+    scope: str = "turn",
+    harness: str | None = None,
+    decision_id: str | None = None,
+    attempted_override: str | None = None,
+) -> str | None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
     Called by the server-side routing path before the turn is forwarded
     to the runner.  The chip shows the judge's model pick at turn start
     — the same UX the runner-side advisor produced, but driven entirely
-    by the server.
+    by the server. Also emits the decision telemetry event, so every
+    server-side routing decision is recorded in exactly one place.
 
     :param agent: Sub-agent name to include when mirroring a child
         session's routing decision into the parent's transcript.
+    :param scope: What the decision governs, e.g. ``"child_session"``.
+    :param harness: Harness the decision applies to, when it picked one.
+    :param decision_id: Decision identity shared with telemetry and the
+        child-sessions API. ``None`` mints one.
+    :param attempted_override: Model an LLM-supplied ``args.model`` asked
+        for and the router overrode. ``None`` when nothing was attempted.
+    :returns: The decision id, so callers can join it onto the session
+        row; ``None`` is never returned (kept for typing symmetry).
     """
     import uuid
 
+    from omnigent.runtime.telemetry import ROUTING_EVENT_DECISION, emit_routing_event
+
     rationale = verdict.get("rationale", "")
     applied = verdict.get("applied", True)
+    resolved_decision_id = decision_id or str(uuid.uuid4())
+    raw_model = verdict.get("raw_model")
     item_data: dict[str, Any] = {
         "model": model,
         "applied": bool(applied),
         "rationale": rationale if isinstance(rationale, str) else "",
+        "scope": scope,
+        "harness": harness,
+        "decision_id": resolved_decision_id,
+        "raw_model": raw_model if isinstance(raw_model, str) and raw_model else None,
+        "attempted_override": attempted_override,
     }
     if agent is not None:
         item_data["agent"] = agent
+    emit_routing_event(
+        ROUTING_EVENT_DECISION,
+        {
+            "routing.scope": scope,
+            "routing.session_id": session_id,
+            "routing.harness": harness,
+            "routing.model": model,
+            "routing.raw_model": item_data["raw_model"],
+            "routing.applied": bool(applied),
+            "routing.decision_id": resolved_decision_id,
+            "routing.attempted_override": attempted_override,
+        },
+    )
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
         _logger.warning("Server routing: failed to parse routing_decision data")
-        return
+        return None
 
     routing_item = NewConversationItem(
         type="routing_decision",
@@ -5509,6 +5545,7 @@ async def _emit_server_routing_decision(
             },
         },
     )
+    return resolved_decision_id
 
 
 @dataclass
@@ -7929,7 +7966,9 @@ def _child_session_summary_from_conversation(
         # picks a model for a spawned sub-agent. The decision id is not
         # persisted on the conversation row yet, so it stays null.
         routed_model=conv.model_override,
-        routing_decision_id=None,
+        # Joined through a conversation label rather than a new column:
+        # routing stamps the decision id when it pins the child's model.
+        routing_decision_id=conv.labels.get(ROUTING_DECISION_LABEL_KEY),
     )
 
 

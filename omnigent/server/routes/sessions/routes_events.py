@@ -29,6 +29,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     session_stream,
+    session_warnings,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -282,6 +283,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _EXTERNAL_SESSION_WARNING_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
@@ -725,6 +727,17 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_WARNING_TYPE:
+            warnings = body.data.get("warnings")
+            if not isinstance(warnings, list):
+                raise OmnigentError(
+                    "external_session_warning requires a list data.warnings",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            for warning in warnings:
+                if isinstance(warning, dict):
+                    session_warnings.record(session_id, warning)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
             status = body.data.get("status")

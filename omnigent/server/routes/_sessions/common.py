@@ -91,6 +91,12 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
+# Session-scoped degraded-but-running conditions posted by a native
+# forwarder (e.g. a router hook that never fired). Recorded in the
+# in-process warnings index and replayed on the session snapshot.
+_EXTERNAL_SESSION_WARNING_TYPE: str = "external_session_warning"
+
+
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {"idle", "running", "waiting", "failed"}
 )
@@ -358,6 +364,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
+    _EXTERNAL_SESSION_WARNING_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -729,6 +736,7 @@ __all__ = [
     "_EXTERNAL_SESSION_SUPERSEDED_TYPE",
     "_EXTERNAL_SESSION_TODOS_TYPE",
     "_EXTERNAL_SESSION_USAGE_TYPE",
+    "_EXTERNAL_SESSION_WARNING_TYPE",
     "_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT",
     "_EXTERNAL_SUBAGENT_START_TYPE",
     "_EXTERNAL_TOOL_OUTPUT_DELTA_TYPE",

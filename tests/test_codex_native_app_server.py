@@ -604,6 +604,40 @@ def test_write_codex_policy_hooks_file_no_symlink_unchanged(tmp_path: Path) -> N
     assert set(payload["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit"}
 
 
+def test_write_codex_policy_hooks_file_merges_router_hooks(tmp_path: Path) -> None:
+    """Routing hooks share the one hooks.json codex loads, user hooks kept."""
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}}'
+    )
+
+    _write_codex_policy_hooks_file(
+        codex_home,
+        bridge_dir,
+        sys.executable,
+        router_bridge_dir=router_dir,
+        router_session_id="conv_abc",
+        user_hooks_source=user_hooks,
+    )
+
+    hooks = json.loads((codex_home / "hooks.json").read_text())["hooks"]
+    commands = [h["command"] for entry in hooks["PreToolUse"] for h in entry["hooks"]]
+    assert any("codex_router_hook" in c and "--session-id conv_abc" in c for c in commands)
+    assert any("codex_policy_hook" in c or "policy" in c for c in commands)
+    # The routing canary / audit events and the user's own hook survive.
+    assert "SessionStart" in hooks
+    assert "SubagentStart" in hooks
+    assert hooks["Stop"][0]["hooks"][0]["command"] == "echo bye"
+
+
 async def test_missing_hook_raises() -> None:
     """
     No discovered Omnigent hook fails loud (anti fail-open).

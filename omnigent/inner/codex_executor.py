@@ -18,7 +18,14 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+)
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -1157,27 +1164,64 @@ def read_codex_spawn_audit(bridge_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
-def subagent_routing_unenforced_warning(reason: str) -> dict[str, Any]:
+def subagent_routing_unenforced_warning(
+    reason: str, *, harness: str = "codex-native"
+) -> dict[str, Any]:
     """
     Build the session-scoped warning for unenforced subagent routing.
 
-    The payload shape is the frozen contract the web UI renders. This
-    helper is the single place it is built so both sides stay in step.
-
-    TODO(P7): emit this on the session-status channel after launch when
-    :func:`codex_router_canary_fired` is ``False`` — the poster lives in
-    ``codex_native_forwarder`` (``external_session_status`` session
-    events), which this packet does not own.
+    The payload shape is the frozen contract the web UI renders (keyed by
+    ``code``, the field the header banner reads). This helper is the
+    single place it is built so both sides stay in step. Posted on the
+    session's ``external_session_warning`` channel by the codex forwarder.
 
     :param reason: Human-readable cause, e.g. ``"SessionStart canary did
         not fire; codex skipped the generated hooks (untrusted)."``.
-    :returns: Warning payload ``{"warning", "harness", "reason"}``.
+    :param harness: Harness the warning is about, e.g. ``"codex-native"``.
+    :returns: Warning payload ``{"code", "harness", "reason"}``.
     """
     return {
-        "warning": SUBAGENT_ROUTING_UNENFORCED_WARNING,
-        "harness": "codex",
+        "code": SUBAGENT_ROUTING_UNENFORCED_WARNING,
+        "harness": harness,
         "reason": reason,
     }
+
+
+def reconcile_spawn_audit(
+    records: Iterable[Mapping[str, Any]],
+    routed_models: Collection[str],
+    *,
+    harness: str = "codex-native",
+) -> list[dict[str, Any]]:
+    """
+    Compare ``SubagentStart`` audit records against the routed models.
+
+    The audit is the only place codex reports the model it *actually*
+    started a subagent on, so a rewrite the harness ignored shows up here
+    and nowhere else. Records naming a model the router never approved
+    yield one warning each.
+
+    :param records: Audit records from :func:`read_codex_spawn_audit`.
+    :param routed_models: Models the router approved for the session.
+        Empty means nothing was routed, so there is nothing to contradict.
+    :param harness: Harness label for the emitted warnings.
+    :returns: Warning payloads, one per mismatching record.
+    """
+    if not routed_models:
+        return []
+    expected = ", ".join(sorted(routed_models))
+    warnings: list[dict[str, Any]] = []
+    for record in records:
+        spawned = record.get("model")
+        if not isinstance(spawned, str) or not spawned or spawned in routed_models:
+            continue
+        warnings.append(
+            subagent_routing_unenforced_warning(
+                f"spawned model {spawned} != routed model {expected}",
+                harness=harness,
+            )
+        )
+    return warnings
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating

@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -35,7 +36,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    import httpx
+
+    from omnigent.entities.conversation import RoutingDecisionData
+
+from omnigent._platform import stable_user_id
+from omnigent.runtime.telemetry import ROUTING_EVENT_DECISION, emit_routing_event
 
 _logger = logging.getLogger(__name__)
 
@@ -53,6 +62,11 @@ SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-subagent"
 DEFAULT_FAIL_MODE: Literal["open", "closed"] = "open"
 DEFAULT_CACHE_TTL_S = 300.0
 
+#: Conversation label carrying the routing decision behind a session's
+#: ``model_override``, so the child-sessions API can join the two without
+#: a new column or a transcript scan.
+ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
+
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 
@@ -66,6 +80,40 @@ _COUNTERPART_HARNESS: dict[str, str] = {
 }
 
 Resolver = Callable[[str, "SubagentRouteRequest"], Awaitable["SubagentRouteDecision"]]
+
+
+# ── Enablement gate ────────────────────────────────────────────────────────
+
+
+def routing_enabled(
+    cost_control_mode: str | None,
+    *,
+    parent_cost_control_mode: str | None = None,
+    caps: Any = None,
+) -> bool:
+    """Report whether intelligent routing is on for one session.
+
+    The single gate every wiring site reads, so "routing is on" means the
+    same thing in the server's turn path and at each harness launch. Two
+    conditions: the per-session toggle (its own, or its parent's for a
+    spawned child — the server routes children of a routed parent), and,
+    where a ``RuntimeCaps`` is in reach, a configured routing client.
+
+    :param cost_control_mode: The session's ``cost_control_mode_override``,
+        e.g. ``"on"``.
+    :param parent_cost_control_mode: The parent session's value for a
+        spawned child. ``None`` for a top-level session.
+    :param caps: ``RuntimeCaps``-shaped object whose ``routing_client``
+        must be configured. ``None`` skips that check — the runner
+        process holds no routing client (the server relay owns the policy
+        and its fail mode), so runner-side callers pass nothing.
+    :returns: ``True`` when routing applies to this session.
+    """
+    if cost_control_mode != "on" and parent_cost_control_mode != "on":
+        return False
+    if caps is None:
+        return True
+    return getattr(caps, "routing_client", None) is not None
 
 
 # ── Wire types ─────────────────────────────────────────────────────────────
@@ -180,52 +228,20 @@ class _Settings:
     cache_ttl_s: float = DEFAULT_CACHE_TTL_S
 
 
-# P7: swap this mirror for ``RoutingDecisionData`` once P5's additive
-# fields land — field names already match the frozen shape.
-@dataclass(frozen=True)
-class SubagentDecisionRecord:
-    """Transcript payload for one native-subagent routing decision."""
-
-    model: str
-    applied: bool
-    rationale: str
-    decision_id: str
-    harness: str | None = None
-    raw_model: str | None = None
-    agent: str | None = None
-    attempted_override: str | None = None
-    scope: str = _SCOPE
-
-    def to_item_data(self) -> dict[str, Any]:
-        """Return the ``routing_decision`` item data dict.
-
-        :returns: Item data carrying the full field set.
-        """
-        return {
-            "model": self.model,
-            "applied": self.applied,
-            "rationale": self.rationale,
-            "agent": self.agent,
-            "harness": self.harness,
-            "scope": self.scope,
-            "decision_id": self.decision_id,
-            "raw_model": self.raw_model,
-            "attempted_override": self.attempted_override,
-        }
-
-
 def decision_record(
     req: SubagentRouteRequest,
     decision: SubagentRouteDecision,
-) -> SubagentDecisionRecord:
-    """Build the transcript record for *decision*.
+) -> RoutingDecisionData:
+    """Build the transcript payload for *decision*.
 
     :param req: The spawn that was routed.
     :param decision: The verdict returned to the hook.
-    :returns: Record ready for :func:`persist_subagent_decision`.
+    :returns: Item data ready for :func:`persist_subagent_decision`.
     """
+    from omnigent.entities.conversation import RoutingDecisionData
+
     model = decision.model or req.parent_model or "unrouted"
-    return SubagentDecisionRecord(
+    return RoutingDecisionData(
         model=model,
         applied=decision.action in ("rewrite", "redirect"),
         rationale=decision.rationale,
@@ -233,6 +249,7 @@ def decision_record(
         harness=decision.harness or req.harness,
         raw_model=decision.raw_model,
         agent=req.task_name or None,
+        scope=_SCOPE,
     )
 
 
@@ -408,7 +425,7 @@ async def resolve_subagent_route(
     *,
     caps: Any = None,
     available_models: dict[str, list[str]] | None = None,
-    persist: Callable[[SubagentDecisionRecord], Awaitable[None]] | None = None,
+    persist: Callable[[RoutingDecisionData], Awaitable[None]] | None = None,
     now: float | None = None,
 ) -> SubagentRouteDecision:
     """Decide what happens to one native-subagent spawn.
@@ -432,6 +449,19 @@ async def resolve_subagent_route(
     clock = time.time() if now is None else now
 
     decision = await _decide(session_id, req, caps, settings, available_models, clock)
+    emit_routing_event(
+        ROUTING_EVENT_DECISION,
+        {
+            "routing.scope": _SCOPE,
+            "routing.session_id": session_id,
+            "routing.harness": decision.harness or req.harness,
+            "routing.model": decision.model,
+            "routing.raw_model": decision.raw_model,
+            "routing.action": decision.action,
+            "routing.decision_id": decision.decision_id,
+            "routing.task_name": req.task_name or None,
+        },
+    )
     if persist is not None:
         try:
             await persist(decision_record(req, decision))
@@ -542,36 +572,22 @@ def _decision_from_result(
 async def persist_subagent_decision(
     session_id: str,
     conversation_store: Any,
-    record: SubagentDecisionRecord,
+    record: RoutingDecisionData,
 ) -> None:
     """Persist and publish *record* as a ``routing_decision`` item.
-
-    Drops the additive §5.2 fields when the installed
-    ``RoutingDecisionData`` does not accept them yet, so the chip still
-    lands on a store built before the model extension.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``append``.
     :param record: Decision payload.
     """
-    from omnigent.entities.conversation import NewConversationItem, parse_item_data
+    from omnigent.entities.conversation import NewConversationItem
     from omnigent.runtime import session_stream
 
-    item_data = record.to_item_data()
-    try:
-        parsed = parse_item_data("routing_decision", item_data)
-    except (ValueError, TypeError):
-        legacy = {k: item_data[k] for k in ("model", "applied", "rationale", "agent")}
-        try:
-            parsed = parse_item_data("routing_decision", legacy)
-        except (ValueError, TypeError):
-            _logger.warning("route-subagent: failed to parse routing_decision data")
-            return
-
+    item_data = record.model_dump()
     item = NewConversationItem(
         type="routing_decision",
         response_id=f"routing_{uuid.uuid4().hex}",
-        data=parsed,
+        data=record,
     )
     try:
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
@@ -594,7 +610,7 @@ async def persist_subagent_decision(
 def store_persister(
     session_id: str,
     conversation_store: Any,
-) -> Callable[[SubagentDecisionRecord], Awaitable[None]]:
+) -> Callable[[RoutingDecisionData], Awaitable[None]]:
     """Bind :func:`persist_subagent_decision` to a session and store.
 
     :param session_id: Session/conversation identifier.
@@ -602,7 +618,7 @@ def store_persister(
     :returns: Coroutine function accepting a record.
     """
 
-    async def _persist(record: SubagentDecisionRecord) -> None:
+    async def _persist(record: RoutingDecisionData) -> None:
         await persist_subagent_decision(session_id, conversation_store, record)
 
     return _persist
@@ -611,18 +627,34 @@ def store_persister(
 # ── Runner-side loopback relay ─────────────────────────────────────────────
 
 
-def write_advertisement(bridge_dir: Path, *, url: str, token: str) -> Path:
+def write_advertisement(
+    bridge_dir: Path,
+    *,
+    url: str,
+    token: str,
+    session_id: str | None = None,
+) -> Path:
     """Advertise the endpoint to hook scripts.
 
     :param bridge_dir: Session bridge directory.
     :param url: Endpoint base URL, e.g. ``"http://127.0.0.1:53421"``.
     :param token: Bearer token hook scripts must present.
+    :param session_id: Session the endpoint serves. Included so a hook
+        with no session env var of its own still knows which session to
+        route for.
     :returns: Path of the written ``subagent_router.json``.
     """
     bridge_dir.mkdir(parents=True, exist_ok=True)
     path = bridge_dir / ADVERTISEMENT_FILE
     tmp = path.with_name(f"{path.name}.tmp")
-    payload = {"url": url, "token": token, "pid": os.getpid(), "updated_at": time.time()}
+    payload: dict[str, Any] = {
+        "url": url,
+        "token": token,
+        "pid": os.getpid(),
+        "updated_at": time.time(),
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
@@ -699,7 +731,7 @@ def start_subagent_router(
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = httpd.server_address[0], httpd.server_address[1]
     url = f"http://{host}:{port}"
-    write_advertisement(bridge_dir, url=url, token=token)
+    write_advertisement(bridge_dir, url=url, token=token, session_id=session_id)
     threading.Thread(
         target=httpd.serve_forever,
         name="omnigent-subagent-router",
@@ -809,3 +841,185 @@ def make_server_relay_resolver(
         return SubagentRouteDecision.from_payload(payload)
 
     return _resolve
+
+
+# ── Per-session router lifecycle (runner side) ─────────────────────────────
+
+_session_routers: dict[str, SubagentRouter] = {}
+# Models the relay actually handed back, per session — the ledger the
+# codex ``SubagentStart`` audit is reconciled against.
+_relayed: dict[str, list[dict[str, Any]]] = {}
+_lifecycle_lock = threading.Lock()
+
+
+def relayed_decisions(session_id: str) -> tuple[dict[str, Any], ...]:
+    """Return the verdicts this runner relayed for *session_id*.
+
+    :param session_id: Session/conversation identifier.
+    :returns: Records ``{decision_id, action, model, harness, task_name}``,
+        oldest first.
+    """
+    with _lifecycle_lock:
+        return tuple(_relayed.get(session_id, ()))
+
+
+def routed_models(session_id: str) -> frozenset[str]:
+    """Return every model the router approved for *session_id*.
+
+    :param session_id: Session/conversation identifier.
+    :returns: Approved model ids; empty when nothing was routed.
+    """
+    return frozenset(
+        str(record["model"])
+        for record in relayed_decisions(session_id)
+        if record.get("model") and record.get("action") in ("rewrite", "allow")
+    )
+
+
+def _recording_resolver(resolver: Resolver) -> Resolver:
+    """Wrap *resolver* so each verdict lands in the reconciliation ledger."""
+
+    async def _resolve(session_id: str, req: SubagentRouteRequest) -> SubagentRouteDecision:
+        decision = await resolver(session_id, req)
+        with _lifecycle_lock:
+            _relayed.setdefault(session_id, []).append(
+                {
+                    "decision_id": decision.decision_id,
+                    "action": decision.action,
+                    "model": decision.model,
+                    "harness": decision.harness or req.harness,
+                    "task_name": req.task_name,
+                }
+            )
+        return decision
+
+    return _resolve
+
+
+def ensure_session_router(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    server_client: httpx.AsyncClient,
+    loop: asyncio.AbstractEventLoop | None = None,
+    fail_mode: Literal["open", "closed"] = DEFAULT_FAIL_MODE,
+) -> SubagentRouter:
+    """Start (once) the loopback router serving *session_id*.
+
+    Idempotent: a second call for a session already served returns the
+    running router after re-asserting its advertisement, so a resumed or
+    re-launched terminal finds the file the hook scripts read.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Directory the advertisement is written into — the
+        same directory the harness's hooks are pointed at.
+    :param server_client: Runner→server client used to relay verdicts to
+        the process holding ``RuntimeCaps.routing_client``.
+    :param loop: Event loop owning the relay. ``None`` uses the running
+        loop.
+    :param fail_mode: Behavior when the server hop fails.
+    :returns: The running router handle.
+    """
+    with _lifecycle_lock:
+        existing = _session_routers.get(session_id)
+    if existing is not None:
+        write_advertisement(
+            bridge_dir,
+            url=existing.url,
+            token=existing.token,
+            session_id=session_id,
+        )
+        return existing
+    router = start_subagent_router(
+        bridge_dir=bridge_dir,
+        session_id=session_id,
+        resolver=_recording_resolver(
+            make_server_relay_resolver(server_client, fail_mode=fail_mode)
+        ),
+        loop=loop if loop is not None else asyncio.get_running_loop(),
+        fail_mode=fail_mode,
+    )
+    with _lifecycle_lock:
+        _session_routers[session_id] = router
+    _logger.info(
+        "subagent router started: session=%s url=%s dir=%s", session_id, router.url, bridge_dir
+    )
+    return router
+
+
+def shutdown_session_router(session_id: str) -> None:
+    """Stop the router serving *session_id* and forget its state.
+
+    :param session_id: Session/conversation identifier.
+    """
+    with _lifecycle_lock:
+        router = _session_routers.pop(session_id, None)
+        _relayed.pop(session_id, None)
+    if router is None:
+        return
+    with contextlib.suppress(Exception):
+        router.close()
+    clear_cache(session_id)
+
+
+def router_dir_for_session(session_id: str) -> Path:
+    """Return the advertisement directory for a session with no bridge dir.
+
+    The SDK harnesses (claude-agent-sdk, codex app-server) have no bridge
+    directory of their own, so the router gets a private owner-only one
+    beside the native bridges.
+
+    :param session_id: Session/conversation identifier.
+    :returns: Created directory, mode ``0o700``.
+    """
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    root = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "subagent-router"
+    path = root / digest
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def session_router_env(session_id: str) -> dict[str, str]:
+    """Return the router env for a session, or ``{}`` when it has no router.
+
+    Read at harness-spawn time so a session whose router was started at
+    session init hands every harness process the same rendezvous.
+
+    :param session_id: Session/conversation identifier.
+    :returns: Env-var overrides, empty when routing is off for the session.
+    """
+    with _lifecycle_lock:
+        router = _session_routers.get(session_id)
+    if router is None:
+        return {}
+    return router_env(session_id, router.bridge_dir)
+
+
+def router_env(session_id: str, router_dir: Path) -> dict[str, str]:
+    """Build the env that points a harness process at the router.
+
+    Both harness families read the advertisement out of a directory named
+    in the environment: the claude-agent-sdk executor registers its
+    in-process hook from it, and the codex executor uses it as the switch
+    that turns generated routing ``hooks.json`` on.
+
+    :param session_id: Session/conversation identifier.
+    :param router_dir: Directory holding ``subagent_router.json``.
+    :returns: Env-var overrides for the harness process.
+    """
+    from omnigent.inner.codex_executor import (
+        CODEX_ROUTER_DIR_ENV_VAR,
+        CODEX_ROUTER_SESSION_ID_ENV_VAR,
+    )
+    from omnigent.inner.hook_scripts.subagent_router import (
+        ROUTER_DIR_ENV_VAR,
+        SESSION_ID_ENV_VAR,
+    )
+
+    return {
+        ROUTER_DIR_ENV_VAR: str(router_dir),
+        SESSION_ID_ENV_VAR: session_id,
+        CODEX_ROUTER_DIR_ENV_VAR: str(router_dir),
+        CODEX_ROUTER_SESSION_ID_ENV_VAR: session_id,
+    }

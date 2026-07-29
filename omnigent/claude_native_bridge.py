@@ -1437,6 +1437,7 @@ def augment_claude_args(
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
+    subagent_router_dir: Path | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1473,6 +1474,10 @@ def augment_claude_args(
         append through Claude Code's native ``--append-system-prompt`` flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
+    :param subagent_router_dir: Directory advertising the runner's
+        ``route-subagent`` endpoint, threaded to
+        :func:`build_hook_settings` so native ``Task`` spawns are routed.
+        ``None`` leaves them unrouted.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1485,6 +1490,7 @@ def augment_claude_args(
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_effort=_arg_value(claude_args, "--effort"),
+        subagent_router_dir=subagent_router_dir,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)

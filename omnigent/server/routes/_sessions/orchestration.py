@@ -54,12 +54,14 @@ from omnigent.policies.types import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
     inflight_text,
     pending_elicitations,
     pending_inputs,
+    session_warnings,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
@@ -785,6 +787,9 @@ def _build_session_response(
         # when no per-model usage was recorded.
         usage_by_model=_usage_by_model_for_display(display_usage),
         last_task_error=last_task_error,
+        # Replay session-scoped warnings so a client that connects after
+        # the condition was observed still sees the header banner.
+        warnings=session_warnings.snapshot_for(conv.id),
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
         # Replay outstanding approval prompts into the snapshot.
@@ -3690,6 +3695,10 @@ async def _forward_event_to_runner(
     _routed_model: str | None = None
     _routed_harness: str | None = None
     _verdict: dict[str, Any] | None = None
+    # The model the orchestrator's ``sys_session_send`` asked for, captured
+    # before routing overwrites it: when the router picks something else the
+    # attempt is recorded on the decision instead of silently vanishing.
+    _attempted_override = effective_runner_override
     # For child sessions, route even when the orchestrator specified a model via
     # sys_session_send (effective_runner_override is already set). Smart routing
     # always wins over the LLM's own model choice when the parent toggle is on.
@@ -3797,12 +3806,15 @@ async def _forward_event_to_runner(
         # Auto-harness card (success or failure) emitted here for the same
         # ordering reason; it was resolved earlier in the turn.
         if _auto_card_model is not None and _auto_card_verdict is not None:
-            await _emit_server_routing_decision(
+            _auto_decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _auto_card_model,
                 _auto_card_verdict,
+                scope="session",
+                harness=_auto_harness,
             )
+            await _stamp_routing_decision_label(session_id, conversation_store, _auto_decision_id)
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -3810,14 +3822,29 @@ async def _forward_event_to_runner(
                     _auto_card_model,
                     _auto_card_verdict,
                     agent=agent_name or "",
+                    scope="session",
+                    harness=_auto_harness,
+                    decision_id=_auto_decision_id,
                 )
         if _routed_model is not None and _verdict is not None:
-            await _emit_server_routing_decision(
+            _decision_scope = "child_session" if _parent_routing_on else "turn"
+            # The router wins over the orchestrator's own pick; the attempt
+            # is recorded so the UI can show what it overrode.
+            _overridden = (
+                _attempted_override
+                if _attempted_override is not None and _attempted_override != _routed_model
+                else None
+            )
+            _decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _routed_model,
                 _verdict,
+                scope=_decision_scope,
+                harness=_routed_harness or _resolve_harness(conv),
+                attempted_override=_overridden,
             )
+            await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
             # Mirror the routing decision into the parent session so the
             # orchestrator's transcript also shows which model was chosen
             # for this sub-agent — the decision is otherwise only visible
@@ -3829,6 +3856,10 @@ async def _forward_event_to_runner(
                     _routed_model,
                     _verdict,
                     agent=agent_name or "",
+                    scope=_decision_scope,
+                    harness=_routed_harness or _resolve_harness(conv),
+                    decision_id=_decision_id,
+                    attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
         _logger.exception(
@@ -3843,6 +3874,36 @@ async def _forward_event_to_runner(
         ) from exc
 
     return persisted_items[0].id
+
+
+async def _stamp_routing_decision_label(
+    session_id: str,
+    conversation_store: ConversationStore,
+    decision_id: str | None,
+) -> None:
+    """Record the decision behind a session's pinned model as a label.
+
+    The child-sessions API reads it to render which decision produced a
+    sub-agent's routed model, without a new conversation column.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store exposing ``set_labels``.
+    :param decision_id: Decision identity, or ``None`` to skip.
+    """
+    if decision_id is None:
+        return
+    try:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {ROUTING_DECISION_LABEL_KEY: decision_id},
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "smart_routing: failed to label routing decision for session=%s",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
@@ -4055,11 +4116,17 @@ async def _dispatch_session_event_to_runner_impl(
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
         if _native_routed_model is not None and _native_verdict is not None:
-            await _emit_server_routing_decision(
+            _native_scope = "child_session" if _native_parent_routing_on else "turn"
+            _native_decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _native_routed_model,
                 _native_verdict,
+                scope=_native_scope,
+                harness=_resolve_harness(conv),
+            )
+            await _stamp_routing_decision_label(
+                session_id, conversation_store, _native_decision_id
             )
             if _native_parent_routing_on and conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
@@ -4068,6 +4135,9 @@ async def _dispatch_session_event_to_runner_impl(
                     _native_routed_model,
                     _native_verdict,
                     agent=agent_name or "",
+                    scope=_native_scope,
+                    harness=_resolve_harness(conv),
+                    decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(

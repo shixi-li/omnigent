@@ -351,6 +351,8 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param cost_control_mode: The session's ``cost_control_mode_override``,
+        e.g. ``"on"`` — the intelligent-routing gate.
     """
 
     workspace: Path
@@ -362,6 +364,7 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    cost_control_mode: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -412,6 +415,51 @@ class _KiroNativeLaunchConfig:
     terminal_launch_args: list[str] | None
     external_session_id: str | None
     model_override: str | None = None
+
+
+def _start_subagent_router_for_native_session(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    harness: str,
+    cost_control_mode: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> Path | None:
+    """Start the subagent-routing endpoint for a native session.
+
+    Native harnesses enforce routing through hooks configured at terminal
+    launch, so the endpoint has to be live (and advertised in the bridge
+    dir the hooks read) before the CLI starts.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Session bridge directory the hooks discover.
+    :param harness: Harness label for the enablement telemetry event.
+    :param cost_control_mode: The session's ``cost_control_mode_override``.
+    :param server_client: Runner→server client the relay forwards on.
+    :returns: The advertisement directory to point hooks at, or ``None``
+        when routing is off for this session.
+    """
+    from omnigent.runner.subagent_routing import ensure_session_router, routing_enabled
+    from omnigent.runtime.telemetry import ROUTING_EVENT_ENABLED, emit_routing_event
+
+    if server_client is None or not routing_enabled(cost_control_mode):
+        return None
+    try:
+        ensure_session_router(
+            session_id,
+            bridge_dir=bridge_dir,
+            server_client=server_client,
+        )
+    except OSError:
+        _logger.warning(
+            "subagent router could not start for session=%s", session_id, exc_info=True
+        )
+        return None
+    emit_routing_event(
+        ROUTING_EVENT_ENABLED,
+        {"routing.session_id": session_id, "routing.harness": harness},
+    )
+    return bridge_dir
 
 
 def _required_runner_env(name: str) -> str:
@@ -755,6 +803,11 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        cost_control_mode=(
+            snapshot.get("cost_control_mode_override")
+            if isinstance(snapshot.get("cost_control_mode_override"), str)
+            else None
+        ),
     )
 
 
@@ -3653,6 +3706,20 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
     )
+    # Generate routing hooks.json (and bypass codex's hook-trust prompt) when
+    # intelligent routing is on: the app-server reads the endpoint out of its
+    # own process env at start.
+    _codex_router_dir = _start_subagent_router_for_native_session(
+        session_id,
+        bridge_dir=bridge_dir,
+        harness="codex-native",
+        cost_control_mode=launch_config.cost_control_mode,
+        server_client=server_client,
+    )
+    if _codex_router_dir is not None:
+        from omnigent.runner.subagent_routing import router_env
+
+        app_server.env.update(router_env(session_id, _codex_router_dir))
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
@@ -5296,7 +5363,11 @@ def _ensure_orchestrator_skills_in_bundle(
 
 @dataclasses.dataclass(frozen=True)
 class _ClaudeSessionLaunchMetadata:
-    """Persisted values consumed by Claude terminal launch."""
+    """Persisted values consumed by Claude terminal launch.
+
+    ``cost_control_mode`` is the session's ``cost_control_mode_override``
+    — the intelligent-routing gate read at launch.
+    """
 
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -5304,6 +5375,7 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    cost_control_mode: str | None = None
 
 
 def _claude_launch_metadata_from_envelope(
@@ -5326,6 +5398,7 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        cost_control_mode=snapshot.cost_control_mode_override,
     )
 
 
@@ -5380,6 +5453,11 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        cost_control_mode=(
+            snapshot.get("cost_control_mode_override")
+            if isinstance(snapshot.get("cost_control_mode_override"), str)
+            else None
+        ),
     )
     _logger.info(
         "Claude terminal launch config fetched: session=%s status=%s effort_set=%s "
@@ -5488,6 +5566,7 @@ async def _auto_create_claude_terminal(
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner.subagent_routing import shutdown_session_router
 
     workspace = (
         session_init.snapshot.workspace
@@ -5849,6 +5928,16 @@ async def _auto_create_claude_terminal(
     # has the spec resolver) expose a bundle's ``skills/`` to Claude Code
     # via ``--plugin-dir`` — the CLI mirror of the SDK plugin wiring.
     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
+    # Route natively spawned subagents (the Task/Agent tool) when intelligent
+    # routing is on for this session: start the loopback endpoint in the
+    # bridge dir the PreToolUse hook already discovers.
+    subagent_router_dir = _start_subagent_router_for_native_session(
+        session_id,
+        bridge_dir=bridge_dir,
+        harness="claude-native",
+        cost_control_mode=launch_metadata.cost_control_mode,
+        server_client=server_client,
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -5858,6 +5947,7 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        subagent_router_dir=subagent_router_dir,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
@@ -6025,6 +6115,7 @@ async def _auto_create_claude_terminal(
             if refresh_task is not None:
                 refresh_task.cancel()
                 _ = await asyncio.gather(refresh_task, return_exceptions=True)
+            shutdown_session_router(session_id)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),

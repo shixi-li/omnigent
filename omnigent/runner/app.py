@@ -553,6 +553,15 @@ class _SessionInitContext:
         """Return server-supplied labels, or ``None`` on the legacy path."""
         return self.envelope.snapshot.labels if self.envelope is not None else None
 
+    @property
+    def cost_control_mode(self) -> str | None:
+        """Return the session's cost-control toggle, the routing gate input."""
+        return (
+            self.envelope.snapshot.cost_control_mode_override
+            if self.envelope is not None
+            else None
+        )
+
 
 # Language constant the omnigent YAML translator stamps on callable-backed
 # tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE). Duplicated rather
@@ -2558,11 +2567,18 @@ def create_runner_app(
                 if _start_verdict.data is not None:
                     _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
 
+            await _ensure_session_subagent_router(
+                session_id,
+                harness_name,
+                init_context=init_context,
+                server_client=server_client,
+            )
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
+                session_id=session_id,
             )
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
@@ -5823,6 +5839,7 @@ def create_runner_app(
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=msg_body.get("model_override"),
+                session_id=conv,
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -9704,7 +9721,12 @@ async def _resolve_harness_config(
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
-                spec, harness, cwd=cwd, workdir=workdir, model_override=model_override
+                spec,
+                harness,
+                cwd=cwd,
+                workdir=workdir,
+                model_override=model_override,
+                session_id=session_id,
             )
             return harness, spawn_env
 
@@ -9739,6 +9761,54 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
 
 
+async def _ensure_session_subagent_router(
+    session_id: str,
+    harness: str | None,
+    *,
+    init_context: _SessionInitContext,
+    server_client: httpx.AsyncClient | None,
+) -> None:
+    """Start this session's subagent-routing endpoint when routing is on.
+
+    Only for the SDK harness families: the native terminals know their own
+    bridge directory and start the router from their launch paths, where
+    the harness's hooks are also pointed at it.
+
+    :param session_id: Session/conversation identifier.
+    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param init_context: Server-supplied session snapshot carrying the
+        routing toggle.
+    :param server_client: Runner→server client the relay forwards on.
+        ``None`` (in-process tests) skips the start.
+    """
+    from omnigent.runner.subagent_routing import (
+        ensure_session_router,
+        router_dir_for_session,
+        routing_enabled,
+    )
+    from omnigent.runtime.telemetry import ROUTING_EVENT_ENABLED, emit_routing_event
+
+    if server_client is None or is_native_harness(harness):
+        return
+    if not routing_enabled(init_context.cost_control_mode):
+        return
+    try:
+        ensure_session_router(
+            session_id,
+            bridge_dir=router_dir_for_session(session_id),
+            server_client=server_client,
+        )
+    except OSError:
+        _logger.warning(
+            "subagent router could not start for session=%s", session_id, exc_info=True
+        )
+        return
+    emit_routing_event(
+        ROUTING_EVENT_ENABLED,
+        {"routing.session_id": session_id, "routing.harness": harness},
+    )
+
+
 def _build_spawn_env_from_spec(
     spec: Any,
     harness: str,
@@ -9746,6 +9816,7 @@ def _build_spawn_env_from_spec(
     cwd: Path | None = None,
     workdir: Path | None = None,
     model_override: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -9753,6 +9824,8 @@ def _build_spawn_env_from_spec(
     :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
     :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
+    :param session_id: Session/conversation id, used to hand the harness
+        this session's subagent-routing endpoint. ``None`` omits it.
     :param model_override: The per-session ``/model`` override, e.g.
         ``"claude-sonnet-4-6"``, or ``None``. When set, it overrides the
         ``HARNESS_<H>_MODEL`` the builder baked in (spec model / provider
@@ -9814,6 +9887,14 @@ def _build_spawn_env_from_spec(
                 return None
     except ImportError:
         return None
+
+    # Point the harness process at this session's subagent-routing endpoint
+    # when one is running (started at session init). Empty for unrouted
+    # sessions, so nothing changes when routing is off.
+    if env is not None and session_id:
+        from omnigent.runner.subagent_routing import session_router_env
+
+        env.update(session_router_env(session_id))
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the

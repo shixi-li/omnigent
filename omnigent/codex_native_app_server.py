@@ -44,6 +44,9 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_hook_trust_bypass_args,
+    codex_router_bridge_dir,
+    codex_router_hooks_settings,
+    codex_router_session_id,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
@@ -607,9 +610,15 @@ class CodexNativeAppServer:
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
+        # When the runner advertises a route-subagent endpoint, the generated
+        # hooks file owns hooks.json, so the user's copy is merged in rather
+        # than symlinked over.
+        router_bridge_dir = codex_router_bridge_dir(self.env)
+        config_source = _codex_home_config_source_from_env()
         _populate_codex_home_config(
             self.codex_home,
-            _codex_home_config_source_from_env(),
+            config_source,
+            subagent_routing=router_bridge_dir is not None,
         )
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
@@ -646,7 +655,12 @@ class CodexNativeAppServer:
             # ap_server_url the hook is still registered + trusted but
             # no-ops.
             _write_codex_policy_hooks_file(
-                self.codex_home, self.bridge_dir, self.python_executable
+                self.codex_home,
+                self.bridge_dir,
+                self.python_executable,
+                router_bridge_dir=router_bridge_dir,
+                router_session_id=codex_router_session_id(self.env),
+                user_hooks_source=config_source / _CODEX_HOOKS_FILE,
             )
             if self.ap_server_url:
                 write_policy_hook_config(
@@ -959,6 +973,28 @@ def _codex_policy_hooks_settings(
     }
 
 
+def _merge_hook_payloads(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge two ``hooks.json``-shaped payloads, *base* first per event.
+
+    Codex loads exactly one hooks file per ``CODEX_HOME``, so the policy
+    hooks and the subagent-routing hooks have to share one payload.
+
+    :param base: Payload whose entries stay in first position.
+    :param extra: Payload appended after it, e.g. the routing hooks.
+    :returns: The merged payload.
+    """
+    merged: dict[str, Any] = dict(base)
+    merged_hooks: dict[str, Any] = dict(base.get("hooks", {}))
+    for event, entries in extra.get("hooks", {}).items():
+        if not isinstance(entries, list):
+            continue
+        existing = merged_hooks.get(event)
+        merged_hooks[event] = list(existing) + entries if existing else list(entries)
+    merged["hooks"] = merged_hooks
+    return merged
+
+
 def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> dict[str, Any]:
     """
     Merge user-declared hooks into the policy hooks payload.
@@ -998,7 +1034,13 @@ def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> 
 
 
 def _write_codex_policy_hooks_file(
-    codex_home: Path, bridge_dir: Path, python_executable: str | None
+    codex_home: Path,
+    bridge_dir: Path,
+    python_executable: str | None,
+    *,
+    router_bridge_dir: Path | None = None,
+    router_session_id: str | None = None,
+    user_hooks_source: Path | None = None,
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
@@ -1009,17 +1051,43 @@ def _write_codex_policy_hooks_file(
     alongside Omnigent's policy hooks. The symlink is replaced by a
     regular merged file.
 
+    This file is the only ``hooks.json`` codex loads, so the subagent
+    routing hooks are merged into the same payload rather than written
+    separately — otherwise whichever ran last would erase the other.
+
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
     :param python_executable: Python executable for the hook command.
+    :param router_bridge_dir: Directory advertising the route-subagent
+        endpoint. ``None`` leaves native subagent spawns unrouted.
+    :param router_session_id: Session id baked into the routing hook
+        commands.
+    :param user_hooks_source: The user's real ``hooks.json`` to merge when
+        the private home holds no symlink to it (the routing path unlinks
+        it before this runs).
     :returns: None.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = codex_home / _CODEX_HOOKS_FILE
     payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
+    if router_bridge_dir is not None:
+        payload = _merge_hook_payloads(
+            payload,
+            codex_router_hooks_settings(
+                router_bridge_dir,
+                session_id=router_session_id,
+                harness="codex-native",
+                python_executable=python_executable,
+            ),
+        )
+    merge_source: Path | None = None
     if path.is_symlink() and path.exists():
-        payload = _merge_user_hooks(payload, path.resolve())
+        merge_source = path.resolve()
         path.unlink()
+    elif user_hooks_source is not None and user_hooks_source.is_file():
+        merge_source = user_hooks_source
+    if merge_source is not None:
+        payload = _merge_user_hooks(payload, merge_source)
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

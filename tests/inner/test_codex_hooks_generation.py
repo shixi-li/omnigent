@@ -23,6 +23,7 @@ from omnigent.inner.codex_executor import (
     codex_router_session_id,
     merge_codex_user_hooks,
     read_codex_spawn_audit,
+    reconcile_spawn_audit,
     subagent_routing_unenforced_warning,
     write_codex_router_hooks_file,
 )
@@ -342,7 +343,23 @@ def test_unenforced_warning_payload() -> None:
     warning = subagent_routing_unenforced_warning("canary did not fire")
 
     assert warning == {
-        "warning": SUBAGENT_ROUTING_UNENFORCED_WARNING,
-        "harness": "codex",
+        "code": SUBAGENT_ROUTING_UNENFORCED_WARNING,
+        "harness": "codex-native",
         "reason": "canary did not fire",
     }
+
+
+def test_reconcile_spawn_audit_flags_a_model_the_router_never_approved() -> None:
+    warnings = reconcile_spawn_audit(
+        [{"agent_id": "a1", "model": "gpt-5-6-luna"}, {"agent_id": "a2", "model": "glm-5-2"}],
+        {"glm-5-2"},
+    )
+
+    assert len(warnings) == 1
+    assert warnings[0]["code"] == SUBAGENT_ROUTING_UNENFORCED_WARNING
+    assert "gpt-5-6-luna" in warnings[0]["reason"]
+    assert "glm-5-2" in warnings[0]["reason"]
+
+
+def test_reconcile_spawn_audit_is_silent_without_routed_models() -> None:
+    assert reconcile_spawn_audit([{"model": "gpt-5-6-luna"}], set()) == []
