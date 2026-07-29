@@ -10,7 +10,7 @@ Living checklist, maintained by the lead session. Legend:
 "UI" = what chips/dropdowns/panels display. "Process" = what the harness
 process actually runs (rollout files, panes, config, spawned models).
 
-Last updated: 2026-07-29 late evening (sticky IR + toggle user-confirmed).
+Last updated: 2026-07-29 night (live headless battery run by the lead session).
 
 ## 1. Claude Code CUJ (IR main session)
 
@@ -28,8 +28,8 @@ Last updated: 2026-07-29 late evening (sticky IR + toggle user-confirmed).
 | Layer | Status | Evidence / notes |
 |---|---|---|
 | IR selectable in Configure Codex | ✅ user | |
-| Router decision + chip | ✅ user | luna/sol picks, exact match after model provisioning |
-| **Process runs the routed model** | ✅ evidence | codex rollout jsonl: 4 turns `gpt-5.6-luna`; private config.toml `model = gpt-5.6-luna` |
+| Router decision + chip | ✅ evidence | headless battery: "hi"→luna, complex refactor→sol, both exact servable matches |
+| **Process runs the routed model** | 🟡 | rollout proved luna when routing won the launch race; live battery caught the race losing (decision luna, config pinned default, mirror stamped it back) — native push fix in flight (`live-model-state`) |
 | Codex TUI `/model` reflects the live model | ❌ | shows thread default (`databricks-gpt-5-5`), not the routed per-turn model. Design in flight (`live-model-state`) |
 | Post-launch model push (re-route / lost launch race) | ❌ by design gap | no omnigent→codex push exists; claude-style injection equivalent needed. Design in flight (`live-model-state`) |
 
@@ -47,7 +47,7 @@ Last updated: 2026-07-29 late evening (sticky IR + toggle user-confirmed).
 | Layer | Status | Evidence / notes |
 |---|---|---|
 | Claude subagent decisions (chips per spawn) | ✅ user | decisions fire |
-| **Claude subagent spawns get the routed model** | ❌ | **user-verified broken**: stale static catalog downgraded sonnet-5→haiku, then Agent tool rejected `databricks-*` id — spawns failed. Fix in flight |
+| **Claude subagent spawns get the routed model** | ✅ evidence | live re-test post-fix: Explore spawn ran to completion with routed sonnet-5 decision (was 7ms schema failure) |
 | Same-harness constraint (no codex suggestions in CC) | 🟡 | user: "seems like it's being followed" — not deliberately exercised yet |
 | **Codex subagent hooks execute at all** | 🟡 | fix landed `e32c4925` (persisted per-hook trust — the bypass flag is a no-op for app-server); needs host restart + live re-test |
 | Canary → `subagent_routing_unenforced` warning banner | 🟡 | fix landed `e32c4925` (advertisement-armed, first-turn-anchored); needs live re-test |
@@ -60,7 +60,7 @@ Last updated: 2026-07-29 late evening (sticky IR + toggle user-confirmed).
 | Layer | Status | Evidence / notes |
 |---|---|---|
 | Decision chips show raw→applied divergence | ✅ user | this is how two real bugs were caught — keep it |
-| Chip below the user message | ✅ user | reverted from above per product call |
+| Chip below the user message | ❌ | native path persists decision BEFORE the message (pos 1 vs 2) so order-faithful render shows it on top — render rule fix in flight (`chip-below-message`) |
 | Per-subagent routed model in sub-agents panel | 🟡 ui-only | displays child model_override, which for claude ≠ actual spawned model until apply fix lands |
 | Session warning banner renders when server publishes | ⬜ | component shipped; never seen live (see canary ❌) |
 | `omnigent.routing.*` OTel events | ⬜ | needs OTEL endpoint configured to observe |
