@@ -71,6 +71,56 @@ client must inject the router vocabulary; (b) a pick may be unservable in the
 workspace and must be mapped to a servable id (or the decision degraded to
 fallback) — see §2.
 
+### 1.1 Backend implementation notes (universe `ai-gateway/src/routing/`)
+
+Read the server source; it confirms the probes and adds contract facts the
+client design should exploit:
+
+- **Versioned routers are frozen.** A `router_name` pin means "same decision
+  forever"; behavior changes ship as `task_v2`, never edits to v1
+  (`router/CLAUDE.md`, the FROZEN banner). So scenario menus can only drift
+  when *we* change `routing.router_name` — pinning the name pins the menu,
+  which de-fangs risk #4 (drift is opt-in, not ambient).
+- **Every task_v1 call makes an LLM extraction self-call under the caller's
+  identity** (three axes: `expected_change_scope`, `prompt_ambiguity`,
+  `difficulty`) — even Rule-0 needs `llm difficulty == easy`, so there is no
+  LLM-free fast path. Extraction model = `route_selector.config.model` if
+  set, else the frozen default `gpt-5-4-mini`, resolved as
+  `system.ai.<model>` in the caller's workspace. Two implications:
+  (a) routing latency ≈ one small-model call — real, budget it on the spawn
+  path (risk #2); (b) **the caller needs query access to the extraction
+  model** — P1 should pass `routing.selection_model` through as
+  `route_selector.config.model` so deployments can pin one they have.
+- **`task.prompt` is the entire routing signal.** Deterministic features are
+  regexes/lengths over the prompt (stack traces, file paths, `` `symbols` ``,
+  code fences; buckets at 400/1200/3000 chars; trivial cutoff 300). Send the
+  user's raw task text, not a wrapper/summary — wrapping changes routing.
+  Corollary for B0/P2: Codex's encrypted spawn prompts mean hook-path codex
+  routing degenerates to short-prompt defaults; the redirect path
+  (plaintext) is where task-aware quality lives.
+- **`harness` is never read by any router.** `RouteOption.harness` is
+  documented "optional for a native harness, required for a metaharness";
+  selection matches on model only ("first harness wins on a duplicate"), and
+  post-validation just checks the picked option was offered verbatim.
+  Confirms: derive harness client-side from the picked arm's family.
+- **Malformed model ids are silently dropped** from `route_options`
+  (normalizer: lowercase, `.`→`-`), not 400ed — catalog junk is safe to send.
+- **`session_history` exists in the request schema but no shipped router
+  reads it** — the designed hook for per-turn / "sidekick" routing (open
+  questions 6/10). The client should be shaped to populate it later (P2's
+  decision cache already retains per-session picks).
+- **`routes:select` does no access or existence checks** on offered options —
+  explains unservable arms being required *and* selectable; resolution is
+  entirely ours (§2).
+- **No server-side decision logging yet** (TODO in `RoutingHandler`) — until
+  AIGW's background-activity log lands, omnigent's decision items + OTel (P5)
+  are the *only* record of routing decisions. Raises the stakes on P5.
+- The wire types in universe are temporary "until Omnigent's routing protos
+  sync" — `omnigent/api/routing/v1/routing.proto` is the source of truth, so
+  contract extensions (codebase metadata, fork context, spawn-eligible sets)
+  start as PRs on *our* proto. Endpoint is SAFE-gated server-side
+  (`routeSelectionEnabled`).
+
 Dev-loop config (worktree `.omnigent-local/config.yaml`, isolated via
 `OMNIGENT_CONFIG_HOME`/`OMNIGENT_DATA_DIR`): routing `provider: external`,
 `base_url: https://eng-ml-inference.staging.cloud.databricks.com/ai-gateway/routing/v1`,
@@ -165,9 +215,14 @@ Owns: `omnigent/server/smart_routing.py`, `omnigent/cli.py`
 - Introduce `RouteOptionSource` per §2; move `_HARNESS_EXCLUDED_MODELS` /
   `_redirect_incompatible_pick` / `MODEL_LISTS` behind it as the v0 static
   implementation (task_v1 scenario menus per §1, config-overridable via
-  `routing.scenario_menus`; default `routing.router_name` = `task_v1`).
+  `routing.scenario_menus`; default `routing.router_name` = `task_v1` — menus
+  are keyed by router version since versions are frozen, §1.1).
 - Map unservable picks to the nearest servable catalog id; emit the raw pick
   in the decision payload either way (UI shows what the router said).
+- Pass `routing.selection_model` config through as
+  `route_selector.config.model` (extraction self-call runs under caller
+  identity — §1.1); send the raw task text as `task.prompt`, never a
+  wrapped/summarized prompt.
 - Default-on: when the server's provider is Databricks (`kind: databricks`)
   and no `routing:` block exists, synthesize the external client against that
   workspace's `/ai-gateway/routing/v1` with
@@ -372,9 +427,10 @@ delivered on the existing session-status channel.
 3. **Redirect compliance is soft**: deny+redirect relies on the model calling
    `sys_session_send`; worst case non-spawn, never wrong-model. Track
    redirect-follow rate via decision items during the pilot.
-4. **Scenario-menu drift**: if Ivan's recipe changes its arms (task_v2, new
-   models), the client 400s until `routing.scenario_menus` is updated; P1 must
-   degrade to fallback with a loud warning, and the config knob is the escape
-   hatch.
+4. **Scenario-menu drift**: routers are frozen per version (§1.1), so menus
+   only change when we bump `routing.router_name` (e.g. to a future task_v2)
+   — bumping the name and the menus must happen together (`scenario_menus`
+   keyed by router version enforces this). P1 still degrades to fallback with
+   a loud warning if they're ever mismatched.
 5. **Fork/cache-miss economics**: v1 doesn't route forks; a real cost model
    needs inherited-context size that only Omnigent can supply out-of-band.
