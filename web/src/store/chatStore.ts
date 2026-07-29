@@ -386,6 +386,13 @@ export interface ChatState {
    */
   costControlModeOverride: "on" | "off" | null;
   /**
+   * Routing switch for the sub-agents the active session spawns: ``"on"``
+   * routes them, ``"off"`` runs them on the default model, ``null``
+   * inherits the session's own routing state. Session-scoped: hydrated
+   * from the snapshot on bind and written through `setSubagentRouting`.
+   */
+  subagentRoutingOverride: "on" | "off" | null;
+  /**
    * Per-session Codex collaboration-mode flag. Hydrated from
    * ``omnigent.codex_native.collaboration_mode`` on bind and updated by the
    * web toggle or native Codex TUI events. False for non-Codex sessions.
@@ -634,6 +641,13 @@ export interface ChatState {
    * default. No-ops when there is no active conversation.
    */
   setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  /**
+   * Set the active session's sub-agent routing switch — optimistic local
+   * write, then PATCH; the server's canonical value (or a rollback on
+   * failure) settles the state. ``null`` clears back to inheriting the
+   * session's own routing state. No-ops when there is no active conversation.
+   */
+  setSubagentRouting: (mode: "on" | "off" | null) => Promise<void>;
   /**
    * Toggle Codex Plan mode for the active session. No-ops when there is no
    * active conversation.
@@ -914,6 +928,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   costControlModeOverride: null,
+  subagentRoutingOverride: null,
   codexPlanMode: false,
   hasMoreHistory: false,
   loadingMoreHistory: false,
@@ -1619,6 +1634,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // so they reset with the session and re-hydrate from the snapshot.
         sessionModelOverride: null,
         costControlModeOverride: null,
+        subagentRoutingOverride: null,
         codexPlanMode: false,
         contextWindow: null,
         tokensUsed: null,
@@ -1805,6 +1821,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
           costControlModeOverride: previous,
           ...(clearModel ? { sessionModelOverride: previousModel } : {}),
         });
+      }
+      throw err;
+    }
+  },
+
+  setSubagentRouting: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().subagentRoutingOverride;
+    // Optimistic write so the select responds instantly; the PATCH response
+    // (or the rollback below) is the settled truth. Unlike the session's own
+    // routing switch this never touches `model_override` — it governs the
+    // sub-agents' models, not this session's.
+    set({ subagentRoutingOverride: mode });
+    try {
+      const session = await updateSession(conversationId, { subagentRoutingOverride: mode });
+      if (get().conversationId !== conversationId) return;
+      set({ subagentRoutingOverride: session.subagentRoutingOverride ?? null });
+    } catch (err) {
+      if (get().conversationId === conversationId) {
+        set({ subagentRoutingOverride: previous });
       }
       throw err;
     }
@@ -2221,6 +2258,7 @@ function sessionBindingPatch(
   | "sessionHarness"
   | "subAgentName"
   | "costControlModeOverride"
+  | "subagentRoutingOverride"
   | "codexPlanMode"
   | "contextWindow"
   | "gitBranch"
@@ -2245,6 +2283,7 @@ function sessionBindingPatch(
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
+    subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,

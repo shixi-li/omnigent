@@ -333,6 +333,13 @@ export interface Session {
    * "Cost Optimized" toggle.
    */
   costControlModeOverride?: "on" | "off" | null;
+  /**
+   * Per-session routing switch for the sub-agents this session spawns:
+   * `"on"` routes them intelligently, `"off"` runs them on the default
+   * model, `null` inherits the session's own routing state (a routed
+   * session's sub-agents route; a model-pinned session's don't).
+   */
+  subagentRoutingOverride?: "on" | "off" | null;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**
