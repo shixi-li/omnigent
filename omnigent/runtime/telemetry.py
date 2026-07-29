@@ -827,6 +827,7 @@ ROUTING_EVENT_DECISION = "omnigent.routing.decision"
 ROUTING_EVENT_ENABLED = "omnigent.routing.enabled"
 ROUTING_EVENT_DISABLED_MID_SESSION = "omnigent.routing.disabled_mid_session"
 ROUTING_EVENT_FORK_FROM_ROUTED_SESSION = "omnigent.routing.fork_from_routed_session"
+ROUTING_EVENT_SUBAGENT_OVERRIDE_CHANGED = "omnigent.routing.subagent_override_changed"
 
 
 def _event_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:

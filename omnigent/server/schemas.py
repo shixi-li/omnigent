@@ -1334,6 +1334,11 @@ class SessionCreateRequest(BaseModel):
         default) defers to the spec default. Set by the web UI's
         new-session "Cost Optimized" option; read by the cost-control
         advisor pipeline at turn start.
+    :param subagent_routing_override: Optional per-session
+        subagent-routing switch to persist at create time: ``"on"``
+        routes subagent spawns, ``"off"`` leaves them unrouted.
+        ``None`` (the default) inherits the session's main routing
+        state. Mutable mid-session via ``PATCH /v1/sessions/{id}``.
     :param harness_override: Optional per-session brain-harness
         override to persist at create time, e.g. ``"pi"`` or
         ``"openai-agents"``. Set by the web UI's new-chat harness
@@ -1361,6 +1366,7 @@ class SessionCreateRequest(BaseModel):
     model_override: str | None = None
     reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
 
     @model_validator(mode="after")
@@ -1701,6 +1707,12 @@ class SessionResponse(BaseModel):
         applies). Set at create time or via
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle); read by the cost-control advisor pipeline.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch: ``"on"`` routes subagent spawns, ``"off"`` leaves them
+        unrouted. ``None`` means the session inherits its main routing
+        state (own or parent ``cost_control_mode_override == "on"``) —
+        the value the in-session "Subagent routing" row renders as
+        "Default". Set via ``PATCH /v1/sessions/{id}``.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -1848,6 +1860,7 @@ class SessionResponse(BaseModel):
     harness: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -1933,6 +1946,13 @@ class UpdateSessionRequest(BaseModel):
         default; omitting the field leaves it unchanged (``"off"`` is
         a real value here, so the field's *presence* — not a clear
         alias — is the clear signal, unlike ``model_override``).
+    :param subagent_routing_override: Per-session subagent-routing
+        switch: ``"on"`` routes subagent spawns, ``"off"`` leaves them
+        unrouted. Explicit JSON ``null`` clears the override so the
+        session inherits its main routing state again; omitting the
+        field leaves it unchanged (same presence-is-the-clear-signal
+        rule as ``cost_control_mode_override``). Effective on the next
+        spawn, so it can be changed at any point in a session.
     :param external_session_id: Runtime-native session id captured
         by a wrapper bridge (e.g. Claude Code's session uuid for
         ``omnigent claude`` sessions). Idempotent on same-value
@@ -1976,6 +1996,7 @@ class UpdateSessionRequest(BaseModel):
     model_override: str | None = None
     collaboration_mode: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None

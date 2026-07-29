@@ -1585,6 +1585,17 @@ def register_core_routes(
             body.cost_control_mode_override
         )
 
+        # Same presence-is-the-clear-signal rule for the subagent-routing
+        # switch: an explicit null returns the session to inheriting its
+        # main routing state.
+        clear_subagent_routing = (
+            "subagent_routing_override" in body.model_fields_set
+            and body.subagent_routing_override is None
+        )
+        subagent_routing_override = _validated_subagent_routing_override(
+            body.subagent_routing_override
+        )
+
         # Native-terminal pass-through args: ``None`` leaves them
         # unchanged; a provided list (including ``[]``) replaces the
         # stored value wholesale (resume is last-write-wins, never an
@@ -1690,11 +1701,28 @@ def register_core_routes(
             _unset_model_override=clear_model,
             cost_control_mode_override=None if clear_cost_control else cost_control_mode_override,
             _unset_cost_control_mode_override=clear_cost_control,
+            subagent_routing_override=(
+                None if clear_subagent_routing else subagent_routing_override
+            ),
+            _unset_subagent_routing_override=clear_subagent_routing,
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
         if updated is None:
             raise _session_not_found()
+        if subagent_routing_override is not None or clear_subagent_routing:
+            from omnigent.runtime.telemetry import (
+                ROUTING_EVENT_SUBAGENT_OVERRIDE_CHANGED,
+                emit_routing_event,
+            )
+
+            emit_routing_event(
+                ROUTING_EVENT_SUBAGENT_OVERRIDE_CHANGED,
+                {
+                    "routing.session_id": session_id,
+                    "routing.value": updated.subagent_routing_override,
+                },
+            )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).

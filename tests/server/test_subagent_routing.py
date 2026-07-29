@@ -32,6 +32,7 @@ from omnigent.runner.subagent_routing import (
     session_router_env,
     shutdown_session_router,
     start_subagent_router,
+    subagent_routing_enabled,
     write_advertisement,
 )
 from omnigent.server.smart_routing import RoutingResult
@@ -116,8 +117,14 @@ def _clean_cache() -> Any:
 # ── Candidate set ───────────────────────────────────────────────────
 
 
-def test_candidate_models_offers_both_families() -> None:
+def test_candidate_models_stays_in_family_by_default() -> None:
     candidates = candidate_models("claude-native")
+    assert set(candidates) == {"claude-native"}
+    assert CLAUDE_MODEL in candidates["claude-native"]
+
+
+def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
+    candidates = candidate_models("claude-native", cross_harness=True)
     assert set(candidates) == {"claude-native", "codex-native"}
     assert CLAUDE_MODEL in candidates["claude-native"]
     assert GPT_MODEL in candidates["codex-native"]
@@ -148,11 +155,25 @@ async def test_cross_family_pick_redirects_to_counterpart_harness() -> None:
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=_FakeCaps(routing_client=client), cross_harness=True
     )
     assert decision.action == "redirect"
     assert decision.model == GPT_MODEL
     assert decision.harness == "codex-native"
+
+
+@pytest.mark.asyncio
+async def test_in_family_session_only_offers_its_own_harness() -> None:
+    client = _FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+    )
+    # Only Claude arms were offered, so a Codex pick is unrunnable — a
+    # constrained session can never redirect.
+    assert set(client.calls[0][1]) == {"claude-native"}
+    assert decision.action == "deny"
 
 
 @pytest.mark.asyncio
@@ -550,6 +571,33 @@ def test_routing_enabled_reads_the_session_toggle() -> None:
 def test_routing_enabled_requires_a_client_when_caps_are_given() -> None:
     assert routing_enabled("on", caps=_FakeCaps(routing_client=None)) is False
     assert routing_enabled("on", caps=_FakeCaps(routing_client=object())) is True
+
+
+def test_subagent_routing_inherits_the_session_routing_state() -> None:
+    assert subagent_routing_enabled(None, cost_control_mode="on") is True
+    assert subagent_routing_enabled(None, cost_control_mode="off") is False
+    assert subagent_routing_enabled(None, cost_control_mode=None) is False
+    assert (
+        subagent_routing_enabled(
+            None,
+            cost_control_mode=None,
+            parent_cost_control_mode="on",
+        )
+        is True
+    )
+
+
+def test_subagent_routing_override_beats_the_inherited_state() -> None:
+    assert subagent_routing_enabled("off", cost_control_mode="on") is False
+    assert subagent_routing_enabled("on", cost_control_mode=None) is True
+    assert (
+        subagent_routing_enabled(
+            "off",
+            cost_control_mode=None,
+            parent_cost_control_mode="on",
+        )
+        is False
+    )
 
 
 def test_router_dir_for_session_is_owner_only(tmp_path: Path) -> None:

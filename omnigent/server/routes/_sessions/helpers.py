@@ -7029,6 +7029,25 @@ def _validated_cost_control_mode_override(value: str | None) -> str | None:
     )
 
 
+def _validated_subagent_routing_override(value: str | None) -> str | None:
+    """
+    Validate a caller-supplied per-session subagent-routing switch.
+
+    :param value: The candidate value, e.g. ``"on"``, or ``None`` when
+        the caller did not set / wants to clear the override (inherit
+        the session's main routing state).
+    :returns: The value unchanged when valid, or ``None``.
+    :raises OmnigentError: 400 (``invalid_input``) when *value* is
+        anything other than ``"on"``, ``"off"``, or ``None``.
+    """
+    if value is None or value in SUBAGENT_ROUTING_OVERRIDE_VALUES:
+        return value
+    raise OmnigentError(
+        f"invalid subagent_routing_override: {value!r} (expected 'on', 'off', or null to clear)",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     Parse the JSON metadata part from bundled session creation.
@@ -8690,6 +8709,7 @@ __all__ = [
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
     "_validated_harness_override_executor_type",
+    "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",

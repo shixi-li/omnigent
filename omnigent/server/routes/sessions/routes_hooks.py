@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -1156,8 +1157,14 @@ def register_hooks_routes(
         ``PreToolUse`` hooks via ``subagent_router.json``) relays here
         because ``RuntimeCaps.routing_client`` only lives in the server
         process. Request and response follow the frozen route-subagent
-        contract; every verdict also lands as a ``routing_decision``
-        transcript item.
+        contract; every routed verdict also lands as a
+        ``routing_decision`` transcript item.
+
+        The session's subagent-routing setting is re-read on every call
+        (it is togglable mid-session), so a session whose routing is off
+        gets its spawn allowed unchanged without calling the router.
+        Candidate models stay inside the session's own harness family
+        unless the session started in auto-harness mode.
 
         :param request: FastAPI request — body is the route-subagent
             request JSON.
@@ -1167,9 +1174,12 @@ def register_hooks_routes(
             omits ``harness``.
         """
         from omnigent.runner.subagent_routing import (
+            AUTO_HARNESS_LABEL_KEY,
+            SubagentRouteDecision,
             SubagentRouteRequest,
             resolve_subagent_route,
             store_persister,
+            subagent_routing_enabled,
         )
 
         user_id = _get_user_id(request, auth_provider)
@@ -1193,10 +1203,47 @@ def register_hooks_routes(
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        parent_cost_control_mode = (
+            parent.cost_control_mode_override if parent is not None else None
+        )
+        if conv is None or not subagent_routing_enabled(
+            conv.subagent_routing_override,
+            cost_control_mode=conv.cost_control_mode_override,
+            parent_cost_control_mode=parent_cost_control_mode,
+        ):
+            # Allowed unchanged, and deliberately not persisted: an
+            # unrouted spawn is not a decision worth a transcript item.
+            _logger.info(
+                "route-subagent: subagent routing disabled for session=%s harness=%s",
+                session_id,
+                route_request.harness,
+            )
+            unrouted = SubagentRouteDecision(
+                action="allow",
+                rationale="subagent routing disabled for this session",
+            )
+            return Response(
+                content=json.dumps(unrouted.to_payload()),
+                media_type="application/json",
+            )
+
+        # Only a session started in auto-harness mode may be moved across
+        # harness families; everyone else is offered their own family, so a
+        # Claude Code session never gets a Codex suggestion.
+        cross_harness = conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1" or (
+            parent is not None and parent.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+        )
         decision = await resolve_subagent_route(
             session_id,
             route_request,
             caps=get_caps(),
+            cross_harness=cross_harness,
             persist=store_persister(session_id, conversation_store),
         )
         return Response(

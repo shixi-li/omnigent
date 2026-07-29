@@ -775,6 +775,7 @@ def _build_session_response(
         harness=_resolve_harness(conv),
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
+        subagent_routing_override=conv.subagent_routing_override,
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -4075,8 +4076,7 @@ async def _dispatch_session_event_to_runner_impl(
             conv.model_override is None or conv.parent_conversation_id is not None
         ):
             _logger.info(
-                "smart_routing: native turn not routed session=%s: "
-                "model already pinned (%s)",
+                "smart_routing: native turn not routed session=%s: model already pinned (%s)",
                 session_id,
                 conv.model_override,
             )
@@ -4089,8 +4089,7 @@ async def _dispatch_session_event_to_runner_impl(
             _user_text = _extract_user_text_for_routing(body)
             if not _user_text:
                 _logger.info(
-                    "smart_routing: native turn not routed session=%s: "
-                    "no user text in message",
+                    "smart_routing: native turn not routed session=%s: no user text in message",
                     session_id,
                 )
             if _user_text:
@@ -5407,6 +5406,9 @@ async def _create_session_from_existing_agent(
     cost_control_mode_override = _validated_cost_control_mode_override(
         body.cost_control_mode_override
     )
+    subagent_routing_override = _validated_subagent_routing_override(
+        body.subagent_routing_override
+    )
 
     # When the parent session has smart routing on, a sub-agent created via
     # sys_session_send is routed regardless of the harness/model the
@@ -5608,6 +5610,7 @@ async def _create_session_from_existing_agent(
         model_override is not None
         or reasoning_effort is not None
         or cost_control_mode_override is not None
+        or subagent_routing_override is not None
         or harness_override is not None
     ):
         # ``create_conversation`` has no override params; reuse the
@@ -5620,6 +5623,7 @@ async def _create_session_from_existing_agent(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
             cost_control_mode_override=cost_control_mode_override,
+            subagent_routing_override=subagent_routing_override,
             harness_override=harness_override,
         )
         if updated_conv is None:
@@ -5657,6 +5661,19 @@ async def _create_session_from_existing_agent(
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+
+    if harness_override == "auto":
+        # First-message routing replaces the "auto" sentinel, so record the
+        # auto start durably: it is what lets subagent routing offer picks
+        # from the other harness family later in the session.
+        from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {AUTO_HARNESS_LABEL_KEY: "1"},
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
 
     # Emit session.created exactly once at creation time.
     # Best-effort: skip if the host opted out via HostHelloFrame.

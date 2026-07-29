@@ -553,15 +553,6 @@ class _SessionInitContext:
         """Return server-supplied labels, or ``None`` on the legacy path."""
         return self.envelope.snapshot.labels if self.envelope is not None else None
 
-    @property
-    def cost_control_mode(self) -> str | None:
-        """Return the session's cost-control toggle, the routing gate input."""
-        return (
-            self.envelope.snapshot.cost_control_mode_override
-            if self.envelope is not None
-            else None
-        )
-
 
 # Language constant the omnigent YAML translator stamps on callable-backed
 # tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE). Duplicated rather
@@ -2570,7 +2561,6 @@ def create_runner_app(
             await _ensure_session_subagent_router(
                 session_id,
                 harness_name,
-                init_context=init_context,
                 server_client=server_client,
             )
             spawn_env = _build_spawn_env_from_spec(
@@ -9765,32 +9755,28 @@ async def _ensure_session_subagent_router(
     session_id: str,
     harness: str | None,
     *,
-    init_context: _SessionInitContext,
     server_client: httpx.AsyncClient | None,
 ) -> None:
-    """Start this session's subagent-routing endpoint when routing is on.
+    """Start this session's subagent-routing endpoint.
 
     Only for the SDK harness families: the native terminals know their own
     bridge directory and start the router from their launch paths, where
-    the harness's hooks are also pointed at it.
+    the harness's hooks are also pointed at it. Started for every session
+    regardless of its routing state — the server gates each spawn on the
+    session's (mid-session togglable) subagent-routing setting.
 
     :param session_id: Session/conversation identifier.
     :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
-    :param init_context: Server-supplied session snapshot carrying the
-        routing toggle.
     :param server_client: Runner→server client the relay forwards on.
         ``None`` (in-process tests) skips the start.
     """
     from omnigent.runner.subagent_routing import (
         ensure_session_router,
         router_dir_for_session,
-        routing_enabled,
     )
     from omnigent.runtime.telemetry import ROUTING_EVENT_ENABLED, emit_routing_event
 
     if server_client is None or is_native_harness(harness):
-        return
-    if not routing_enabled(init_context.cost_control_mode):
         return
     try:
         ensure_session_router(
@@ -9889,8 +9875,8 @@ def _build_spawn_env_from_spec(
         return None
 
     # Point the harness process at this session's subagent-routing endpoint
-    # when one is running (started at session init). Empty for unrouted
-    # sessions, so nothing changes when routing is off.
+    # when one is running (started at session init). Empty when the session
+    # has no router, e.g. a native harness or an in-process test.
     if env is not None and session_id:
         from omnigent.runner.subagent_routing import session_router_env
 

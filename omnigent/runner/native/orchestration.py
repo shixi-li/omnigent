@@ -351,8 +351,6 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
-    :param cost_control_mode: The session's ``cost_control_mode_override``,
-        e.g. ``"on"`` — the intelligent-routing gate.
     """
 
     workspace: Path
@@ -364,7 +362,6 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
-    cost_control_mode: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -422,27 +419,28 @@ def _start_subagent_router_for_native_session(
     *,
     bridge_dir: Path,
     harness: str,
-    cost_control_mode: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> Path | None:
     """Start the subagent-routing endpoint for a native session.
 
     Native harnesses enforce routing through hooks configured at terminal
     launch, so the endpoint has to be live (and advertised in the bridge
-    dir the hooks read) before the CLI starts.
+    dir the hooks read) before the CLI starts. Installed for every
+    session, routed or not: the server re-reads the session's
+    subagent-routing setting on each spawn, so a session that starts
+    unrouted can still be toggled on mid-flight.
 
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory the hooks discover.
     :param harness: Harness label for the enablement telemetry event.
-    :param cost_control_mode: The session's ``cost_control_mode_override``.
     :param server_client: Runner→server client the relay forwards on.
     :returns: The advertisement directory to point hooks at, or ``None``
-        when routing is off for this session.
+        when the endpoint could not start.
     """
-    from omnigent.runner.subagent_routing import ensure_session_router, routing_enabled
+    from omnigent.runner.subagent_routing import ensure_session_router
     from omnigent.runtime.telemetry import ROUTING_EVENT_ENABLED, emit_routing_event
 
-    if server_client is None or not routing_enabled(cost_control_mode):
+    if server_client is None:
         return None
     try:
         ensure_session_router(
@@ -803,11 +801,6 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
-        cost_control_mode=(
-            snapshot.get("cost_control_mode_override")
-            if isinstance(snapshot.get("cost_control_mode_override"), str)
-            else None
-        ),
     )
 
 
@@ -3706,14 +3699,13 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
     )
-    # Generate routing hooks.json (and bypass codex's hook-trust prompt) when
-    # intelligent routing is on: the app-server reads the endpoint out of its
-    # own process env at start.
+    # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
+    # app-server reads the endpoint out of its own process env at start, and
+    # the server decides per spawn whether to route.
     _codex_router_dir = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
         harness="codex-native",
-        cost_control_mode=launch_config.cost_control_mode,
         server_client=server_client,
     )
     if _codex_router_dir is not None:
@@ -5363,11 +5355,7 @@ def _ensure_orchestrator_skills_in_bundle(
 
 @dataclasses.dataclass(frozen=True)
 class _ClaudeSessionLaunchMetadata:
-    """Persisted values consumed by Claude terminal launch.
-
-    ``cost_control_mode`` is the session's ``cost_control_mode_override``
-    — the intelligent-routing gate read at launch.
-    """
+    """Persisted values consumed by Claude terminal launch."""
 
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -5375,7 +5363,6 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
-    cost_control_mode: str | None = None
 
 
 def _claude_launch_metadata_from_envelope(
@@ -5398,7 +5385,6 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
-        cost_control_mode=snapshot.cost_control_mode_override,
     )
 
 
@@ -5453,11 +5439,6 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
-        cost_control_mode=(
-            snapshot.get("cost_control_mode_override")
-            if isinstance(snapshot.get("cost_control_mode_override"), str)
-            else None
-        ),
     )
     _logger.info(
         "Claude terminal launch config fetched: session=%s status=%s effort_set=%s "
@@ -5928,14 +5909,13 @@ async def _auto_create_claude_terminal(
     # has the spec resolver) expose a bundle's ``skills/`` to Claude Code
     # via ``--plugin-dir`` — the CLI mirror of the SDK plugin wiring.
     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
-    # Route natively spawned subagents (the Task/Agent tool) when intelligent
-    # routing is on for this session: start the loopback endpoint in the
-    # bridge dir the PreToolUse hook already discovers.
+    # Gate natively spawned subagents (the Task/Agent tool): start the loopback
+    # endpoint in the bridge dir the PreToolUse hook already discovers. Always
+    # installed — the server decides per spawn whether to route.
     subagent_router_dir = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
         harness="claude-native",
-        cost_control_mode=launch_metadata.cost_control_mode,
         server_client=server_client,
     )
     claude_args = augment_claude_args(

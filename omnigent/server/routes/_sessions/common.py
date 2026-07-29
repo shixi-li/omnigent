@@ -621,6 +621,11 @@ _MAX_TERMINAL_LAUNCH_ARG_LEN = 4096
 COST_CONTROL_OVERRIDE_VALUES = frozenset({"on", "off"})
 
 
+# Per-session subagent-routing switch; ``None`` (absent) inherits the
+# session's main routing state instead of forcing either way.
+SUBAGENT_ROUTING_OVERRIDE_VALUES = frozenset({"on", "off"})
+
+
 _CHILD_PREVIEW_LIMIT = 150
 
 
@@ -673,6 +678,7 @@ def get_server_runner_router() -> RunnerRouter | None:
 
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
+    "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_APPROVAL_TYPE",

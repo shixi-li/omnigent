@@ -26,6 +26,7 @@ pytestmark = pytest.mark.asyncio
 
 ROUTED_MODEL = "databricks-claude-opus-4-8"
 LLM_PICKED_MODEL = "databricks-claude-sonnet-4-6"
+GPT_MODEL = "databricks-gpt-5-5"
 
 
 class _FakeRoutingClient:
@@ -36,6 +37,7 @@ class _FakeRoutingClient:
         self._error = error
         self.last_error: str | None = None
         self.calls: list[str] = []
+        self.offered: list[dict[str, list[str]]] = []
 
     async def route(
         self,
@@ -43,6 +45,7 @@ class _FakeRoutingClient:
         available_models: dict[str, list[str]],
     ) -> RoutingResult | None:
         self.calls.append(message)
+        self.offered.append(dict(available_models))
         if self._error is not None:
             raise self._error
         return self._result
@@ -266,6 +269,255 @@ async def test_identical_spawns_hit_the_router_once(
     assert first.status_code == 200 and second.status_code == 200
     assert first.json()["decision_id"] == second.json()["decision_id"]
     assert len(routing_client.calls) == 1
+
+
+# ── 5. Per-session subagent-routing gate ───────────────────────────
+
+
+SPAWN_PAYLOAD = {
+    "harness": "claude-native",
+    "task_name": "code-reviewer",
+    "prompt": "review the auth module",
+    "parent_model": LLM_PICKED_MODEL,
+}
+DISABLED_RATIONALE = "subagent routing disabled for this session"
+
+
+async def _session_with_routing_flags(
+    client: httpx.AsyncClient,
+    *,
+    agent_name: str,
+    cost_control: str | None = None,
+    subagent_routing: str | None = None,
+) -> str:
+    agent = await create_test_agent(client, name=agent_name)
+    body: dict[str, Any] = {"agent_id": agent["id"]}
+    if cost_control is not None:
+        body["cost_control_mode_override"] = cost_control
+    if subagent_routing is not None:
+        body["subagent_routing_override"] = subagent_routing
+    resp = await client.post("/v1/sessions", json=body)
+    assert resp.status_code == 201, resp.text
+    return str(resp.json()["id"])
+
+
+@pytest.mark.parametrize(
+    ("case", "cost_control", "subagent_routing", "routed"),
+    [
+        ("inherit-on", "on", None, True),
+        ("inherit-off", None, None, False),
+        ("override-off", "on", "off", False),
+        ("override-on", None, "on", True),
+    ],
+)
+async def test_subagent_gate_follows_the_session_setting(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    cost_control: str | None,
+    subagent_routing: str | None,
+    routed: bool,
+) -> None:
+    session_id = await _session_with_routing_flags(
+        client,
+        agent_name=f"routing-gate-{case}",
+        cost_control=cost_control,
+        subagent_routing=subagent_routing,
+    )
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    if routed:
+        assert decision["action"] == "rewrite"
+        assert decision["model"] == ROUTED_MODEL
+        assert len(routing_client.calls) == 1
+        assert len(_routing_decisions(conv_store, session_id)) == 1
+    else:
+        # Allowed unchanged, router untouched, and no transcript spam.
+        assert decision["action"] == "allow"
+        assert decision["model"] is None
+        assert decision["rationale"] == DISABLED_RATIONALE
+        assert routing_client.calls == []
+        assert _routing_decisions(conv_store, session_id) == []
+
+
+async def test_child_inherits_the_parents_routing_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client, db_uri, agent_name="routing-gate-child-inherit"
+    )
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        resp = await client.post(
+            f"/v1/sessions/{child.id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "rewrite"
+    assert len(routing_client.calls) == 1
+
+    # The child's own "off" wins over the parent's routed state.
+    conv_store.update_conversation(child.id, subagent_routing_override="off")
+    clear_cache(child.id)
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        second = await client.post(
+            f"/v1/sessions/{child.id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert second.status_code == 200, second.text
+    assert second.json()["action"] == "allow"
+    assert second.json()["rationale"] == DISABLED_RATIONALE
+    assert len(routing_client.calls) == 1
+
+
+async def test_patch_round_trips_the_subagent_setting_and_rejects_junk(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session_id = await _session_with_routing_flags(client, agent_name="routing-gate-patch")
+
+    for value in ("on", "off"):
+        patched = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"subagent_routing_override": value},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["subagent_routing_override"] == value
+        snapshot = await client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.json()["subagent_routing_override"] == value
+
+    # Explicit null clears it back to inheriting the main routing state.
+    cleared = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"subagent_routing_override": None},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["subagent_routing_override"] is None
+
+    rejected = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"subagent_routing_override": "maybe"},
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "subagent_routing_override" in rejected.text
+
+
+async def test_toggling_the_setting_on_mid_session_routes_the_next_spawn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session_id = await _session_with_routing_flags(client, agent_name="routing-gate-midsession")
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        before = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+        assert before.json()["action"] == "allow"
+        patched = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"subagent_routing_override": "on"},
+        )
+        assert patched.status_code == 200, patched.text
+        after = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert after.json()["action"] == "rewrite"
+    assert after.json()["model"] == ROUTED_MODEL
+
+
+# ── 6. Harness-family constraint on the candidate set ──────────────
+
+
+@pytest.mark.parametrize(
+    ("harness", "counterpart", "picked"),
+    [
+        ("claude-native", "codex-native", ROUTED_MODEL),
+        ("codex-native", "claude-native", GPT_MODEL),
+    ],
+)
+async def test_pinned_session_is_offered_only_its_own_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+    counterpart: str,
+    picked: str,
+) -> None:
+    session_id = await _session_with_routing_flags(
+        client,
+        agent_name=f"routing-family-{harness}",
+        subagent_routing="on",
+    )
+    routing_client = _FakeRoutingClient(RoutingResult(model=picked, rationale="deep reasoning"))
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json={**SPAWN_PAYLOAD, "harness": harness},
+        )
+    assert resp.status_code == 200, resp.text
+    assert set(routing_client.offered[0]) == {harness}
+    assert counterpart not in routing_client.offered[0]
+    assert resp.json()["action"] == "rewrite"
+
+
+async def test_auto_session_and_its_children_keep_cross_harness_picks(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client, name="routing-family-auto")
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="reviewer:auth",
+        parent_conversation_id=session_id,
+        agent_id=agent["id"],
+    )
+
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+        child_resp = await client.post(
+            f"/v1/sessions/{child.id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert resp.status_code == 200, resp.text
+    assert set(routing_client.offered[0]) == {"claude-native", "codex-native"}
+    # Auto keeps the cross-family escape hatch: a Codex pick redirects.
+    assert resp.json()["action"] == "redirect"
+    assert resp.json()["harness"] == "codex-native"
+    # The child of an auto session inherits the cross-harness allowance.
+    assert child_resp.status_code == 200, child_resp.text
+    assert set(routing_client.offered[1]) == {"claude-native", "codex-native"}
 
 
 # ── Session warnings channel ───────────────────────────────────────

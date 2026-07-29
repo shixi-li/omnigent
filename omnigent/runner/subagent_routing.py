@@ -67,6 +67,12 @@ DEFAULT_CACHE_TTL_S = 300.0
 #: a new column or a transcript scan.
 ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
 
+#: Conversation label marking a session created in auto-harness mode. The
+#: ``harness_override`` sentinel is replaced the moment first-message routing
+#: resolves a harness, so this label is the durable record that the router
+#: may still move this session's subagents across harness families.
+AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
+
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 
@@ -93,11 +99,13 @@ def routing_enabled(
 ) -> bool:
     """Report whether intelligent routing is on for one session.
 
-    The single gate every wiring site reads, so "routing is on" means the
-    same thing in the server's turn path and at each harness launch. Two
-    conditions: the per-session toggle (its own, or its parent's for a
-    spawned child — the server routes children of a routed parent), and,
-    where a ``RuntimeCaps`` is in reach, a configured routing client.
+    The shared gate for main-agent routing, so "routing is on" means the
+    same thing everywhere the server decides to route. Two conditions:
+    the per-session toggle (its own, or its parent's for a spawned child
+    — the server routes children of a routed parent), and, where a
+    ``RuntimeCaps`` is in reach, a configured routing client. Subagent
+    spawns read :func:`subagent_routing_enabled`, which layers the
+    per-session subagent override on top of this.
 
     :param cost_control_mode: The session's ``cost_control_mode_override``,
         e.g. ``"on"``.
@@ -114,6 +122,38 @@ def routing_enabled(
     if caps is None:
         return True
     return getattr(caps, "routing_client", None) is not None
+
+
+def subagent_routing_enabled(
+    subagent_routing_override: str | None,
+    *,
+    cost_control_mode: str | None,
+    parent_cost_control_mode: str | None = None,
+) -> bool:
+    """Report whether subagent spawns are routed for one session.
+
+    Read per spawn (not at launch) so the setting can be flipped at any
+    point in a session and take effect on the next spawn. ``"on"`` /
+    ``"off"`` win outright; unset inherits the session's main routing
+    state, so a session started on Intelligent Routing routes its
+    subagents and one started on a manual model does not.
+
+    :param subagent_routing_override: The session's
+        ``subagent_routing_override`` — ``"on"``, ``"off"``, or ``None``
+        to inherit.
+    :param cost_control_mode: The session's ``cost_control_mode_override``.
+    :param parent_cost_control_mode: The parent session's value for a
+        spawned child. ``None`` for a top-level session.
+    :returns: ``True`` when subagent spawns should be routed.
+    """
+    if subagent_routing_override == "on":
+        return True
+    if subagent_routing_override == "off":
+        return False
+    return routing_enabled(
+        cost_control_mode,
+        parent_cost_control_mode=parent_cost_control_mode,
+    )
 
 
 # ── Wire types ─────────────────────────────────────────────────────────────
@@ -365,20 +405,25 @@ def _harness_family(harness: str) -> str | None:
     return _HARNESS_FAMILY.get(harness)
 
 
-def candidate_models(harness: str) -> dict[str, list[str]]:
+def candidate_models(harness: str, *, cross_harness: bool = False) -> dict[str, list[str]]:
     """Build the harness → models map offered to the router.
 
-    Offers the requesting harness plus its cross-harness counterpart so
-    the router can move a task to the other family; the route-options
-    seam turns this into the router's scenario menu.
+    In-family by default: a Claude Code session must not be told to move a
+    subagent to Codex, so only the requesting harness's models are offered
+    and the router's scenario stays that one family. Auto-harness sessions
+    already let the router pick the family, so they also get the
+    cross-harness counterpart — the only case where a ``redirect`` verdict
+    can fire.
 
     :param harness: Requesting harness id, e.g. ``"codex-native"``.
+    :param cross_harness: ``True`` to also offer the counterpart family.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
     from omnigent.server.smart_routing import infer_models
 
+    offered = (harness, _COUNTERPART_HARNESS.get(harness)) if cross_harness else (harness,)
     result: dict[str, list[str]] = {}
-    for candidate in (harness, _COUNTERPART_HARNESS.get(harness)):
+    for candidate in offered:
         if candidate is None or candidate in result:
             continue
         models = infer_models(candidate)
@@ -425,6 +470,7 @@ async def resolve_subagent_route(
     *,
     caps: Any = None,
     available_models: dict[str, list[str]] | None = None,
+    cross_harness: bool = False,
     persist: Callable[[RoutingDecisionData], Awaitable[None]] | None = None,
     now: float | None = None,
 ) -> SubagentRouteDecision:
@@ -436,6 +482,9 @@ async def resolve_subagent_route(
         process-global caps.
     :param available_models: Candidate harness → models map. ``None``
         derives it from the requesting harness.
+    :param cross_harness: ``True`` when the session may move a subagent to
+        the counterpart harness family (auto-harness sessions only).
+        Ignored when *available_models* is given.
     :param persist: Coroutine that records the decision in the
         transcript. ``None`` skips persistence (unit tests, dry runs).
     :param now: Monotonic-ish clock override for cache tests.
@@ -448,7 +497,9 @@ async def resolve_subagent_route(
     settings = _resolved_settings(caps)
     clock = time.time() if now is None else now
 
-    decision = await _decide(session_id, req, caps, settings, available_models, clock)
+    decision = await _decide(
+        session_id, req, caps, settings, available_models, cross_harness, clock
+    )
     emit_routing_event(
         ROUTING_EVENT_DECISION,
         {
@@ -476,6 +527,7 @@ async def _decide(
     caps: Any,
     settings: _Settings,
     available_models: dict[str, list[str]] | None,
+    cross_harness: bool,
     clock: float,
 ) -> SubagentRouteDecision:
     if req.fork:
@@ -495,7 +547,9 @@ async def _decide(
         return _fail_mode_decision(settings, "no routing client configured")
 
     candidates = (
-        available_models if available_models is not None else candidate_models(req.harness)
+        available_models
+        if available_models is not None
+        else candidate_models(req.harness, cross_harness=cross_harness)
     )
     if not candidates:
         return _fail_mode_decision(settings, f"no candidate models for harness {req.harness}")
@@ -987,7 +1041,7 @@ def session_router_env(session_id: str) -> dict[str, str]:
     session init hands every harness process the same rendezvous.
 
     :param session_id: Session/conversation identifier.
-    :returns: Env-var overrides, empty when routing is off for the session.
+    :returns: Env-var overrides, empty when the session has no router.
     """
     with _lifecycle_lock:
         router = _session_routers.get(session_id)
