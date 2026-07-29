@@ -43,6 +43,7 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
+    codex_hook_trust_bypass_args,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
@@ -660,8 +661,14 @@ class CodexNativeAppServer:
             f"{Path(self.codex_path).name} "
             f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
         )
+        # Codex silently skips hooks it does not trust, which for the
+        # subagent-routing gate is a fail-open. When the hooks file in this
+        # private home is one Omnigent generated, launch with the bypass flag
+        # (version-gated) instead of relying on the interactive trust prompt
+        # no headless session can answer.
         argv = [
             tagged_argv0,
+            *codex_hook_trust_bypass_args(self.codex_home, codex_version),
             "app-server",
             "--listen",
             resolved_listen,
