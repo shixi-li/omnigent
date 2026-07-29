@@ -22,63 +22,85 @@ MVP requirements (from the Jul 28 brainstorm/meeting):
 
 ---
 
-## 1. Confirmed router API behavior (live probes, 2026-07-28)
+## 1. Confirmed router API behavior (live probes, 2026-07-28/29)
 
-Probed `POST {workspace}/ai-gateway/routing/v1/routes:select` with
-`router_name=task_v0` on **eng-ml-inference** and **eng-ml-agent-platform**
-staging (bearer via `databricks auth token`). Identical behavior on both:
+Probed `POST {workspace}/ai-gateway/routing/v1/routes:select` on
+**eng-ml-inference** and **eng-ml-agent-platform** staging (bearer via
+`databricks auth token`). Two routers are registered: `task_v0` and `task_v1`
+(the error for an unknown name enumerates them). **`task_v1` is the
+harness-aware recipe — use it.** Response shape for both:
+`{"route_selection": [{"route_option": {"model", "harness"}, "params": {}}], "rationale": "..."}`.
 
-- **Live and working.** Response shape:
-  `{"route_selection": [{"route_option": {"model", "harness"}, "params": {}}], "rationale": "..."}`.
-- **Static required model set.** The recipe requires *exactly*
-  `[claude-opus-4-8, glm-5-2, gpt-5-4-mini, gpt-5-5, gpt-5-6-luna]` in
-  `route_options`. Any subset → `400 BAD_REQUEST` naming the missing ids.
-  This is per Ivan/Mason: the model set is static for now; a caller-supplied
-  model+harness set comes later.
-- **NOT harness-constrained server-side.** The `harness` field on a route
-  option is echoed back on the pick but does not constrain it: offering all
-  five models tagged `harness=codex` (no claude-sdk option at all) still
-  returned `claude-opus-4-8` (with `harness: "codex"` echoed verbatim).
-  **Harness feasibility is therefore the client's job today.** Per the meeting,
-  the router will constrain the *returned* model by the harnesses passed in
-  eventually — design for that without depending on it (§2).
-- **Required ids need not exist as serving endpoints.** Both staging workspaces
-  lack `databricks-gpt-5-4-mini` and `databricks-gpt-5-6-luna` endpoints, yet
-  the router demands those ids in `route_options`. Consequence: a strictly
-  catalog-derived option list 400s. The client must send the router's
-  vocabulary, then map the pick back to something actually servable.
-- Trivial-task prompts route to `claude-opus-4-8` ("bug fix rewards deeper
-  reasoning"); mid/complex prompts routed to `gpt-5-5`. Recipe quality is
-  Ivan's problem, not ours — but transcript rationale display (C2) matters
-  precisely because of picks like this.
+**`task_v1` (target):**
+
+- **Scenario inference from model arms, not harness tags.** The router infers
+  a scenario from *which model families appear* in `route_options`:
+  Claude arms `{claude-opus-4-8, claude-sonnet-5}` → scenario `cc`;
+  Codex arms `{glm-5-2, gpt-5-6-sol, gpt-5-6-luna}` → scenario `codex`;
+  both families → scenario `both`. Offering no recognized arm (e.g. only
+  `gpt-5-5`) → 400 "could not infer a scenario".
+- **Each scenario requires its full fixed menu** (`cc` = both Claude arms,
+  `codex` = all three Codex arms, `both` = all five). A partial menu → 400
+  naming the missing arms. **Extra non-arm models are tolerated and ignored**
+  (verified: menu + `gpt-5-5`/`claude-haiku-4-5`/`kimi-k2` routes fine) — so
+  omnigent can keep sending a catalog superset as long as the full menu for
+  the intended scenario is present.
+- **This arm-menu selection IS the harness constraint**: send only Codex arms
+  for P0 (within-codex), only Claude arms for P1 (within-CC), all five for
+  the auto/cross-harness CUJ. The pick always comes from the offered menu.
+- **The `harness` field itself is still passthrough**, on both routers:
+  swapping tags (Claude models tagged `codex` and vice versa) neither changes
+  the pick nor errors — the tag is echoed back verbatim on the selection,
+  even when nonsensical. Harness intent is expressed via which arms you
+  offer, not via the tag; treat the echoed harness as untrusted.
+- Recipe is a rule tree (rationales expose predicates: `prompt<300`,
+  `not_crosscutting`, `low_ambiguity`, "cheapest arm … never escalate";
+  defaults `claude-sonnet-5` / `gpt-5-6-sol`).
+
+**`task_v0` (previous placeholder, still registered):** static required set
+`[claude-opus-4-8, glm-5-2, gpt-5-4-mini, gpt-5-5, gpt-5-6-luna]`, no
+tolerance for missing ids, no harness behavior at all. Ignore except for
+backward-compat testing.
+
+**Menu ids need not exist as serving endpoints.** eng-ml-inference has
+endpoints for `claude-opus-4-8`, `claude-sonnet-5`, `glm-5-2`, but **not**
+`gpt-5-6-sol` / `gpt-5-6-luna` — yet task_v1 requires those ids in
+`route_options` and happily *selects* them. Consequences: (a) a strictly
+catalog-derived option list 400s (the two missing arms never enter it), so the
+client must inject the router vocabulary; (b) a pick may be unservable in the
+workspace and must be mapped to a servable id (or the decision degraded to
+fallback) — see §2.
 
 Dev-loop config (worktree `.omnigent-local/config.yaml`, isolated via
 `OMNIGENT_CONFIG_HOME`/`OMNIGENT_DATA_DIR`): routing `provider: external`,
 `base_url: https://eng-ml-inference.staging.cloud.databricks.com/ai-gateway/routing/v1`,
-`router_name: task_v0`, profile `eng-ml-inference`. Note
+`router_name: task_v1`, profile `eng-ml-inference`. Note
 `OMNIGENT_SMART_ROUTING=1` from the Jul 24 runbook is obsolete — the client is
 built from the `routing:` config block alone (`cli.py::_build_external_routing_client`).
 
 ## 2. Design principle: one swappable route-options boundary
 
-Today's contract (static 5-model vocabulary, client-side harness filtering,
-picks that may not be servable) is temporary. Mason will later accept dynamic
-model+harness sets and enforce harness constraints server-side. To make that a
-config/adapter change rather than a refactor, **all knowledge of the router's
-contract lives in exactly one place**: a `RouteOptionSource` seam inside
-`omnigent/server/smart_routing.py`:
+Today's contract (fixed per-scenario arm menus, harness expressed by arm
+choice rather than a first-class field, picks that may not be servable) is
+temporary. Mason will later accept dynamic model+harness sets and enforce
+harness constraints server-side. To make that a config/adapter change rather
+than a refactor, **all knowledge of the router's contract lives in exactly one
+place**: a `RouteOptionSource` seam inside `omnigent/server/smart_routing.py`:
 
 - `build_route_options(harnesses, catalog) -> list[RouteOption]` — v0
-  implementation returns the static required vocabulary annotated with the
-  requesting harness(es), ignoring the catalog except for prefix mapping.
-  A future `CatalogRouteOptionSource` returns the caller's real model set.
-- `resolve_selection(pick, harnesses, catalog) -> ResolvedRoute` — v0 applies
-  the harness-compatibility correction client-side (the existing
-  `_HARNESS_EXCLUDED_MODELS` / `_redirect_incompatible_pick` logic moves here
-  instead of being deleted) and maps router vocabulary → servable catalog id
-  (prefix restore + nearest-available fallback when the picked id has no
-  endpoint). When the server-side constraint ships, this collapses to prefix
-  restore only.
+  implementation selects the task_v1 scenario menu from the requesting
+  harness set (codex-only → Codex arms, claude-only → Claude arms, mixed →
+  all five; menus config-overridable via `routing.scenario_menus`), injecting
+  menu ids even when absent from the catalog. A future
+  `CatalogRouteOptionSource` returns the caller's real model set.
+- `resolve_selection(pick, harnesses, catalog) -> ResolvedRoute` — v0 ignores
+  the router's echoed `harness` (passthrough, untrusted — §1), derives the
+  harness from the picked arm's family (keeping
+  `_HARNESS_EXCLUDED_MODELS`-style compatibility data here rather than
+  deleting it), and maps router vocabulary → servable catalog id (prefix
+  restore + nearest-available fallback when the picked id has no endpoint,
+  e.g. `gpt-5-6-sol`/`gpt-5-6-luna` on eng-ml-inference today). When
+  server-side constraints ship, this collapses to prefix restore only.
 
 Callers (`route_session_harness`, `route_turn`, the B0 subagent endpoint) never
 see router vocabulary or harness-correction rules. Router recipe name stays a
@@ -142,8 +164,8 @@ Owns: `omnigent/server/smart_routing.py`, `omnigent/cli.py`
 (`_build_external_routing_client` region only), `tests/server/test_smart_routing*.py`.
 - Introduce `RouteOptionSource` per §2; move `_HARNESS_EXCLUDED_MODELS` /
   `_redirect_incompatible_pick` / `MODEL_LISTS` behind it as the v0 static
-  implementation (required vocabulary = the task_v0 five, config-overridable
-  via `routing.required_models`).
+  implementation (task_v1 scenario menus per §1, config-overridable via
+  `routing.scenario_menus`; default `routing.router_name` = `task_v1`).
 - Map unservable picks to the nearest servable catalog id; emit the raw pick
   in the decision payload either way (UI shows what the router said).
 - Default-on: when the server's provider is Databricks (`kind: databricks`)
@@ -152,10 +174,12 @@ Owns: `omnigent/server/smart_routing.py`, `omnigent/cli.py`
   `model_prefixes=["databricks-", "system.ai."]` and profile auth. Explicit
   `routing:` config always wins; `routing.provider: none` opts out.
 - Fallback ordering unchanged: external → LLM judge → disabled.
-- Tests: static-vocabulary request shape (all five present regardless of
-  catalog), harness correction on a codex-tagged opus pick, unservable-pick
-  mapping, default-on synthesis with/without Databricks creds, 400-missing-
-  models surfaced as a warning + fallback (not a crash).
+- Tests: scenario-menu request shape (correct arm menu per harness set,
+  injected even when absent from catalog; catalog extras preserved), harness
+  derived from picked arm's family (echoed harness ignored), unservable-pick
+  mapping (`gpt-5-6-sol`/`luna`), default-on synthesis with/without
+  Databricks creds, 400-missing-arms surfaced as a warning + fallback (not a
+  crash).
 
 **P2 — Runner `route-subagent` endpoint** *(req 2 backbone)*
 Owns: new `omnigent/runner/subagent_routing.py`, the runner HTTP surface file
@@ -313,8 +337,9 @@ delivered on the existing session-status channel.
 ## 6. MVP definition of done (Jul 31)
 
 - AIGW `routes:select` drives session/turn/child routing by default on
-  Databricks-backed deployments (P1), surviving the confirmed contract quirks:
-  static vocabulary, no server-side harness constraint, unservable picks.
+  Databricks-backed deployments (P1) using `task_v1`, surviving the confirmed
+  contract quirks: fixed scenario menus, passthrough harness tags, unservable
+  picks.
 - A Claude Task spawn and a Codex `spawn_agent` cannot proceed on a
   non-router-approved model; failure mode is "didn't spawn", never "wrong
   model" (P2–P4, P7).
@@ -347,8 +372,9 @@ delivered on the existing session-status channel.
 3. **Redirect compliance is soft**: deny+redirect relies on the model calling
    `sys_session_send`; worst case non-spawn, never wrong-model. Track
    redirect-follow rate via decision items during the pilot.
-4. **Static vocabulary drift**: if Ivan's recipe changes its required set, the
-   client 400s until `routing.required_models` is updated; P1 must degrade to
-   fallback with a loud warning, and the config knob is the escape hatch.
+4. **Scenario-menu drift**: if Ivan's recipe changes its arms (task_v2, new
+   models), the client 400s until `routing.scenario_menus` is updated; P1 must
+   degrade to fallback with a loud warning, and the config knob is the escape
+   hatch.
 5. **Fork/cache-miss economics**: v1 doesn't route forks; a real cost model
    needs inherited-context size that only Omnigent can supply out-of-band.
