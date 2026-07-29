@@ -1,8 +1,10 @@
 # Intelligent Routing × AIGW: MVP Engineering Plan (Bryan's workstreams)
 
 Owner: bryan.qiu@databricks.com
-Status: ACTIVE — updated 2026-07-28 against main @ `c62bfc2f`; router API behavior
-confirmed by live probes (see §1). MVP target: **Jul 31, 2026**.
+Status: ACTIVE — updated 2026-07-29 against main @ `c62bfc2f`. Router API behavior
+confirmed by live probes (§1); backend read from universe `ai-gateway/src/routing`
+(§1.1); **every omnigent-side claim below verified against code** (file:line
+refs are exact as of `c62bfc2f`). MVP target: **Jul 31, 2026**.
 Branch strategy: **all MVP work lands on the single branch `routing-mvp`**
 (worktree `~/omnigent-routing-mvp`, cut from latest main). No per-task branches —
 tasks are partitioned by file ownership (§4) so parallel agents don't collide.
@@ -18,7 +20,7 @@ MVP requirements (from the Jul 28 brainstorm/meeting):
 4. Telemetry: capture when intelligent routing is enabled, when users switch OFF
    of it mid-flight, and forks off an intelligent-routing session (OTel).
 5. SAFE flag with isaac to default-on for specific users (lives in universe, not
-   this repo — tracked in §7, not a task packet here).
+   this repo — tracked in §8, not a task packet here).
 
 ---
 
@@ -69,7 +71,7 @@ endpoints for `claude-opus-4-8`, `claude-sonnet-5`, `glm-5-2`, but **not**
 catalog-derived option list 400s (the two missing arms never enter it), so the
 client must inject the router vocabulary; (b) a pick may be unservable in the
 workspace and must be mapped to a servable id (or the decision degraded to
-fallback) — see §2.
+no-routing) — see §2.
 
 ### 1.1 Backend implementation notes (universe `ai-gateway/src/routing/`)
 
@@ -95,7 +97,9 @@ client design should exploit:
   regexes/lengths over the prompt (stack traces, file paths, `` `symbols` ``,
   code fences; buckets at 400/1200/3000 chars; trivial cutoff 300). Send the
   user's raw task text, not a wrapper/summary — wrapping changes routing.
-  Corollary for B0/P2: Codex's encrypted spawn prompts mean hook-path codex
+  (Client already truncates to 4000 chars — `smart_routing.py:505` — which
+  preserves the "long" bucket boundary at 3000; keep the truncation.)
+  Corollary for P2: Codex's encrypted spawn prompts mean hook-path codex
   routing degenerates to short-prompt defaults; the redirect path
   (plaintext) is where task-aware quality lives.
 - **`harness` is never read by any router.** `RouteOption.harness` is
@@ -152,38 +156,65 @@ place**: a `RouteOptionSource` seam inside `omnigent/server/smart_routing.py`:
   e.g. `gpt-5-6-sol`/`gpt-5-6-luna` on eng-ml-inference today). When
   server-side constraints ship, this collapses to prefix restore only.
 
-Callers (`route_session_harness`, `route_turn`, the B0 subagent endpoint) never
-see router vocabulary or harness-correction rules. Router recipe name stays a
-config key (`routing.router_name`), never hardcoded in logic.
+Callers (`route_session_harness`, `route_turn`, the P2 subagent endpoint)
+never see router vocabulary or harness-correction rules. Router recipe name
+stays a config key (`routing.router_name`), never hardcoded in logic.
 
-## 3. State of the world on main (do not rebuild)
+**Failure semantics (corrected):** the "external vs LLM judge" choice is
+**build-time** — `cli.py:3420` constructs exactly one client into
+`RuntimeCaps.routing_client`; there is no runtime chain. At runtime a router
+failure returns `None` with `last_error` set (`smart_routing.py:518-582`),
+and callers proceed **unrouted** with the reason surfaced
+(`route_session_harness` returns the error string for the UI). MVP keeps
+this fail-open posture for sessions/turns; the P2 subagent path adds the
+configurable strict mode (§5.1) because "unrouted spawn" there means the
+determinism guarantee silently lapses.
 
-| Capability | Where |
+## 3. State of the world on main (verified 2026-07-29, `c62bfc2f`)
+
+| Capability | Where (exact) |
 |---|---|
-| AIGW routing client (`routes:select`, proto, Databricks OAuth per-call refresh, model-prefix mapping) | `omnigent/server/smart_routing.py::ExternalRoutingClient`, `omnigent/api/routing/v1/routing.proto` |
-| Local LLM-judge fallback router | `smart_routing.py::LLMRoutingClient` (built from server `llm:` block) |
-| Pluggable router | `RuntimeCaps.routing_client` (`omnigent/runtime/caps.py`) |
-| Auto-harness session routing (SDK harnesses `claude-sdk`/`codex`/`pi`) | `smart_routing.py::route_session_harness` ← `server/routes/_sessions/orchestration.py` (~3614) |
-| Per-turn routing (`cost_control_mode_override == "on"`, incl. `/model` injection into live Claude-native sessions) | `smart_routing.py::route_turn` → `orchestration.py` (~3734, ~3995) |
-| Omnigent-spawned child routing via parent catalog | `orchestration.py` (~3697) |
-| Deterministic model-override plumbing (native `--model` argv, SDK `HARNESS_<H>_MODEL` env, family-mismatch guard) | `omnigent/model_override.py` |
-| Routing-decision transcript item (applied vs would-have-picked, rationale, child→parent mirroring) | `omnigent/entities/conversation.py::RoutingDecisionData` |
-| UI Smart Routing sentinel (hard-disabled: `smartRoutingEligible = false`) | `web/src/components/HarnessConfigControls.tsx`, `web/src/shell/NewChatDialog.tsx` (~2165) |
-| `sys_advise_models` tool (present only when routing enabled) | `omnigent/runner/tool_dispatch.py` (~284) |
+| AIGW routing client: proto-typed request (`routing_pb2` + `json_format`, snake_case), per-call Databricks OAuth refresh off-thread, 4000-char prompt cap, `last_error` surfacing | `omnigent/server/smart_routing.py:378-587` |
+| Routing proto — **already has** `RouteSelector.config` (Struct), `SessionHistory`, `RouteSelection.params`; client just doesn't populate them | `omnigent/api/routing/v1/routing.proto` |
+| Local LLM-judge router (built INSTEAD of external when `provider != external`) | `smart_routing.py:250`; `cli.py:107,166,3420` |
+| Pluggable router | `omnigent/runtime/caps.py:80` (`routing_client`) |
+| Auto-harness session routing | `smart_routing.py:678` ← `orchestration.py:3625` |
+| Omnigent-spawned child routing via parent catalog | `orchestration.py:3717` (`catalog_session_id=parent`) |
+| Per-turn routing (`cost_control_mode_override == "on"`; native `/model` injection) | `smart_routing.py:823` ← `orchestration.py:3748, 3995-4012` |
+| Post-verdict harness correction | `smart_routing.py:636-675` (`_HARNESS_EXCLUDED_MODELS`, `_redirect_incompatible_pick`) |
+| Live catalog fetch (server→runner `/v1/sessions/{id}/models`) | `smart_routing.py:122` (`fetch_runner_models`) |
+| Deterministic model-override plumbing (native `--model`, SDK `HARNESS_<H>_MODEL`, `model_family_mismatch` guard) | `omnigent/model_override.py:30,112,254` |
+| `sys_session_send` child model: **create-time-only** `args.model`, family-guarded, → `model_override` | `omnigent/tools/builtins/spawn.py:1562-1662,1778-1781` |
+| Routing-decision transcript item — fields today: `model`, `applied`, `rationale`, `agent` | `omnigent/entities/conversation.py:512-560` |
+| UI decision rendering: `RoutingDecisionChip` (turn) + `RoutingDecisionCard` (session) | `web/src/components/blocks/StatusBlocks.tsx:130,172` |
+| UI Smart Routing sentinel, hard-disabled for Auto harness | `HarnessConfigControls.tsx:17`, `NewChatDialog.tsx:2165` |
+| Claude-native hook provisioning — settings dict built in code, passed via `--settings`; **a deny-capable PreToolUse policy hook already exists** (AskUserQuestion matcher + policy eval when `ap_server_url` set) | `claude_native_bridge.py:1118-1364` (`build_hook_settings`), `:1322-1325` |
+| Runner-local HTTP endpoint pattern for hooks: tool relay on `127.0.0.1:0`, bearer token advertised via `tool_relay.json` in the bridge dir, discovery env vars | `claude_native_bridge.py:3291,3317,3326`; env `HARNESS_CLAUDE_NATIVE_BRIDGE_DIR` / `..._REQUEST_SESSION_ID` (`:804-805`) |
+| Codex per-session private home: `auth.json` symlinked, `hooks.json` **symlinked from the user's** `~/.codex`, `config.toml` copied | `omnigent/inner/codex_executor.py:112-120,656,760,1380` |
+| Codex hook-trust groundwork **already present**: `_CODEX_BYPASS_HOOK_TRUST_FLAG` + min-version gates (policy hooks ≥0.129.0, bypass-trust ≥0.131.0) — defined, not yet applied to omnigent-launched argv | `omnigent/inner/codex_native_app_server.py:89-94,1877` |
+| Fork detection (session-level: `/fork`, `/branch`, `forkedFrom` markers) | `claude_native_forwarder.py:233,2311,2457`; `claude_native_bridge.py:1716` |
+| Existing hook-script precedents (no shared dir yet) | `omnigent/inner/cursor_policy_hook.py`, `omnigent/inner/hermes_policy_hook.py` |
+| Telemetry: `omnigent` tracer, `span()` ctx manager, `record_llm_usage`/`record_error`; **no event-emission helper yet** | `omnigent/runtime/telemetry.py:598,632,789,816` |
 
 **Gaps this plan closes:** (G1) native in-harness subagents are unrouted —
-Claude-native hooks are observe-only (`claude_native_forwarder.py`), Codex's
-private `CODEX_HOME` symlinks the *user's* `hooks.json` (`inner/codex_executor.py`);
-(G2) router-contract knowledge is smeared across the client (static
-`MODEL_LISTS`, `_HARNESS_EXCLUDED_MODELS` post-correction) instead of the §2
-seam; (G3) no routing telemetry; (G4) decisions not visible per-subagent.
+Claude SDK executor registers **no** hooks today, Claude-native's PreToolUse
+hook doesn't cover Task spawns, Codex symlinks the user's `hooks.json`
+untouched; (G2) router-contract knowledge is smeared across the client
+(static `MODEL_LISTS`, post-correction) instead of the §2 seam, and
+`route_selector.config` is never sent; (G3) no routing telemetry, and
+`RoutingDecisionData` lacks harness/scope/decision identity; (G4) decisions
+are not visible per-subagent — `ChildSessionInfo`
+(`web/src/hooks/useChildSessions.ts:25-54`, fed by
+`GET /v1/sessions/{id}/child_sessions`) carries **no model field at all**, and
+there is no generic session-header warning banner to surface enforcement
+state.
 
 Enforcement primitives verified externally (2026-07-28 research reports):
 
 - **Claude Code**: `PreToolUse` hook on the Agent/Task tool can deny **and**
   rewrite `tool_input` (incl. `model`) via `hookSpecificOutput.updatedInput` +
   `permissionDecision: "allow"`. Settings-level hooks recurse to nested
-  subagents. Works in CLI and Agent SDK.
+  subagents. Works in CLI and Agent SDK (SDK: in-process hook callbacks).
 - **Codex** (live-verified on codex-cli 0.145.0): Claude-compatible hooks;
   `PreToolUse` on `spawn_agent` can deny and rewrite args **including
   injecting `model`** (not LLM-visible in the schema; harness accepts it).
@@ -203,149 +234,185 @@ Rules of engagement for subagents:
   another packet's files; integration points go through the frozen contracts
   in §5. Shared-file exceptions are called out explicitly per packet.
 - Every packet lands its own unit tests alongside the code and must pass
-  `pre-commit run --files <owned files>` + its own `uv run pytest` targets
-  before committing to `routing-mvp`.
+  `uvx pre-commit run --files <owned files>` + its own test targets
+  (`uv run pytest <paths>`; `cd web && npx vitest run <paths>` — the web
+  suite is **vitest**, not jest) before committing to `routing-mvp`.
 - Commit per packet (small, revertable), all on `routing-mvp`.
 
 ### Wave 1 — six packets, fully parallel
 
-**P1 — Route-options seam + default-on AIGW router** *(req 1, G2)*
-Owns: `omnigent/server/smart_routing.py`, `omnigent/cli.py`
-(`_build_external_routing_client` region only), `tests/server/test_smart_routing*.py`.
+**P1 — Route-options seam + config + default-on AIGW router** *(req 1, G2)*
+Owns: `omnigent/server/smart_routing.py`, `omnigent/cli.py` (routing-client
+build region ~107-166 only), `tests/server/test_smart_routing.py`.
 - Introduce `RouteOptionSource` per §2; move `_HARNESS_EXCLUDED_MODELS` /
-  `_redirect_incompatible_pick` / `MODEL_LISTS` behind it as the v0 static
-  implementation (task_v1 scenario menus per §1, config-overridable via
-  `routing.scenario_menus`; default `routing.router_name` = `task_v1` — menus
-  are keyed by router version since versions are frozen, §1.1).
-- Map unservable picks to the nearest servable catalog id; emit the raw pick
-  in the decision payload either way (UI shows what the router said).
-- Pass `routing.selection_model` config through as
-  `route_selector.config.model` (extraction self-call runs under caller
-  identity — §1.1); send the raw task text as `task.prompt`, never a
-  wrapped/summarized prompt.
+  `_redirect_incompatible_pick` / `MODEL_LISTS` behind it (task_v1 scenario
+  menus per §1, config-overridable via `routing.scenario_menus`, keyed by
+  router version; default `routing.router_name` = `task_v1`).
+- Map unservable picks to the nearest servable catalog id; keep the raw pick
+  for the decision payload (UI shows what the router said).
+- Populate `route_selector.config.model` from new `routing.selection_model`
+  (proto field already exists — zero proto work); keep raw prompt + existing
+  4000-char cap.
+- **Owns ALL new `routing.*` config parsing** (including P2's
+  `subagent_fail_mode` and cache TTL) into the frozen `RoutingSettings`
+  dataclass (§5.4) hung on `RuntimeCaps` — other packets read the dataclass,
+  never cli.py. This is what keeps cli.py single-owner.
 - Default-on: when the server's provider is Databricks (`kind: databricks`)
   and no `routing:` block exists, synthesize the external client against that
   workspace's `/ai-gateway/routing/v1` with
   `model_prefixes=["databricks-", "system.ai."]` and profile auth. Explicit
   `routing:` config always wins; `routing.provider: none` opts out.
-- Fallback ordering unchanged: external → LLM judge → disabled.
-- Tests: scenario-menu request shape (correct arm menu per harness set,
-  injected even when absent from catalog; catalog extras preserved), harness
-  derived from picked arm's family (echoed harness ignored), unservable-pick
-  mapping (`gpt-5-6-sol`/`luna`), default-on synthesis with/without
-  Databricks creds, 400-missing-arms surfaced as a warning + fallback (not a
-  crash).
+- Failure semantics unchanged for sessions/turns: `None` + `last_error`,
+  caller proceeds unrouted with the reason (§2) — do NOT invent a runtime
+  LLM-judge chain in this packet.
 
 **P2 — Runner `route-subagent` endpoint** *(req 2 backbone)*
-Owns: new `omnigent/runner/subagent_routing.py`, the runner HTTP surface file
-that exposes it, server relay route (mirror the existing
-`/v1/sessions/{id}/models` proxy pattern used by `smart_routing.fetch_runner_models`),
-`tests/server/test_subagent_routing.py`.
-- Implements the §5.1 contract. Internally calls `RuntimeCaps.routing_client`
-  through the server relay; applies policy server-side so hook scripts stay
-  dumb: `fork=true` → `allow` unchanged (v1: don't route forks);
-  router unreachable → configurable `routing.subagent_fail_mode`
-  (`open`=allow unchanged [default], `closed`=deny) — pilot runs `closed`.
-- Caches per (session, task-hash) to keep the blocking spawn path fast.
+Owns: new `omnigent/runner/subagent_routing.py`, its wiring into the runner's
+existing local HTTP surface, new `tests/server/test_subagent_routing.py`.
+- **Follow the existing tool-relay pattern** (`claude_native_bridge.py:3291`):
+  loopback HTTP on `127.0.0.1:0`, bearer token + URL advertised via a JSON
+  file in the session bridge dir — do not invent a new auth scheme. Serves
+  the §5.1 contract.
+- Reaches the server's `RuntimeCaps.routing_client` the same way live
+  catalogs flow today (the runner↔server hop behind
+  `fetch_runner_models`, `smart_routing.py:122`) — P2 adds the inverse
+  relay route next to the existing `/v1/sessions/{id}/models` handler.
+- Policy lives server-side so hook scripts stay dumb: `fork=true` → `allow`
+  unchanged (v1: don't route forks); router unreachable →
+  `RoutingSettings.subagent_fail_mode` (`open`=allow unchanged [default],
+  `closed`=deny) — pilot runs `closed`.
+- Caches per (session, task-hash) with TTL to keep the blocking spawn path
+  fast; cache retains per-session picks shaped for future `session_history`.
 - Persists every decision as a transcript item via the §5.2 shape.
-- Tests with a fake routing client: rewrite/redirect/deny/fork/outage paths.
+- Tests with `_FakeRoutingClient` + the `_caps` patch pattern
+  (`tests/server/test_smart_routing.py:62,305-317`): rewrite / redirect /
+  deny / fork-exempt / outage-open / outage-closed paths.
 
-**P3 — Claude PreToolUse router hook** *(req 2, CC native + SDK)*
-Owns: `omnigent/claude_native_bridge.py` (hook-provisioning region), new hook
-script under `omnigent/inner/hook_scripts/`, `omnigent/inner/claude_sdk_executor.py`
-(hook registration only), matching tests.
-- Generated settings gain a `PreToolUse` entry on the Agent/Task tool calling
-  the packaged script (stdlib-only Python; must be fast — it blocks spawns).
-  SDK path registers the same decision logic as an in-process hook callback.
-- Script maps §5.1 responses: `rewrite` → allow + `updatedInput` with routed
+**P3 — Claude PreToolUse router hook (native + SDK)** *(req 2)*
+Owns: `omnigent/claude_native_bridge.py` (the `build_hook_settings` region
+only), new `omnigent/inner/hook_scripts/` dir (create it) + claude router
+hook script, `omnigent/inner/claude_sdk_executor.py` (hook registration
+only), matching tests.
+- Native: extend `build_hook_settings` (`:1118-1364`) with a `PreToolUse`
+  entry matching the Agent/Task tool — **model on the existing deny-capable
+  PreToolUse policy-hook entry at `:1322-1325`** and the
+  `cursor_policy_hook.py` / `hermes_policy_hook.py` script precedents.
+  Script discovers the P2 endpoint via the bridge-dir advertisement file
+  (same discovery as `tool_relay.json`; bridge dir comes in on
+  `HARNESS_CLAUDE_NATIVE_BRIDGE_DIR` / `--bridge-dir` argv). Stdlib-only,
+  fast — it blocks spawns.
+- SDK: `claude_sdk_executor.py` registers **no hooks today** (verified) —
+  add the same decision logic as an in-process `claude-agent-sdk`
+  `PreToolUse` callback; no subprocess.
+- Decision mapping per §5.1: `rewrite` → allow + `updatedInput` with routed
   `model`; `redirect` → deny with reason
   `"Router selected <harness>/<model>. Use sys_session_send with args.harness=…, args.model=… instead."`;
-  `deny` → deny with router reason. Fork-typed spawns pass `fork=true`.
-- Until P2 merges, develop against a stub of the §5.1 contract (frozen).
+  `deny` → deny with router reason. Fork-typed spawns send `fork=true`.
+- Until P7 wires the live endpoint, develop against a stub honoring §5.1.
 - Tests: fixture hook payloads → exact hook JSON out; settings-generation
-  snapshot; recursion (nested Task) uses the same settings file.
+  snapshot (extend existing `build_hook_settings` tests); recursion note
+  (settings hooks apply to nested Task spawns).
 
-**P4 — Codex hooks.json generation + trust + canary** *(req 2, Codex)*
-Owns: `omnigent/inner/codex_executor.py`, new codex hook script under
+**P4 — Codex hooks.json generation + trust + canary** *(req 2)*
+Owns: `omnigent/inner/codex_executor.py`, `omnigent/inner/codex_native_app_server.py`
+(argv/trust region only), codex router hook script in
 `omnigent/inner/hook_scripts/`, matching tests.
-- Stop symlinking the user's `hooks.json` when routing is on; generate a
-  merged one: user hooks + Omnigent `PreToolUse` matcher `.*spawn_agent`
-  (regex — flattened name is `collaborationspawn_agent` on 0.145.x; re-check
-  the tool name inside the script), generous timeout, + `SessionStart` canary
-  (touch file in bridge dir) + `SubagentStart` audit writer (`agent_id`,
-  `model` → bridge dir for reconciliation against `decision_id`).
-- Add `--dangerously-bypass-hook-trust` to Omnigent-launched codex argv (we
-  own the generated file in a private home); document the managed
+- Stop symlinking the user's `hooks.json` when routing is on
+  (`codex_executor.py:113,760`); generate a merged file: user hooks +
+  Omnigent `PreToolUse` matcher `.*spawn_agent` (regex — flattened name is
+  `collaborationspawn_agent` on 0.145.x; re-check inside the script),
+  generous timeout, + `SessionStart` canary (touch file in bridge dir) +
+  `SubagentStart` audit writer (`agent_id`, `model` → bridge dir).
+- Trust: **the flag and version gates already exist** —
+  `_CODEX_BYPASS_HOOK_TRUST_FLAG` and the ≥0.129/≥0.131 constants
+  (`codex_native_app_server.py:89-94,1877`); apply the flag to
+  omnigent-launched codex argv when the generated hooks file is in play,
+  behind the existing version check. Document the managed
   `requirements.toml` path for fleet later. Canary absent after launch →
   emit the §5.3 warning event instead of failing open silently.
 - Codex constraints: spawn `message` is encrypted — pass through verbatim on
   rewrite, route on `task_name`/parent-model/metadata only; injected `model`
   must come from the harness's spawn-eligible set or the handler errors.
-- Tests: hooks.json merge snapshot, canary detection, audit-file parsing,
-  argv assembly.
+- Tests: hooks.json merge snapshot (user hooks preserved), canary detection,
+  audit-file parsing, argv assembly incl. version-gated flag.
 
-**P5 — Decision data model + telemetry** *(reqs 3+4 backbone)*
-Owns: `omnigent/entities/conversation.py` (`RoutingDecisionData` only),
-OTel emission in `omnigent/runtime/telemetry.py` call sites it adds, matching tests.
-- Extend `RoutingDecisionData` per §5.2 (additive, defaulted fields — old
-  rows must deserialize).
-- OTel events (namespaced `omnigent.routing.*`): `decision` (every §5.2 item,
-  incl. scope + applied), `disabled_mid_session` (user switches off IR),
-  `enabled` (session starts with IR on), `fork_from_routed_session`.
-  Emit from the entity-adjacent helper so call sites stay one-liners.
-- Tests: serialization round-trip incl. legacy rows; event payload shapes.
+**P5 — Decision data model + child-sessions API + telemetry** *(reqs 3+4 backbone)*
+Owns: `omnigent/entities/conversation.py` (`RoutingDecisionData` only), the
+`GET /v1/sessions/{id}/child_sessions` handler (routed-model field addition),
+a new `emit_routing_event` helper in `omnigent/runtime/telemetry.py`, matching
+tests.
+- Extend `RoutingDecisionData` per §5.2 — additive, defaulted (current fields
+  are exactly `model/applied/rationale/agent`; legacy rows must deserialize).
+- Add `routed_model` (+ `routing_decision_id`) to the child-sessions API
+  payload so the sidebar can render per-subagent models — **this is the
+  server half of G4; P6 must not need server edits.**
+- Telemetry: `telemetry.py` has span helpers but **no event API** (verified)
+  — add one `emit_routing_event(name, attrs)` helper (span-event or log-record
+  based, matching `tests/runtime/test_telemetry_logs.py` conventions) and
+  emit `omnigent.routing.decision` / `.enabled` / `.disabled_mid_session` /
+  `.fork_from_routed_session`.
+- Tests: serialization round-trip incl. legacy rows; child-sessions payload;
+  event emission asserted via `InMemorySpanExporter`
+  (pattern: `tests/inner/test_tracing_genai_semconv.py`).
 
-**P6 — UI: per-subagent visibility + toggle telemetry wiring** *(reqs 3+4)*
-Owns: `web/src/` only — transcript routing card, `web/src/shell/Sidebar.tsx`,
-`subagentStatus.ts`, `NewChatDialog.tsx`, jest tests.
-- Transcript card: add harness + scope badge ("subagent: <name>"), raw pick
-  vs applied model when they differ, rationale as today.
-- Sidebar child/subagent rows: show routed model per subagent (ankit req #1).
-- Surface the P4 canary warning on the session header
-  ("subagent routing not enforced").
-- Fire the switch-off/fork telemetry triggers (client → existing event
-  plumbing) when the user leaves IR mid-session or forks a routed session.
-- NewChatDialog: keep Auto harness as the entry point; leave the dead
-  `smartRoutingEligible` sentinel untouched this wave (design decision with
-  Ajay/Tomu pending — §7).
-- Develops against §5.2 as fixture data; jest only (`npx jest web/src/...`).
+**P6 — Web UI: per-subagent visibility + warning banner + toggle telemetry** *(reqs 3+4)*
+Owns: `web/src/` only — `StatusBlocks.tsx`, `Sidebar.tsx`,
+`subagentStatus.ts`, `useChildSessions.ts`, `NewChatDialog.tsx`, vitest tests.
+- Extend `RoutingDecisionChip`/`RoutingDecisionCard`
+  (`StatusBlocks.tsx:130,172`) with harness + scope badge and raw-pick vs
+  applied model.
+- `useChildSessions.ts`: add the §5.2-mirrored `routed_model` field to
+  `ChildSessionInfo`; render it on sidebar child rows (ankit req #1).
+  Develops against fixture payloads matching P5's API addition.
+- **Build the session-header warning banner** (none exists — verified; the
+  closest precedents are `ReconnectSessionDialog` states and the sidebar
+  `AlertTriangleIcon` usage) and render §5.3
+  `subagent_routing_unenforced` on it.
+- Fire switch-off/fork telemetry triggers through the existing event
+  plumbing when the user leaves IR mid-session or forks a routed session.
+- NewChatDialog: leave the dead `smartRoutingEligible` sentinel untouched
+  this wave (design decision with Ajay/Tomu pending — §8).
+- Tests: **vitest** (`cd web && npx vitest run src/...`), not jest.
 
 ### Wave 2 — integration (start once the relevant Wave-1 packets merge)
 
 **P7 — Hook↔endpoint integration + override precedence** *(needs P2+P3+P4)*
-- Wire the real endpoint URL/token into the generated Claude settings and
-  Codex hooks.json (bridge-dir env file), replacing the P3/P4 stubs.
-- B3 determinism check: when routing is on, an LLM-supplied `args.model` on
-  `sys_session_send` must NOT override the router (`tools/builtins/spawn.py`);
-  record the attempted override in the decision item. Add the test.
-- SubagentStart-vs-decision reconciliation in the codex forwarder; mismatch →
-  warning event.
-- Integration tests with a fake router: spawn rewritten in-harness, blocked
-  cross-harness with redirect text, transcript item present (extend the
-  `tests/server/integration/test_sessions_child_sessions.py` pattern).
+The only packet allowed to touch multiple packets' files.
+- Wire the real P2 endpoint advertisement into the generated Claude settings
+  and Codex hooks.json (bridge-dir file), replacing the P3/P4 stubs.
+- Override precedence: when routing is on, an LLM-supplied `args.model` on
+  `sys_session_send` must NOT override the router. Note `args.model` is
+  **create-time-only** (`spawn.py:1778`) — the precedence gate goes where
+  `model_override` enters `create_body`, and the attempted override lands in
+  the decision item (`attempted_override`, §5.2). Add the test.
+- `SubagentStart`-vs-decision reconciliation in the codex forwarder;
+  mismatch → §5.3 warning event.
+- Integration tests: fake router + `ControllableMockClient`
+  (`tests/server/conftest.py:177`), extending the
+  `tests/server/integration/test_sessions_child_sessions.py` pattern —
+  spawn rewritten in-harness, blocked cross-harness with redirect text,
+  transcript item present, child-sessions API carries the routed model.
 
-**P8 — Live E2E + codex probe** *(needs P7)*
-- E2E (conventions from `tests/e2e/test_polly_subagent_model_e2e.py`):
-  Claude-native Task spawn model rewritten; Codex `spawn_agent` rewritten and
-  `SubagentStart` model matches the decision; cross-harness redirect followed
-  by the model at least once.
-- Standalone codex hook probe (deny + rewrite smoke) runnable on every codex
-  version bump; pin the installed codex version (`harness_install_spec.py`).
-- Manual pass against staging AIGW via the worktree dev stack
-  (`run-server.sh` / `run-host.sh` / `run-frontend.sh`, ports 6868/5273).
+**P8 — Live E2E + probes + version pin** *(needs P7)* — see §6 for the full
+test matrix this packet executes.
+- Add a codex version pin: `harness_install_spec.py` has `min_version` /
+  `max_version_exclusive` fields but **no codex pin today** (verified) — set
+  one covering the hook-verified range (≥0.145.0, < next-untested-major).
 
 ### Parallelism summary
 
 ```
 Wave 1 (parallel):  P1   P2   P3   P4   P5   P6
                       \   |  /  \  |   /   |
-Wave 2:                P7 (P2+P3+P4[+P1])  P6 finishes against P5 shapes
+Wave 2:                P7 (P2+P3+P4[+P1])  P6 finishes against P5 fixtures
 Wave 3:                P8 (all)
 ```
 
-P3/P4/P6 code against frozen contracts (§5), not against P2/P5's merged code —
-that's what makes Wave 1 six-wide. P7 is the only packet allowed to touch
-multiple packets' files (it's the integrator; schedule it after Wave 1 merges).
+File-ownership conflicts eliminated by construction: cli.py + smart_routing.py
+are P1-only (P2 reads `RoutingSettings`, not config); entities + server API
+additions are P5-only (P6 consumes fixtures); the two executors split cleanly
+(P3 = claude files, P4 = codex files); `omnigent/inner/hook_scripts/` is new
+but P3/P4 add disjoint files inside it. P7 is the sole integrator.
 
 ---
 
@@ -353,7 +420,10 @@ multiple packets' files (it's the integrator; schedule it after Wave 1 merges).
 
 ### 5.1 `route-subagent` endpoint (P2 serves; P3/P4 consume)
 
-`POST {runner_local}/v1/sessions/{session_id}/route-subagent`
+Advertised to hook scripts via a bridge-dir JSON file
+(`subagent_router.json`: `{url, token}`), same pattern as `tool_relay.json`.
+
+`POST {url}/v1/sessions/{session_id}/route-subagent` (Bearer token)
 
 ```json
 // request
@@ -377,33 +447,133 @@ multiple packets' files (it's the integrator; schedule it after Wave 1 merges).
 
 ### 5.2 `RoutingDecisionData` additions (P5 defines; P2/P6/P7 consume)
 
+Today: `model: str`, `applied: bool`, `rationale: str`, `agent: str | None`.
 Additive fields: `harness: str | None`,
 `scope: Literal["session","turn","child_session","native_subagent"]`,
 `decision_id: str | None`, `raw_model: str | None`,
 `attempted_override: str | None`. All defaulted for legacy rows.
+Child-sessions API mirrors `routed_model: str | null` +
+`routing_decision_id: str | null` per child row.
 
 ### 5.3 Canary warning event (P4 emits; P6 renders)
 
 Session-scoped warning `subagent_routing_unenforced` with `{harness, reason}`,
 delivered on the existing session-status channel.
 
+### 5.4 `RoutingSettings` (P1 defines & parses; P2 reads)
+
+Frozen dataclass on `RuntimeCaps`:
+
+```python
+@dataclass(frozen=True)
+class RoutingSettings:
+    router_name: str = "task_v1"
+    selection_model: str | None = None          # -> route_selector.config.model
+    scenario_menus: Mapping[str, Mapping[str, tuple[str, ...]]] = TASK_V1_MENUS
+    subagent_fail_mode: Literal["open", "closed"] = "open"
+    subagent_cache_ttl_s: float = 300.0
+```
+
 ---
 
-## 6. MVP definition of done (Jul 31)
+## 6. Testing plan
+
+Layered; each layer names its runner and when it gates.
+
+**L1 — per-packet unit (gates every commit).**
+`uv run pytest tests/server/test_smart_routing.py tests/server/test_subagent_routing.py <packet tests>`
+and `cd web && npx vitest run src/...`. Baseline to protect: the existing 47
+tests in `test_smart_routing.py` (they lock prefix round-tripping, worker-name
+mapping, redirect correction, last_error surfacing) must stay green through
+the P1 refactor — they are the regression net for the seam extraction.
+
+**L2 — router contract fixtures (gates P1).** Freeze §1 as recorded
+request/response fixtures and assert the client against them: (a) codex-only
+harness set → request contains exactly the Codex arm menu (+catalog extras);
+(b) claude-only → Claude arms; (c) mixed → all five; (d) 400 "requires its
+full menu" → `None` + `last_error`, session proceeds unrouted; (e) pick of an
+endpoint-less arm (`gpt-5-6-sol`) → resolved to a servable id with `raw_model`
+preserved; (f) echoed nonsense harness ignored (harness derived from arm
+family); (g) `route_selector.config.model` present iff `selection_model` set.
+
+**L3 — live contract probe (manual/CI-cron, not commit-gating).**
+`scripts/probe_routing_api.sh` — the recorded curl battery from 2026-07-28/29
+(scenario inference, full-menu 400s, extras tolerated, tag passthrough)
+against eng-ml-inference staging via `databricks auth token`. Run before
+demos and whenever AIGW deploys; alerts us if a task_v2 lands or menus move.
+
+**L4 — hook-layer unit (gates P3/P4).** Hook scripts are pure functions
+around the §5.1 call: fixture stdin payloads → exact hook JSON out for
+allow/rewrite/redirect/deny × fork × endpoint-down (×fail_mode). Codex
+additionally: merged-hooks.json snapshot preserving user hooks; canary
+present/absent; audit-record parsing; version-gated argv flag.
+
+**L5 — server integration with fake router (gates P7).** Boot the test
+server (`ControllableMockClient` + `_caps` patch), drive a session:
+1. Omnigent child spawn (`sys_session_send`) → router decision wins over
+   `args.model`, attempted override recorded.
+2. Native-subagent decision via the P2 endpoint → transcript
+   `RoutingDecisionData(scope="native_subagent")`, child-sessions API row
+   carries `routed_model`.
+3. `subagent_fail_mode=closed` + dead router → deny; `=open` → allow
+   unchanged; both leave a decision item.
+4. Decision cache: two identical spawns, one router call.
+
+**L6 — live-harness E2E (gates P8; needs real claude/codex CLIs).**
+Conventions from `tests/e2e/test_polly_subagent_model_e2e.py`:
+- Claude native: session with router hook → Task spawn's model rewritten
+  (assert via hooks.jsonl SubagentStart mirror).
+- Claude SDK: same via in-process callback.
+- Codex: `spawn_agent` rewritten; `SubagentStart` payload model ==
+  decision_id's model (audit reconciliation); canary fires; with hooks
+  untrusted and bypass flag stripped → canary absent → warning event.
+- Cross-harness: deny+redirect reason emitted; model follows with
+  `sys_session_send` at least once (track follow rate, don't hard-assert).
+- Standalone `scripts/probe_codex_hooks.py` (deny + rewrite smoke) —
+  rerun on every codex version bump; paired with the P8 version pin.
+
+**L7 — manual CUJ pass on the dev stack (release gate, ~30 min).**
+Stack: `./run-server.sh` / `./run-host.sh` / `./run-frontend.sh` in
+`~/omnigent-routing-mvp` (ports 6868/5273, isolated config, staging AIGW,
+`task_v1`). Checklist mirrors the brainstorm CUJs:
+1. **Codex CUJ**: codex harness + IR on → server log shows Codex-arm-menu
+   request; picked model applied; subagent spawn shows decision in
+   transcript + sidebar.
+2. **Claude Code CUJ**: same with claude; verify `/model` injection on a
+   routed turn.
+3. **Auto CUJ**: Polly + AUTO gear → harness+model pick lands; Omnigent
+   child sessions routed via parent catalog; cross-harness redirect visible.
+4. **Visibility**: every decision has a chip/card with rationale; per-subagent
+   model in sidebar; kill the router mid-session → fail-mode behavior +
+   warning banner.
+5. **Telemetry**: `omnigent.routing.*` events visible in OTel export
+   (`OTEL_EXPORTER_OTLP_ENDPOINT` set); switch IR off mid-session and fork a
+   routed session → both events present.
+6. **Isolation regression**: user-level `~/.omnigent` untouched (config home
+   + data dir remain worktree-local).
+
+**L8 — full-suite regression (before PR split).**
+`uv run pytest tests/server tests/runtime tests/inner` +
+`cd web && npx vitest run` + `uvx pre-commit run --all-files`.
+
+---
+
+## 7. MVP definition of done (Jul 31)
 
 - AIGW `routes:select` drives session/turn/child routing by default on
   Databricks-backed deployments (P1) using `task_v1`, surviving the confirmed
   contract quirks: fixed scenario menus, passthrough harness tags, unservable
-  picks.
+  picks. L2 fixtures green; L3 probe clean against staging.
 - A Claude Task spawn and a Codex `spawn_agent` cannot proceed on a
   non-router-approved model; failure mode is "didn't spawn", never "wrong
-  model" (P2–P4, P7).
+  model" (P2–P4, P7). L5/L6 green.
 - Every decision renders in the transcript; per-subagent routed model in the
-  sidebar; canary warning when enforcement is off (P5, P6).
-- `omnigent.routing.*` OTel events for enabled / switched-off / fork (P5, P6).
-- E2E green on the live dev stack against staging AIGW (P8).
+  sidebar; warning banner when enforcement is off (P5, P6).
+- `omnigent.routing.*` OTel events for decision / enabled / switched-off /
+  fork (P5, P6).
+- L7 manual CUJ pass recorded (notes or screen capture) on the live dev stack.
 
-## 7. Outside this branch / open items
+## 8. Outside this branch / open items
 
 - **SAFE flag** for isaac default-on cohort — universe repo, after this branch
   is testable.
@@ -412,25 +582,30 @@ delivered on the existing session-status channel.
 - **v3 gateway model-listing API** — explicitly not-MVP per the checklist.
 - **Feed to Mason**: (a) harness-constrained returns (client correction is a
   stopgap — §1); (b) spawn-eligible model subsets per harness (Codex spawns
-  support fewer models than sessions); (c) required-vocabulary ids should not
-  400 when absent from the caller's workspace.
+  support fewer models than sessions); (c) menu ids should not be required
+  when absent from the caller's workspace.
 - **Feed to Ivan**: encrypted Codex spawn prompts cap task-aware quality for
   in-harness codex subagent routing (signal lives in `task_name` only).
 
-## 8. Risks
+## 9. Risks
 
 1. **Codex hook fragility** (tool-name flattening, trust gate, v1/v2
-   selection): regex matcher + canary + pinned version + standalone probe;
-   budget breakage on bumps.
-2. **Router latency blocks spawns**: p99 of `routes:select` sits on the
-   PreToolUse path; mitigated by P2 caching + fail-mode knob.
+   selection): regex matcher + canary + new version pin + L6 standalone
+   probe; budget breakage on bumps. Groundwork (bypass flag + version gates)
+   already exists in `codex_native_app_server.py`.
+2. **Router latency blocks spawns**: task_v1 always makes an LLM extraction
+   self-call (§1.1), so p99 sits on the PreToolUse path; mitigated by P2
+   caching + fail-mode knob; measure in L6.
 3. **Redirect compliance is soft**: deny+redirect relies on the model calling
    `sys_session_send`; worst case non-spawn, never wrong-model. Track
    redirect-follow rate via decision items during the pilot.
 4. **Scenario-menu drift**: routers are frozen per version (§1.1), so menus
-   only change when we bump `routing.router_name` (e.g. to a future task_v2)
-   — bumping the name and the menus must happen together (`scenario_menus`
-   keyed by router version enforces this). P1 still degrades to fallback with
-   a loud warning if they're ever mismatched.
+   only change when we bump `routing.router_name` — `scenario_menus` keyed by
+   router version keeps them moving together; L3 probe catches server-side
+   surprises; P1 degrades to unrouted-with-warning on mismatch.
 5. **Fork/cache-miss economics**: v1 doesn't route forks; a real cost model
    needs inherited-context size that only Omnigent can supply out-of-band.
+6. **Extraction-model access**: task_v1's self-call needs the caller to have
+   `system.ai.gpt-5-4-mini` (or `routing.selection_model` pinned to one they
+   do have); a workspace without it breaks routing invisibly — L3 probe +
+   `last_error` surfacing cover it.
