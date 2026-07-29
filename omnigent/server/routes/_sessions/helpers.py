@@ -7925,6 +7925,11 @@ def _child_session_summary_from_conversation(
         # in-memory index that feeds the sidebar badge, so the Agents
         # rail can flag a child that's awaiting user input.
         pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        # The child's pinned model — what session routing writes when it
+        # picks a model for a spawned sub-agent. The decision id is not
+        # persisted on the conversation row yet, so it stays null.
+        routed_model=conv.model_override,
+        routing_decision_id=None,
     )
 
 

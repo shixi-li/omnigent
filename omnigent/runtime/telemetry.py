@@ -820,6 +820,75 @@ def span(
         yield started
 
 
+#: Routing telemetry event names. Emitted through
+#: :func:`emit_routing_event` so operators can query the whole family by
+#: the ``omnigent.routing.`` prefix.
+ROUTING_EVENT_DECISION = "omnigent.routing.decision"
+ROUTING_EVENT_ENABLED = "omnigent.routing.enabled"
+ROUTING_EVENT_DISABLED_MID_SESSION = "omnigent.routing.disabled_mid_session"
+ROUTING_EVENT_FORK_FROM_ROUTED_SESSION = "omnigent.routing.fork_from_routed_session"
+
+
+def _event_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
+    """
+    Coerce an event attribute mapping to OTel-acceptable values.
+
+    ``None`` values are dropped (an absent attribute is more honest than
+    the string ``"None"``) and non-primitive values are stringified so a
+    caller passing e.g. an enum or a dict never trips the SDK's attribute
+    type validation.
+
+    :param attributes: Raw attributes from the call site, e.g.
+        ``{"routing.model": "databricks-claude-opus-4-8"}``.
+    :returns: A dict safe to hand to ``add_event`` / ``set_attribute``.
+    """
+    coerced: dict[str, Any] = {}
+    for key, value in (attributes or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str | bool | int | float):
+            coerced[key] = value
+        else:
+            coerced[key] = str(value)
+    return coerced
+
+
+def emit_routing_event(name: str, attributes: Mapping[str, Any] | None = None) -> None:
+    """
+    Emit an intelligent-routing telemetry event.
+
+    Routing decisions have no span of their own — they happen inside a
+    turn, a spawn, or a UI toggle — so the event rides the currently
+    active span when there is one. With no recording span (a background
+    task, a UI-driven toggle) the event is emitted as a short standalone
+    span of the same name so the record is not lost.
+
+    A no-op when telemetry is not enabled, matching :func:`span` and the
+    other helpers here: an install that never opted in emits nothing.
+
+    :param name: Event name, one of the ``ROUTING_EVENT_*`` constants,
+        e.g. :data:`ROUTING_EVENT_DECISION`.
+    :param attributes: Event attributes, e.g.
+        ``{"routing.model": "databricks-claude-opus-4-8",
+        "routing.scope": "turn"}``. ``None`` values are dropped.
+    :returns: ``None``.
+    """
+    if not telemetry_enabled():
+        return
+    from opentelemetry import trace as otel_trace
+
+    attrs = _event_attributes(attributes)
+    current = otel_trace.get_current_span()
+    if current.is_recording():
+        current.add_event(name, attrs)
+        return
+    tracer = otel_trace.get_tracer("omnigent.routing")
+    with tracer.start_as_current_span(name) as started:
+        for key, value in attrs.items():
+            started.set_attribute(key, value)
+        started.add_event(name, attrs)
+
+
 def _metrics_exporter_name() -> str:
     """
     Return the configured OpenTelemetry metrics exporter name.

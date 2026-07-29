@@ -792,6 +792,15 @@ class ChildSessionSummary(BaseModel):
         a fanned-out sub-agent that needs attention is visible
         without opening its chat. Mirrors
         :attr:`SessionListItem.pending_elicitations_count`.
+    :param routed_model: Model this sub-agent runs on when one was pinned
+        for it, e.g. ``"databricks-claude-opus-4-8"``. Read from the
+        child's ``model_override`` — the field intelligent routing writes
+        when it picks a model for a spawned child. ``None`` when the child
+        inherits the parent/spec model.
+    :param routing_decision_id: Identifier of the routing decision that
+        produced :attr:`routed_model`, mirroring
+        ``RoutingDecisionData.decision_id``. ``None`` until decision ids
+        are joined onto child rows.
     """
 
     id: str
@@ -812,6 +821,8 @@ class ChildSessionSummary(BaseModel):
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
+    routed_model: str | None = None
+    routing_decision_id: str | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
