@@ -1740,9 +1740,14 @@ async def supervise_forwarder(
         # other writer races the dead-letter files (#1579).
         await _replay_dead_letters_on_startup(ap_client, bridge_dir)
         # Surface "routing hooks never ran" / "spawned a model the router
-        # didn't approve" on the session's warning channel.
+        # didn't approve" on the session's warning channel. Held until the
+        # first turn, which is when codex dispatches SessionStart (and so
+        # when the routing canary can exist at all).
+        turn_observed = asyncio.Event()
         _enforcement_task = asyncio.create_task(
-            _watch_subagent_routing_enforcement(ap_client, session_id, bridge_dir),
+            _watch_subagent_routing_enforcement(
+                ap_client, session_id, bridge_dir, turn_observed=turn_observed
+            ),
             name=f"codex-routing-enforcement-{session_id}",
         )
         _ENFORCEMENT_TASKS.add(_enforcement_task)
@@ -1825,6 +1830,9 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
+                        # Same signal releases the routing-enforcement watcher:
+                        # the canary can only exist once a turn has begun.
+                        turn_observed.set()
                     await _handle_event(
                         ap_client,
                         session_id=target.session_id,
@@ -5704,6 +5712,25 @@ async def _post_session_warnings(
     _log_failed_session_event_post("external_session_warning", response)
 
 
+def subagent_routing_armed(bridge_dir: Path) -> bool:
+    """
+    Report whether subagent routing was set up for this session.
+
+    Presence of the router advertisement in the bridge dir is the signal:
+    the runner writes it exactly when it wires the ``route-subagent``
+    endpoint, which is also when the routing hooks are generated. This must
+    not be inferred from *relayed decisions* — the routing gate is the thing
+    that relays them, so gating on decisions makes "the gate never ran"
+    undetectable.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when the router advertisement is present.
+    """
+    from omnigent.runner.subagent_routing import ADVERTISEMENT_FILE
+
+    return (bridge_dir / ADVERTISEMENT_FILE).is_file()
+
+
 def subagent_routing_warnings(session_id: str, bridge_dir: Path) -> list[dict[str, Any]]:
     """
     Report why this session's subagent routing is not being enforced.
@@ -5725,10 +5752,10 @@ def subagent_routing_warnings(session_id: str, bridge_dir: Path) -> list[dict[st
         reconcile_spawn_audit,
         subagent_routing_unenforced_warning,
     )
-    from omnigent.runner.subagent_routing import relayed_decisions, routed_models
+    from omnigent.runner.subagent_routing import routed_models
 
-    if not relayed_decisions(session_id):
-        # Nothing was routed for this session — no enforcement claim to check.
+    if not subagent_routing_armed(bridge_dir):
+        # Routing is off for this session — no enforcement claim to check.
         return []
     if not codex_router_canary_fired(bridge_dir):
         return [
@@ -5746,6 +5773,7 @@ async def _watch_subagent_routing_enforcement(
     bridge_dir: Path,
     *,
     interval_s: float = 30.0,
+    turn_observed: asyncio.Event | None = None,
 ) -> None:
     """
     Re-check subagent-routing enforcement while the session runs.
@@ -5755,20 +5783,43 @@ async def _watch_subagent_routing_enforcement(
     startup would miss most of them. Warnings dedupe server-side on
     ``(code, harness)``, so re-posting the same condition is a no-op.
 
+    Codex dispatches ``SessionStart`` when a thread's *first turn* begins,
+    not at ``thread/start``, so checking before then would flag every idle
+    session. *turn_observed* holds the first check until the forwarder has
+    seen the thread go active.
+
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id.
     :param bridge_dir: Native Codex bridge directory.
     :param interval_s: Seconds between checks.
+    :param turn_observed: Set by the forwarder on the thread's first
+        activity. ``None`` checks immediately (tests / resumed sessions).
     :returns: None. Runs until cancelled.
     """
+    armed = subagent_routing_armed(bridge_dir)
+    _logger.info(
+        "subagent routing enforcement watcher started for session %s (armed=%s, interval=%ss)",
+        session_id,
+        armed,
+        interval_s,
+    )
+    if turn_observed is not None:
+        await turn_observed.wait()
     while not client.is_closed:
         await asyncio.sleep(interval_s)
         if client.is_closed:
             return
         try:
-            await _post_session_warnings(
-                client, session_id, subagent_routing_warnings(session_id, bridge_dir)
-            )
+            warnings = subagent_routing_warnings(session_id, bridge_dir)
+            if warnings:
+                _logger.info(
+                    "posting subagent routing warnings for session %s: %s",
+                    session_id,
+                    [w.get("code") for w in warnings],
+                )
+            else:
+                _logger.debug("subagent routing enforcement intact for session %s", session_id)
+            await _post_session_warnings(client, session_id, warnings)
         except (httpx.HTTPError, OSError):
             _logger.debug("subagent routing enforcement check failed", exc_info=True)
 

@@ -1096,7 +1096,15 @@ def codex_hook_trust_bypass_args(
     Build the hook-trust bypass argv for an omnigent-launched codex.
 
     Codex silently skips untrusted hooks, which for the routing gate is a
-    fail-open. The bypass flag is applied only when the hooks file in play
+    fail-open. The flag covers codex's interactive / ``exec`` paths only:
+    hooks dispatched by ``codex app-server`` threads still require persisted
+    trust (verified empirically on codex-cli 0.145.0 — an untrusted
+    ``SessionStart`` hook does not run with the flag, and does run once
+    ``hooks.state.<key>.trusted_hash`` is written). App-server launches
+    therefore also run the trust handshake; see
+    :func:`omnigent.codex_native_app_server.trust_codex_router_hooks`.
+
+    The bypass flag is applied only when the hooks file in play
     is one Omnigent generated (never the user's own) and only on a codex
     that knows the flag — older binaries exit immediately on an unknown
     flag, and an unparseable version is treated as too old for the same
@@ -1854,6 +1862,21 @@ class _CodexAppServerSession:
                 },
             )
             self._started = True
+            if router_bridge_dir is not None:
+                # The bypass flag above only covers codex's interactive /
+                # exec paths; app-server threads run persisted-trusted hooks
+                # only, so the routing hooks need the trust handshake too.
+                # Imported here: the app-server module imports this one.
+                from omnigent.codex_native_app_server import trust_codex_router_hooks
+
+                try:
+                    await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
+                except Exception:  # noqa: BLE001 - never block session startup
+                    logger.warning(
+                        "codex subagent-routing hook trust failed; "
+                        "routing will not be enforced for this session",
+                        exc_info=True,
+                    )
         except Exception:
             await self.close()
             raise

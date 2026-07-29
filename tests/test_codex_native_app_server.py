@@ -21,6 +21,7 @@ from omnigent.codex_native_app_server import (
     _codex_policy_hooks_settings,
     _sync_codex_developer_instructions,
     build_codex_native_server,
+    trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
@@ -1040,3 +1041,120 @@ class TestPinCodexConfigModel:
         # read_codex_config_model resolves codex-home under the bridge dir.
         _pin_codex_config_model(home, "databricks-gpt-5-4-mini")
         assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-4-mini"
+
+
+# --- Subagent-routing hook trust ---------------------------------------
+#
+# Empirically (codex-cli 0.145.0) ``--dangerously-bypass-hook-trust`` does
+# NOT make hooks run under ``codex app-server``: an untrusted SessionStart
+# hook stayed silent with the flag and fired only once its
+# ``hooks.state.<key>.trusted_hash`` was persisted. The routing hooks
+# therefore need their own trust pass; the policy pass filters by module
+# and would leave them untrusted (a silent fail-open on the spawn gate).
+
+_ROUTER_CANARY_COMMAND = (
+    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
+    "session-canary --bridge-dir /b"
+)
+_ROUTER_GATE_COMMAND = (
+    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
+    "route-subagent --bridge-dir /b --harness codex-native"
+)
+
+
+async def test_router_hooks_are_trusted_via_batchwrite() -> None:
+    """Untrusted routing hooks are trusted with their currentHash."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+            _hook("canary", _ROUTER_CANARY_COMMAND, "untrusted", "sha256:canary"),
+        ]
+    )
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+
+    writes = _batchwrite_calls(client)
+    assert len(writes) == 1
+    edit = writes[0].params["edits"][0]
+    assert edit["keyPath"] == "hooks.state"
+    assert edit["value"] == {
+        "gate": {"trusted_hash": "sha256:gate"},
+        "canary": {"trusted_hash": "sha256:canary"},
+    }
+    assert writes[0].params["reloadUserConfig"] is True
+
+
+async def test_router_hook_trust_never_touches_user_or_policy_hooks() -> None:
+    """Only the routing hooks are trusted by the routing pass."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+            _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+            _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+        ]
+    )
+    await trust_codex_router_hooks(client.request, cwd=_CWD)
+    assert _batchwrite_calls(client)[0].params["edits"][0]["value"] == {
+        "gate": {"trusted_hash": "sha256:gate"}
+    }
+
+
+async def test_router_hook_trust_reports_still_untrusted_without_raising() -> None:
+    """A routing-trust failure is reported, never raised (policy must survive)."""
+    client = _FakeCodexClient(
+        hooks=[_hook("gate", _ROUTER_GATE_COMMAND, "untrusted")], flip_on_trust=False
+    )
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == ["gate"]
+    assert len(_batchwrite_calls(client)) == 1
+
+
+async def test_router_hook_trust_noop_without_routing_hooks() -> None:
+    """No routing hooks registered → no write, no failure."""
+    client = _FakeCodexClient(hooks=[_hook("policy", _OUR_COMMAND, "trusted")])
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+    assert _batchwrite_calls(client) == []
+
+
+async def test_already_trusted_router_hooks_skip_batchwrite() -> None:
+    """Routing hooks already trusted issue no config write."""
+    client = _FakeCodexClient(hooks=[_hook("gate", _ROUTER_GATE_COMMAND, "trusted")])
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+    assert _batchwrite_calls(client) == []
+
+
+async def test_trust_step_covers_router_hooks_when_routing_armed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The startup trust step trusts the routing hooks alongside the policy hook."""
+    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+        ]
+    )
+
+    async def _fake_connect(self: Any) -> None:
+        return None
+
+    async def _fake_close(self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.connect", _fake_connect
+    )
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient.close", _fake_close)
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.request",
+        lambda self, method, params: client.request(method, params),
+    )
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", Path(_CWD))
+    server.env[CODEX_ROUTER_DIR_ENV_VAR] = str(tmp_path / "bridge")
+    server.router_hooks_registered = True
+    await server._trust_policy_hooks()
+
+    trusted = {}
+    for write in _batchwrite_calls(client):
+        trusted.update(write.params["edits"][0]["value"])
+    assert set(trusted) == {"policy", "gate"}

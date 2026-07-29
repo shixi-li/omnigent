@@ -12,7 +12,7 @@ import shlex
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -34,6 +34,7 @@ from omnigent.codex_native_process_registry import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -45,6 +46,7 @@ from omnigent.inner.codex_executor import (
     _provider_codex_config_overrides,
     codex_hook_trust_bypass_args,
     codex_router_bridge_dir,
+    codex_router_hooks_generated,
     codex_router_hooks_settings,
     codex_router_session_id,
 )
@@ -54,6 +56,9 @@ _logger = logging.getLogger(__name__)
 
 CodexMessage = dict[str, Any]
 CodexParams = dict[str, Any]
+# A bound app-server JSON-RPC request coroutine (``client.request`` or the
+# SDK executor's ``_request``), so the trust helpers work over either transport.
+CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -598,6 +603,7 @@ class CodexNativeAppServer:
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
+    router_hooks_registered: bool = False
 
     async def start(self) -> None:
         """
@@ -614,6 +620,7 @@ class CodexNativeAppServer:
         # hooks file owns hooks.json, so the user's copy is merged in rather
         # than symlinked over.
         router_bridge_dir = codex_router_bridge_dir(self.env)
+        self.router_hooks_registered = router_bridge_dir is not None
         config_source = _codex_home_config_source_from_env()
         _populate_codex_home_config(
             self.codex_home,
@@ -676,13 +683,22 @@ class CodexNativeAppServer:
             f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
         )
         # Codex silently skips hooks it does not trust, which for the
-        # subagent-routing gate is a fail-open. When the hooks file in this
-        # private home is one Omnigent generated, launch with the bypass flag
-        # (version-gated) instead of relying on the interactive trust prompt
-        # no headless session can answer.
+        # subagent-routing gate is a fail-open. The bypass flag covers the
+        # interactive / exec paths; app-server threads honor persisted trust
+        # only, so it is belt-and-braces on top of the trust handshake run
+        # after readiness (see _trust_session_hooks).
+        trust_args = codex_hook_trust_bypass_args(self.codex_home, codex_version)
+        _logger.info(
+            "codex hook trust: bypass flag %s (generated hooks=%s, codex=%s, minimum=%s); "
+            "app-server hooks additionally rely on the persisted-trust handshake",
+            "applied" if trust_args else "skipped",
+            codex_router_hooks_generated(self.codex_home),
+            _format_codex_version(codex_version) if codex_version else "unknown",
+            _format_codex_version(_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION),
+        )
         argv = [
             tagged_argv0,
-            *codex_hook_trust_bypass_args(self.codex_home, codex_version),
+            *trust_args,
             "app-server",
             "--listen",
             resolved_listen,
@@ -768,6 +784,18 @@ class CodexNativeAppServer:
         await client.connect()
         try:
             await trust_native_policy_hooks(client, cwd=str(self.cwd))
+            # Routing hooks live in the same generated file but under a
+            # different module, so they need their own trust pass. Best
+            # effort: a routing-trust failure must not disable the policy
+            # gate, and the canary watcher surfaces it as a session warning.
+            if self.router_hooks_registered:
+                try:
+                    await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
+                except Exception:  # noqa: BLE001 - routing trust never blocks startup
+                    _logger.warning(
+                        "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
         except RuntimeError as exc:
             raise RuntimeError(f"{exc}{self._codex_config_error_hint()}") from exc
         finally:
@@ -1099,20 +1127,21 @@ def _write_codex_policy_hooks_file(
             os.unlink(tmp_name)
 
 
-def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[str, Any]]:
+def _our_hooks_from_list(listed: dict[str, Any], cwd: str, module: str) -> list[dict[str, Any]]:
     """
-    Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
+    Extract the hooks for *cwd* whose command runs *module*.
 
-    Filters to hooks whose command references :data:`_POLICY_HOOK_MODULE`
-    so the trust step never touches hooks the user's symlinked
-    ``config.toml`` might declare.
+    Filtering by module keeps the trust step from ever touching hooks the
+    user's own ``hooks.json`` contributed to the merged file.
 
     :param listed: Parsed ``hooks/list`` response envelope, with
         ``result.data`` a list of ``{cwd, hooks: [...]}`` entries.
     :param cwd: The cwd whose hook set to read, e.g.
         ``"/home/user/repo"``.
-    :returns: The matching Omnigent hook metadata dicts (possibly
-        empty), each with ``key``, ``currentHash``, ``trustStatus``.
+    :param module: Hook-script module marker, e.g.
+        ``"omnigent.codex_native_hook"``.
+    :returns: The matching hook metadata dicts (possibly empty), each
+        with ``key``, ``currentHash``, ``trustStatus``.
     """
     result = listed.get("result", listed)
     data = result.get("data", []) if isinstance(result, dict) else []
@@ -1120,11 +1149,21 @@ def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[s
         if isinstance(entry, dict) and entry.get("cwd") == cwd:
             hooks = entry.get("hooks", [])
             return [
-                h
-                for h in hooks
-                if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+                h for h in hooks if isinstance(h, dict) and module in str(h.get("command", ""))
             ]
     return []
+
+
+def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[str, Any]]:
+    """
+    Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
+
+    :param listed: Parsed ``hooks/list`` response envelope.
+    :param cwd: The cwd whose hook set to read, e.g.
+        ``"/home/user/repo"``.
+    :returns: The matching Omnigent policy-hook metadata dicts.
+    """
+    return _our_hooks_from_list(listed, cwd, _POLICY_HOOK_MODULE)
 
 
 def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
@@ -1193,6 +1232,102 @@ def _untrusted_hook_detail(hooks: list[dict[str, Any]]) -> str:
     )
 
 
+async def _persist_hook_trust(request: CodexRequestFn, untrusted: list[dict[str, Any]]) -> None:
+    """
+    Write ``hooks.state.<key>.trusted_hash`` for each untrusted hook.
+
+    Persisted trust is the *only* mechanism that makes a hook run under
+    ``codex app-server``: the ``--dangerously-bypass-hook-trust`` CLI flag
+    is honored by the interactive/exec paths only, so app-server threads
+    silently skip anything left ``untrusted``.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param untrusted: Hook metadata dicts from ``hooks/list`` carrying
+        ``key`` and ``currentHash``.
+    :returns: None.
+    """
+    trust_value = {
+        str(h["key"]): {"trusted_hash": h["currentHash"]}
+        for h in untrusted
+        if h.get("key") and h.get("currentHash")
+    }
+    if not trust_value:
+        return
+    await request(
+        "config/batchWrite",
+        {
+            "edits": [
+                {
+                    "keyPath": "hooks.state",
+                    "mergeStrategy": "upsert",
+                    "value": trust_value,
+                }
+            ],
+            "reloadUserConfig": True,
+        },
+    )
+
+
+async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Trust the generated subagent-routing hooks so codex runs them.
+
+    The routing gate (``PreToolUse`` on the spawn tool), the
+    ``SessionStart`` canary and the ``SubagentStart`` audit live in the
+    same generated ``hooks.json`` as the policy hook but under a different
+    module, so the policy trust pass leaves them ``untrusted`` — and codex
+    skips untrusted hooks without a word, which for the routing gate is a
+    fail-open. Same ``hooks/list`` → ``config/batchWrite`` flow, but
+    best-effort: a routing-trust failure must not disable policy
+    enforcement, so it is reported instead of raised (the canary watcher
+    then surfaces the session warning).
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request`` (or the SDK executor's ``_request``).
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of routing hooks still untrusted afterwards; empty when
+        every routing hook is trusted (or none are registered).
+    """
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    ours = _our_hooks_from_list(listed, cwd, _CODEX_ROUTER_HOOK_MODULE)
+    if not ours:
+        _logger.info(
+            "codex subagent-routing hooks: none discovered for cwd %s (%s)",
+            cwd,
+            _hooks_list_diagnostics(listed, cwd),
+        )
+        return []
+    untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        _logger.info(
+            "codex subagent-routing hooks: all %d already trusted for cwd %s", len(ours), cwd
+        )
+        return []
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, _CODEX_ROUTER_HOOK_MODULE)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if still_untrusted:
+        _logger.warning(
+            "codex subagent-routing hooks still untrusted after config/batchWrite; "
+            "native subagent routing will NOT be enforced: %s",
+            _untrusted_hook_detail(still_untrusted),
+        )
+        return [str(h.get("key")) for h in still_untrusted]
+    _logger.info(
+        "codex subagent-routing hooks trusted (%d of %d newly): %s",
+        len(untrusted),
+        len(ours),
+        ", ".join(sorted(str(h.get("eventName")) for h in ours)),
+    )
+    return []
+
+
 async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -> None:
     """
     Trust the Omnigent policy hook so codex actually runs it.
@@ -1223,24 +1358,7 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
     untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
     if not untrusted:
         return
-    trust_value = {
-        str(h["key"]): {"trusted_hash": h["currentHash"]}
-        for h in untrusted
-        if h.get("key") and h.get("currentHash")
-    }
-    await client.request(
-        "config/batchWrite",
-        {
-            "edits": [
-                {
-                    "keyPath": "hooks.state",
-                    "mergeStrategy": "upsert",
-                    "value": trust_value,
-                }
-            ],
-            "reloadUserConfig": True,
-        },
-    )
+    await _persist_hook_trust(client.request, untrusted)
     relisted = await client.request("hooks/list", {"cwds": [cwd]})
     still_untrusted = [
         h
