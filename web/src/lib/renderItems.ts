@@ -18,8 +18,18 @@
 //
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
-import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
-import { type RoutingDecisionExtras, routingExtras } from "./routingDecision";
+import type {
+  AnyBlock,
+  MessageContentBlock,
+  RoutingDecisionBlock,
+  ToolExecution,
+  ToolResultBlock,
+} from "./blocks";
+import {
+  type RoutingDecisionExtras,
+  isSessionScopedDecision,
+  routingExtras,
+} from "./routingDecision";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -179,6 +189,9 @@ const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "re
  * :param lastBubbleStart: block index where the last (active) bubble's
  *     group started, i.e. the only region that can change on append.
  *     ``-1`` when there were no bubbles.
+ * :param lastBubbleCount: how many bubbles that region produced — 1 normally,
+ *     2 for a hoisted routing chip paired with its user message. Reuse drops
+ *     exactly this many bubbles before re-walking the region.
  */
 export interface BubbleCache {
   blocks: AnyBlock[] | null;
@@ -186,6 +199,7 @@ export interface BubbleCache {
   interruptedResponseIds: readonly string[] | null;
   bubbles: Bubble[];
   lastBubbleStart: number;
+  lastBubbleCount: number;
 }
 
 const EMPTY_INTERRUPTED_RESPONSE_IDS: readonly string[] = [];
@@ -198,6 +212,7 @@ export function createBubbleCache(): BubbleCache {
     interruptedResponseIds: null,
     bubbles: [],
     lastBubbleStart: -1,
+    lastBubbleCount: 1,
   };
 }
 
@@ -265,6 +280,7 @@ export function buildBubbles(
     cache.interruptedResponseIds = interruptedResponseIds;
     cache.bubbles = rest.bubbles;
     cache.lastBubbleStart = rest.lastBubbleStart;
+    cache.lastBubbleCount = rest.lastBubbleCount;
     return rest.bubbles;
   }
 
@@ -275,6 +291,7 @@ export function buildBubbles(
   cache.interruptedResponseIds = interruptedResponseIds;
   cache.bubbles = full.bubbles;
   cache.lastBubbleStart = full.lastBubbleStart;
+  cache.lastBubbleCount = full.lastBubbleCount;
   return full.bubbles;
 }
 
@@ -325,7 +342,10 @@ function reusablePrefix(
       return null;
     }
   }
-  const prefix = cache.bubbles.slice(0, cache.bubbles.length - 1);
+  // Drop every bubble the re-walked region produced — normally just the last
+  // one, but a hoisted routing chip and its user message come as a pair.
+  const dropped = Math.min(cache.lastBubbleCount, cache.bubbles.length);
+  const prefix = cache.bubbles.slice(0, cache.bubbles.length - dropped);
   // A reused assistant bubble whose response is still the active one
   // could change lifecycle/error without a block change — don't reuse.
   const activeId = activeResponse?.responseId;
@@ -355,8 +375,10 @@ function reusablePrefix(
  * :param subIndexByResp: seeded count of assistant bubbles already
  *     emitted per responseId, so streaming-only bubbles (no itemId)
  *     keep stable `stableId`s across the reuse boundary.
- * :returns: the bubble list and the block index where the last bubble
- *     began (``-1`` if no bubbles were produced at all).
+ * :returns: the bubble list, the block index where the last bubble began
+ *     (``-1`` if no bubbles were produced at all), and how many bubbles that
+ *     final region produced (2 when a routing chip was hoisted above its user
+ *     message, else 1).
  */
 function walkBubbles(
   blocks: AnyBlock[],
@@ -365,7 +387,7 @@ function walkBubbles(
   startIndex: number,
   seedBubbles: Bubble[],
   subIndexByResp: Map<string, number>,
-): { bubbles: Bubble[]; lastBubbleStart: number } {
+): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
   // One cross-bubble result index per walk: the relay backdates a
   // delayed function_call_output to its ORIGINAL turn's response id, so
@@ -381,8 +403,13 @@ function walkBubbles(
       crossBubbleResults.set(`${blk.ctx.responseId}:${blk.callId}`, blk);
     }
   }
-  // Block index where the most recently pushed bubble's group started.
+  // Routing chips read as a header for the turn they route, so a decision on
+  // the session's own turn is hoisted above the user message it follows.
+  const hoisted = hoistedRoutingChips(blocks, startIndex);
+  // Block index where the most recently pushed bubble's group started, and how
+  // many bubbles that group produced (2 for a hoisted chip + its message).
   let lastBubbleStart = bubbles.length > 0 ? 0 : -1;
+  let lastBubbleCount = 1;
   let i = startIndex;
 
   while (i < blocks.length) {
@@ -397,6 +424,12 @@ function walkBubbles(
 
     if (b.type === "user_message") {
       lastBubbleStart = i;
+      lastBubbleCount = 1;
+      const chipIndex = hoisted.byMessage.get(i);
+      if (chipIndex !== undefined) {
+        bubbles.push(routingChipBubble(blocks[chipIndex] as RoutingDecisionBlock, chipIndex));
+        lastBubbleCount = 2;
+      }
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
@@ -412,6 +445,7 @@ function walkBubbles(
 
     if (b.type === "compaction_loading") {
       lastBubbleStart = i;
+      lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction_loading",
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
@@ -432,6 +466,7 @@ function walkBubbles(
         }
       }
       lastBubbleStart = i;
+      lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction",
         itemId: b.ctx.itemId ?? `compaction_${i}`,
@@ -441,18 +476,17 @@ function walkBubbles(
     }
 
     if (b.type === "routing_decision") {
-      // Standalone muted chip at its transcript position (turn start),
-      // never folded into an adjacent assistant bubble.
+      // Already emitted above its user message by the hoist.
+      if (hoisted.indexes.has(i)) {
+        i += 1;
+        continue;
+      }
+      // Standalone muted chip at its transcript position, never folded into an
+      // adjacent assistant bubble. Sub-agent decisions stay inline where they
+      // occur — they belong to the spawn, not to the user's message.
       lastBubbleStart = i;
-      bubbles.push({
-        kind: "routing_decision",
-        itemId: b.ctx.itemId ?? `routing_${i}`,
-        model: b.model,
-        applied: b.applied,
-        rationale: b.rationale,
-        ...(b.agent !== undefined && { agent: b.agent }),
-        ...routingExtras(b),
-      });
+      lastBubbleCount = 1;
+      bubbles.push(routingChipBubble(b, i));
       i += 1;
       continue;
     }
@@ -511,6 +545,7 @@ function walkBubbles(
     const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
 
     lastBubbleStart = groupStart;
+    lastBubbleCount = 1;
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
@@ -521,7 +556,58 @@ function walkBubbles(
     });
   }
 
-  return { bubbles, lastBubbleStart };
+  return { bubbles, lastBubbleStart, lastBubbleCount };
+}
+
+/** Build the standalone chip bubble for a routing-decision block. */
+function routingChipBubble(b: RoutingDecisionBlock, index: number): Bubble {
+  return {
+    kind: "routing_decision",
+    itemId: b.ctx.itemId ?? `routing_${index}`,
+    model: b.model,
+    applied: b.applied,
+    rationale: b.rationale,
+    ...(b.agent !== undefined && { agent: b.agent }),
+    ...routingExtras(b),
+  };
+}
+
+/**
+ * Pair each user message with the routing decision it triggered.
+ *
+ * The server persists (and streams) a session/turn decision right AFTER the
+ * user message, but the chip reads as that turn's header, so it renders above
+ * the message. Only a decision directly adjacent to the message qualifies —
+ * lifecycle markers may sit between, nothing else — which keeps the pair inside
+ * the incremental re-walk region: a user bubble is the last bubble until some
+ * later block opens the next one, and by then no adjacent slot is left. A chip
+ * arriving after the turn already produced other bubbles stays inline, as do
+ * sub-agent decisions.
+ *
+ * :param startIndex: first block the walk will visit; earlier blocks belong to
+ *     the reused prefix and are already paired.
+ * :returns: ``byMessage`` (user block index → chip block index) plus the set of
+ *     chip indexes to skip when the walk reaches them.
+ */
+function hoistedRoutingChips(
+  blocks: AnyBlock[],
+  startIndex: number,
+): { byMessage: Map<number, number>; indexes: Set<number> } {
+  const byMessage = new Map<number, number>();
+  const indexes = new Set<number>();
+  for (let j = startIndex; j < blocks.length; j += 1) {
+    if (blocks[j]!.type !== "user_message") continue;
+    for (let k = j + 1; k < blocks.length; k += 1) {
+      const next = blocks[k]!;
+      if (next.type === "response_start" || next.type === "response_end") continue;
+      if (next.type === "routing_decision" && isSessionScopedDecision(next.scope)) {
+        byMessage.set(j, k);
+        indexes.add(k);
+      }
+      break;
+    }
+  }
+  return { byMessage, indexes };
 }
 
 /** Filter to blocks that participate in assistant rendering. */

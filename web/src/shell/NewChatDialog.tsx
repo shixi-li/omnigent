@@ -1379,7 +1379,13 @@ function HarnessConfigModal({
     }
     // Intelligent Routing rides the Model dropdown on both routable harnesses
     // (Claude Code and Codex), so commit it outside the per-capability branches.
-    if (smartRoutingEligible) setCostControlMode(draftRouting);
+    // Remembered per harness like the model pick, so the next new session with
+    // this harness starts on it again.
+    if (smartRoutingEligible) {
+      setCostControlMode(draftRouting);
+      if (entryHarness)
+        writeHarnessOption(entryHarness, { routing: draftRouting === "on" ? "on" : "off" });
+    }
     onOpenChange(false);
   };
 
@@ -2400,6 +2406,28 @@ export function NewChatLandingScreen() {
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNativeHarness, claudeModelOptions]);
+  // Intelligent Routing is remembered per harness alongside the mode/model
+  // knobs, in its own effect because eligibility depends on the server flag
+  // (which resolves after mount — this must reseed when it lands). A stored
+  // "on" on a server without routing resolves to Default, so the create sends
+  // no override. Nothing stored → leave the current value alone, so a restored
+  // landing draft isn't downgraded.
+  // Keyed on the agent too (not just the harness) so it re-runs after the
+  // agent-change reset above, which clears routing for every agent switch —
+  // including one between two agents on the same harness. Fully-auto owns the
+  // switch itself (the router always routes), so it's left alone.
+  useEffect(() => {
+    if (!selectedNativeHarness || pickedHarness === AUTO_HARNESS_ID) return;
+    const storedRouting = readHarnessOptions(selectedNativeHarness).routing;
+    if (storedRouting === undefined) return;
+    setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
+  }, [
+    selectedNativeHarness,
+    smartRoutingEligible,
+    effectiveAgentId,
+    pickedHarness,
+    setCostControlMode,
+  ]);
   // The Auto Harness pins permissions to Default (no override sent), so entering
   // fully-auto resets the mode rather than restoring one: nothing is remembered
   // for the sentinel, and a value left over from a previously selected native

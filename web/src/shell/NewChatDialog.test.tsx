@@ -2940,6 +2940,134 @@ describe("NewChatLandingScreen intelligent routing", () => {
     expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
   });
+
+  // Sticky Intelligent Routing: the pick is remembered per harness in the same
+  // localStorage store as the mode/model/effort knobs, so a returning user's
+  // next session on that harness starts routed.
+
+  /** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */
+  function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
+    cleanup();
+    resetLandingDraft();
+    renderLanding(infoOverrides);
+  }
+
+  it("preselects Intelligent Routing on a later session for the same harness", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    saveConfig();
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
+    ).toMatchObject({ routing: "on" });
+
+    remountLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "Intelligent Routing",
+    );
+  });
+
+  it("remembers Codex's routing pick without touching Claude Code's", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    saveConfig();
+
+    remountLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "Intelligent Routing",
+    );
+    closeMenu();
+    // Claude Code never had routing picked, so it stays on Default.
+    openAgentConfig("a1");
+    const model = screen.getByTestId("new-chat-landing-config-model");
+    expect(model.textContent).toContain("Default");
+    expect(model.textContent).not.toContain("Intelligent Routing");
+  });
+
+  it("drops back to Default once the user picks a model again", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    saveConfig();
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    // By role, not text: "Default" also labels the Permissions row's value.
+    fireEvent.click(screen.getByRole("option", { name: "Default" }));
+    saveConfig();
+
+    remountLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    const model = screen.getByTestId("new-chat-landing-config-model");
+    expect(model.textContent).toContain("Default");
+    expect(model.textContent).not.toContain("Intelligent Routing");
+  });
+
+  it("falls back to Default when a remembered routing pick meets a server without routing", () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on" } }),
+    );
+    renderLanding({ smart_routing_enabled: false });
+    openAgentConfig("a1");
+    const model = screen.getByTestId("new-chat-landing-config-model");
+    expect(model.textContent).toContain("Default");
+    expect(model.textContent).not.toContain("Intelligent Routing");
+  });
+
+  it("omits cost_control_mode_override when a remembered pick can't be honored", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_plain" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: false });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBeUndefined();
+  });
+
+  it("launches a remembered routing pick as cost_control_mode_override 'on'", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_routed_again" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.cost_control_mode_override).toBe("on");
+    expect(body.model_override).toBeUndefined();
+  });
 });
 
 describe("NewChatLandingScreen Auto harness", () => {

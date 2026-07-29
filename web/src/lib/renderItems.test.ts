@@ -1394,6 +1394,201 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
   });
 });
 
+// The decision is persisted/streamed AFTER the user message that triggered it,
+// but it reads as that turn's header — the walker hoists it above the message.
+describe("buildBubbles — routing chip hoisted above its user message", () => {
+  function chipBlock(
+    itemId: string,
+    responseId: string,
+    scope?: "session" | "turn" | "child_session" | "native_subagent",
+  ): AnyBlock {
+    return {
+      type: "routing_decision",
+      ctx: ctx({ itemId, responseId }),
+      model: "databricks-claude-opus-4-8",
+      applied: true,
+      rationale: "hard turn",
+      ...(scope !== undefined ? { scope } : {}),
+    };
+  }
+  function userBlock(itemId: string, responseId: string): AnyBlock {
+    return {
+      type: "user_message",
+      ctx: ctx({ itemId, responseId }),
+      content: [{ type: "input_text", text: "refactor it" }],
+    };
+  }
+  function doneBlock(itemId: string, responseId: string, text: string): AnyBlock {
+    return {
+      type: "text_done",
+      ctx: ctx({ itemId, responseId }),
+      fullText: text,
+      hasCodeBlocks: false,
+    };
+  }
+
+  it("renders a turn-scoped chip above the message it followed", () => {
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      chipBlock("rd_1", "resp_1", "turn"),
+      doneBlock("a1", "resp_1", "Done."),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["routing_decision", "user", "assistant"]);
+    const chip = bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>;
+    expect(chip.itemId).toBe("rd_1");
+    // Hoisting must not drop or duplicate anything else in the turn.
+    expect((bubbles[1] as Extract<Bubble, { kind: "user" }>).itemId).toBe("u1");
+  });
+
+  it("hoists a session-scoped and a legacy scope-less decision the same way", () => {
+    for (const scope of ["session", undefined] as const) {
+      const blocks: AnyBlock[] = [userBlock("u1", "resp_1"), chipBlock("rd_1", "resp_1", scope)];
+      expect(buildBubbles(blocks, null).map((b) => b.kind)).toEqual(["routing_decision", "user"]);
+    }
+  });
+
+  it("leaves sub-agent decisions inline where they occur", () => {
+    for (const scope of ["child_session", "native_subagent"] as const) {
+      const blocks: AnyBlock[] = [userBlock("u1", "resp_1"), chipBlock("rd_sub", "resp_1", scope)];
+      // A spawn's decision belongs to the spawn, not to the user's message.
+      expect(buildBubbles(blocks, null).map((b) => b.kind)).toEqual(["user", "routing_decision"]);
+    }
+  });
+
+  it("hoists per turn, so each message keeps its own chip", () => {
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      chipBlock("rd_1", "resp_1", "turn"),
+      doneBlock("a1", "resp_1", "one"),
+      userBlock("u2", "resp_2"),
+      chipBlock("rd_2", "resp_2", "turn"),
+      doneBlock("a2", "resp_2", "two"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "routing_decision",
+      "user",
+      "assistant",
+      "routing_decision",
+      "user",
+      "assistant",
+    ]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>).itemId).toBe("rd_1");
+    expect((bubbles[3] as Extract<Bubble, { kind: "routing_decision" }>).itemId).toBe("rd_2");
+  });
+
+  it("keeps a chip that isn't the message's own trigger inline", () => {
+    // A second decision mid-turn (after assistant output) is not the header for
+    // the message — only the adjacent one is hoisted.
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      chipBlock("rd_1", "resp_1", "turn"),
+      doneBlock("a1", "resp_1", "thinking"),
+      chipBlock("rd_2", "resp_1", "turn"),
+      doneBlock("a2", "resp_1", "done"),
+    ];
+    expect(buildBubbles(blocks, null).map((b) => b.kind)).toEqual([
+      "routing_decision",
+      "user",
+      "assistant",
+      "routing_decision",
+      "assistant",
+    ]);
+  });
+
+  it("static transcript: the reload funnel hoists the persisted decision too", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "u1",
+        type: "message",
+        role: "user",
+        response_id: "resp_1",
+        status: "completed",
+        content: [{ type: "input_text", text: "refactor it" }],
+      } as unknown as ConversationItem,
+      {
+        id: "rd_reload",
+        type: "routing_decision",
+        response_id: "resp_1",
+        status: "completed",
+        model: "databricks-claude-sonnet-4-6",
+        applied: true,
+        rationale: "moderate knowledge work",
+        scope: "turn",
+      } as unknown as ConversationItem,
+    ];
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["routing_decision", "user"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>).itemId).toBe("rd_reload");
+  });
+
+  it("live stream: the chip arriving after the message still lands above it", () => {
+    const cache = createBubbleCache();
+    const streaming: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    // Frame 1: the optimistic user bubble is alone.
+    const f1 = [userBlock("u1", "resp_1")];
+    expect(buildBubbles(f1, streaming, cache).map((b) => b.kind)).toEqual(["user"]);
+
+    // Frame 2: the decision event arrives — retroactively hoisted, not appended.
+    const f2 = [...f1, chipBlock("rd_1", "resp_1", "turn")];
+    const second = buildBubbles(f2, streaming, cache);
+    expect(second.map((b) => b.kind)).toEqual(["routing_decision", "user"]);
+    // Incremental output must match a from-scratch rebuild — a duplicated or
+    // dropped bubble would show up here.
+    expect(second).toEqual(buildBubbles(f2, streaming));
+
+    // Frame 3+: assistant text streams in over the hoisted pair.
+    const f3 = [...f2, { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "Wor" }];
+    const third = buildBubbles(f3 as AnyBlock[], streaming, cache);
+    expect(third.map((b) => b.kind)).toEqual(["routing_decision", "user", "assistant"]);
+    expect(third).toEqual(buildBubbles(f3 as AnyBlock[], streaming));
+
+    const f4 = [...f3, { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "king" }];
+    const fourth = buildBubbles(f4 as AnyBlock[], streaming, cache);
+    expect(fourth.map((b) => b.kind)).toEqual(["routing_decision", "user", "assistant"]);
+    expect(fourth).toEqual(buildBubbles(f4 as AnyBlock[], streaming));
+    // The hoisted pair is reused by reference once it's finalized.
+    expect(fourth[0]).toBe(third[0]);
+    expect(fourth[1]).toBe(third[1]);
+  });
+
+  it("live stream: a response_start marker between message and chip doesn't block the hoist", () => {
+    const cache = createBubbleCache();
+    const streaming: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      { type: "response_start", ctx: ctx({ responseId: "resp_1" }) },
+      chipBlock("rd_1", "resp_1", "turn"),
+    ];
+    const bubbles = buildBubbles(blocks, streaming, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["routing_decision", "user"]);
+    expect(bubbles).toEqual(buildBubbles(blocks, streaming));
+  });
+
+  it("live stream: a second turn's chip hoists over the finalized first turn", () => {
+    const cache = createBubbleCache();
+    const done: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      chipBlock("rd_1", "resp_1", "turn"),
+      doneBlock("a1", "resp_1", "one"),
+    ];
+    buildBubbles(done, null, cache);
+    const next = [...done, userBlock("u2", "resp_2")];
+    buildBubbles(next, null, cache);
+    const withChip = [...next, chipBlock("rd_2", "resp_2", "turn")];
+    const bubbles = buildBubbles(withChip, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "routing_decision",
+      "user",
+      "assistant",
+      "routing_decision",
+      "user",
+    ]);
+    expect(bubbles).toEqual(buildBubbles(withChip, null));
+  });
+});
+
 describe("bubblesEqual — React.memo comparator", () => {
   const baseBlocks = (): AnyBlock[] => [
     {
