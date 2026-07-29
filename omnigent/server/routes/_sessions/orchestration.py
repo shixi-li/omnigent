@@ -3710,6 +3710,16 @@ async def _forward_event_to_runner(
         and not _auto_resolved_this_turn
         and (effective_runner_override is None or conv.parent_conversation_id is not None)
     )
+    if _routing_enabled and not _should_route:
+        _logger.info(
+            "smart_routing: turn not routed session=%s: %s",
+            session_id,
+            "auto-harness already routed this turn"
+            if _auto_resolved_this_turn
+            else f"model already pinned ({effective_runner_override})"
+            if effective_runner_override is not None
+            else f"event type {body.type!r} is not a message",
+        )
     if _should_route:
         _user_text = _extract_user_text_for_routing(body)
         if _user_text:
@@ -4061,6 +4071,15 @@ async def _dispatch_session_event_to_runner_impl(
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
+        if _native_routing_enabled and not (
+            conv.model_override is None or conv.parent_conversation_id is not None
+        ):
+            _logger.info(
+                "smart_routing: native turn not routed session=%s: "
+                "model already pinned (%s)",
+                session_id,
+                conv.model_override,
+            )
         if _native_routing_enabled and (
             conv.model_override is None or conv.parent_conversation_id is not None
         ):
@@ -4068,6 +4087,12 @@ async def _dispatch_session_event_to_runner_impl(
 
             _harness = _resolve_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
+            if not _user_text:
+                _logger.info(
+                    "smart_routing: native turn not routed session=%s: "
+                    "no user text in message",
+                    session_id,
+                )
             if _user_text:
                 _native_runner_client = await _get_runner_client(session_id, runner_router)
                 _native_routed_model, _native_verdict = await route_turn(

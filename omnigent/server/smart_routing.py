@@ -1198,8 +1198,15 @@ async def route_turn(
         return None, None
 
     if _caps is None or _caps.routing_client is None:
+        _logger.info(
+            "smart_routing: route_turn skipped for session=%s: no routing client configured",
+            session_id,
+        )
         return None, None
 
+    _logger.info(
+        "smart_routing: routing turn session=%s harness=%s", session_id, harness
+    )
     # Prefer live runner catalog — but only the "self" worker entry.
     # The catalog includes sub-agent workers (claude_code, pi, codex…);
     # for brain-turn routing we only want the models this session's own
@@ -1214,6 +1221,12 @@ async def route_turn(
     if not available:
         models = infer_models(harness)
         if models is None:
+            _logger.info(
+                "smart_routing: route_turn skipped for session=%s: "
+                "no candidate models for harness=%s",
+                session_id,
+                harness,
+            )
             return None, None
         available = {harness or "": models}
 
