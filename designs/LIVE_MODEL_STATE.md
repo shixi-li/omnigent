@@ -197,6 +197,41 @@ model at its first omnigent-driven turn. No launch-ordering change needed.
 - A steered (mid-turn) message skips the settings branch by design; the
   switch lands at the next turn boundary.
 
+### Forwarder hardening (implemented — follow-up packet)
+
+`_CodexForwarderState` now tracks `settings_model` (last live
+`thread/settings/updated` model — the running thread's truth) and
+`last_config_model` (the config.toml value as of the previous read).
+`_refresh_model_from_config` precedence: a config.toml value that CHANGED
+since the last read wins (in-TUI `/model` or the executor's mirror write —
+freshest signal); an unchanged config defers to `settings_model`; otherwise
+the config value is adopted as before. This keeps the routed model even when
+the executor's config mirror write fails, while still honoring a genuine
+in-TUI `/model` rewrite.
+
+### Launch race — source analysis (no further change needed)
+
+- A terminal created AFTER routing already launches on the routed model:
+  `_codex_native_launch_config` GETs the live snapshot at create time and
+  prefers `model_override` (`omnigent/runner/native/orchestration.py:694-748`,
+  used at `:3458-3473`).
+- The racy case is auto-create at session bind (POST /v1/sessions), which by
+  definition precedes the first message — `model_override` cannot exist yet,
+  so no re-read timing helps, and the pin cannot be skipped (it exists to
+  stop the stale shared-config model from being mirrored;
+  `codex_native_app_server.py:205-244`, applied at `:635` — a file owned by
+  the enforcement agent). The race is closed functionally by the first-turn
+  push: the forwarded message carries `model_override` in-band
+  (`orchestration.py:3337-3342`), and `CodexNativeExecutor.run_turn` applies
+  `thread/settings/update` + the config mirror under `_inject_lock` BEFORE
+  `turn/start` — the same locked switch-then-inject discipline as
+  claude-native's `/model` injection.
+
+Note: the "native TUI flow" and the executor flow are the same path —
+`omnigent/inner/codex_native_harness.py` builds `CodexNativeExecutor` as the
+sole injection bridge for web-originated codex-native messages, so the
+executor-side push covers the native TUI sessions.
+
 ## Implemented (this packet — all files outside the two in-flight agents' sets)
 
 - `omnigent/codex_native_bridge.py`: `write_codex_config_model` (+ `re` import).
@@ -210,26 +245,26 @@ model at its first omnigent-driven turn. No launch-ordering change needed.
   `tests/server/integration/test_routing_integration.py`
   (`session.model` SSE published on routed persist).
 
+- `omnigent/codex_native_forwarder.py` (unblocked mid-flight, edits confined
+  to the model-mirror regions: state fields, `note_thread_settings_updated`,
+  `_refresh_model_from_config`): settings-model preference described above,
+  plus regression tests in `tests/test_codex_native_forwarder.py`
+  (pushed-model holds over stale config; changed config wins; launch-race
+  scenario ends on the routed model).
+
 ## Deferred — patch plan for the next packet (owned files in flight)
 
-1. `omnigent/codex_native_forwarder.py` (owned by codex trust/canary agent):
-   optional hardening — in the `turn/started` handler
-   (`:2885-2901`), prefer the last `thread/settings/updated` model over the
-   `config.toml` re-read when both are known for the same thread (e.g. only
-   let `_refresh_model_from_config` overwrite `forwarder_state.model` when
-   the file's mtime is newer than the last settings notification). Not
-   required once the mirror write lands, but removes the residual window
-   where a turn starts between the settings RPC and the file write.
-2. `omnigent/inner/codex_executor.py` (owned): if the SDK-codex harness ever
+1. `omnigent/inner/codex_executor.py` (owned): if the SDK-codex harness ever
    gains per-turn routing, apply the same "switch + mirror" rule there.
-3. Upstream/TUI: the `/model` picker's current-selection highlight after a
+2. Upstream/TUI: the `/model` picker's current-selection highlight after a
    remote switch is codex TUI behavior; the status bar already reflects the
    live model on 0.145.0. If a stronger in-terminal marker is wanted, the
    terminal wrapper label (`omnigent/_wrapper_labels.py`) could append the
    live model to the tmux status line, driven by the same `session.model`
    stream — nice-to-have, not required for correctness.
-4. Optional: runner terminal auto-create
-   (`omnigent/runner/native/orchestration.py:3458-3473`) could re-read the
-   snapshot after the first message settles to pin the routed model at
-   launch; redundant given the per-turn push, so recommend NOT doing it
-   unless a launch-time-only consumer appears.
+3. Forwarder reconnect edge: a forwarder that reconnects after a failed
+   config mirror write re-adopts the stale config at subscription (its
+   `settings_model` baseline is per-connection). Acceptable — the next
+   routed turn re-pushes and re-mirrors; a full fix would seed
+   `settings_model` from the `thread/resume` response, which touches
+   resume semantics deliberately left to the forwarder's owner.
