@@ -155,6 +155,58 @@ async def test_router_overrides_llm_supplied_child_model(
     assert refreshed.labels.get(ROUTING_DECISION_LABEL_KEY) == data.decision_id
 
 
+async def test_routed_model_publishes_session_model_event(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A routed pick pushes ``session.model`` so open web pickers update live.
+
+    Routing persists ``model_override`` server-side; without the SSE the
+    dropdown keeps showing the launch model until a reload (the PATCH and
+    ``external_model_change`` paths publish it — routing must too).
+    """
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-sse",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+    caps = _FakeCaps(
+        routing_client=_FakeRoutingClient(
+            RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+        )
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(
+            orchestration_module.session_stream,
+            "publish",
+            side_effect=lambda sid, payload: published.append((sid, payload)),
+        ),
+    ):
+        async with _echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id,
+                child,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    model_events = [
+        payload
+        for sid, payload in published
+        if sid == child.id and payload.get("type") == "session.model"
+    ]
+    assert len(model_events) == 1
+    assert model_events[0]["model"] == ROUTED_MODEL
+
+
 # ── 2. Native-subagent relay: transcript item + child join ──────────
 
 

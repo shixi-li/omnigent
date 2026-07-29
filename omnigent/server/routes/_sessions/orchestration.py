@@ -54,7 +54,10 @@ from omnigent.policies.types import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
-from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
+from omnigent.runner.subagent_routing import (
+    ROUTING_DECISION_LABEL_KEY,
+    subagent_routing_enabled,
+)
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
@@ -143,6 +146,7 @@ from omnigent.server.schemas import (
     SessionCreateRequest,
     SessionEventInput,
     SessionListItem,
+    SessionModelEvent,
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
@@ -641,6 +645,43 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
+def _visible_session_warnings(
+    conv: Conversation, parent_cost_control_mode: str | None
+) -> list[dict[str, Any]]:
+    """
+    Filter recorded warnings down to the ones that still apply.
+
+    The routing hooks and their advertisement are installed on every
+    native session so the setting can be flipped mid-session, so the
+    publisher (a runner-side forwarder that cannot see server state) posts
+    ``subagent_routing_unenforced`` whenever the canary is missing —
+    including on sessions where subagent routing is switched off and
+    nothing was ever meant to be gated. Re-evaluating the effective gate
+    here, at the one place warnings reach a client, keeps a mid-session
+    toggle honest in both directions with no re-post: turning routing on
+    reveals the already-recorded warning, turning it off hides it.
+
+    :param conv: The persisted conversation entity.
+    :param parent_cost_control_mode: The parent session's
+        ``cost_control_mode_override`` for a sub-agent, or ``None``.
+    :returns: Warning payloads to put on the snapshot.
+    """
+    warnings = session_warnings.snapshot_for(conv.id)
+    if not warnings:
+        return warnings
+    if subagent_routing_enabled(
+        conv.subagent_routing_override,
+        cost_control_mode=conv.cost_control_mode_override,
+        parent_cost_control_mode=parent_cost_control_mode,
+    ):
+        return warnings
+    return [
+        warning
+        for warning in warnings
+        if warning.get("code") != session_warnings.SUBAGENT_ROUTING_UNENFORCED
+    ]
+
+
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
@@ -660,6 +701,7 @@ def _build_session_response(
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     viewer_id: str | None = None,
+    parent_cost_control_mode: str | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -726,6 +768,11 @@ def _build_session_response(
     :param model_options: Runner-owned native model picker options,
         e.g. ``[{"id": "gpt-5.5", "displayName": "GPT-5.5"}]``.
         ``None`` is treated as ``[]``.
+    :param parent_cost_control_mode: The parent session's
+        ``cost_control_mode_override``, used to resolve a sub-agent's
+        inherited subagent-routing state when filtering warnings (see
+        :func:`_visible_session_warnings`). ``None`` for a top-level
+        session or a caller with no parent loaded.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -789,8 +836,9 @@ def _build_session_response(
         usage_by_model=_usage_by_model_for_display(display_usage),
         last_task_error=last_task_error,
         # Replay session-scoped warnings so a client that connects after
-        # the condition was observed still sees the header banner.
-        warnings=session_warnings.snapshot_for(conv.id),
+        # the condition was observed still sees the header banner, minus
+        # any that no longer apply to the session's current settings.
+        warnings=_visible_session_warnings(conv, parent_cost_control_mode),
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
         # Replay outstanding approval prompts into the snapshot.
@@ -3457,6 +3505,30 @@ async def _persist_session_event(
     return item_id
 
 
+def _publish_routed_model(session_id: str, model: str) -> None:
+    """
+    Publish a ``session.model`` SSE for a router-selected model.
+
+    Intelligent routing persists its pick as ``model_override`` before the
+    turn is forwarded, but nothing pushed that change to open web clients —
+    the model dropdown only updates from PATCH responses and ``session.model``
+    events, so a routed session kept showing the launch model until reload.
+    Mirrors the event `_persist_external_model_change` publishes for
+    harness-observed switches; if the harness-side apply later fails, the
+    forwarder's ``external_model_change`` mirror corrects this value.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param model: The routed model id, e.g. ``"gpt-5.6-luna"``.
+    :returns: None.
+    """
+    event = SessionModelEvent(
+        type="session.model",
+        conversation_id=session_id,
+        model=model,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
 async def _forward_event_to_runner(
     session_id: str,
     conv: Conversation,
@@ -3754,6 +3826,8 @@ async def _forward_event_to_runner(
                             session_id,
                             **_child_updates,
                         )
+                        if _routed_model is not None:
+                            _publish_routed_model(session_id, _routed_model)
                 except (OSError, ValueError):
                     _logger.warning(
                         "smart_routing: failed to persist harness/model for child session=%s",
@@ -3781,6 +3855,7 @@ async def _forward_event_to_runner(
                             session_id,
                             model_override=_routed_model,
                         )
+                        _publish_routed_model(session_id, _routed_model)
                     except (OSError, ValueError):
                         _logger.warning(
                             "smart_routing: failed to persist model_override "
