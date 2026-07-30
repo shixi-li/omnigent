@@ -37,14 +37,11 @@ def test_parse_args_returns_all_fields() -> None:
             "tests.runtime.harnesses._test_harness",
             "--socket",
             "/tmp/example.sock",
-            "--conversation-id",
-            "conv_abc",
         ]
     )
     assert ns.harness == "test"
     assert ns.module == "tests.runtime.harnesses._test_harness"
     assert ns.socket == "/tmp/example.sock"
-    assert ns.conversation_id == "conv_abc"
 
 
 def test_parse_args_parent_pid_defaults_to_none() -> None:
@@ -61,8 +58,6 @@ def test_parse_args_parent_pid_defaults_to_none() -> None:
             "tests.runtime.harnesses._test_harness",
             "--socket",
             "/tmp/example.sock",
-            "--conversation-id",
-            "conv_abc",
         ]
     )
     assert ns.parent_pid is None
@@ -83,8 +78,6 @@ def test_parse_args_parent_pid_parses_integer() -> None:
             "tests.runtime.harnesses._test_harness",
             "--socket",
             "/tmp/example.sock",
-            "--conversation-id",
-            "conv_abc",
             "--parent-pid",
             "12345",
         ]
@@ -96,19 +89,11 @@ def test_parse_args_parent_pid_parses_integer() -> None:
 def test_load_harness_app_import_error_exits(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A non-importable module path is fatal at boot.
-
-    Per §Process management: misconfigurations should surface at
-    spawn time as a non-zero exit, not as a connection refused
-    on the first request. Verifies SystemExit(2) + a stderr
-    message naming the bad module path.
-    """
+    """A non-importable module path is fatal at boot."""
     with pytest.raises(SystemExit) as excinfo:
-        _runner._load_harness_app("missing", "omnigent.does_not_exist", "conv_x")
+        _runner._load_harness_app("missing", "omnigent.does_not_exist")
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
-    # Catch a future regression where the loud-fail message gets
-    # silenced or the module path gets dropped from it.
     assert "cannot import harness module" in err
     assert "'omnigent.does_not_exist'" in err
 
@@ -116,35 +101,15 @@ def test_load_harness_app_import_error_exits(
 def test_load_harness_app_module_without_create_app_exits(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A module that doesn't export create_app is fatal.
-
-    Verifies the runner's structural check (``getattr(module,
-    "create_app", None)``) catches the misnaming case loudly.
-    Pointing the runner at a real module without ``create_app``
-    (``omnigent.errors``) reproduces the failure mode.
-    """
+    """A module that doesn't export create_app is fatal."""
     with pytest.raises(SystemExit) as excinfo:
-        _runner._load_harness_app("broken", "omnigent.errors", "conv_x")
+        _runner._load_harness_app("broken", "omnigent.errors")
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
     assert "does not export create_app" in err
 
 
 def test_load_harness_app_loads_test_fixture() -> None:
-    """A real module with create_app loads + stashes app state.
-
-    Verifies the happy path: import → factory call →
-    app.state.conversation_id + app.state.harness stash. The
-    conversation id plumbing is the most fragile part of the
-    runner contract (the design doc explicitly forbids parsing
-    it from the socket path), so it gets a focused assertion.
-    """
-    app = _runner._load_harness_app("test", "tests.runtime.harnesses._test_harness", "conv_xyz")
-    # The fixture's create_app() returns a real FastAPI app — the
-    # runner's job is to stash the conversation id on it. If this
-    # fails, the harness can't scope its in-memory state per
-    # §Harness in-memory state.
-    assert app.state.conversation_id == "conv_xyz"
-    # The harness name is also stashed for introspection /
-    # logging — verifies the second app.state plumbing.
+    """A real module with create_app loads and stashes app.state.harness."""
+    app = _runner._load_harness_app("test", "tests.runtime.harnesses._test_harness")
     assert app.state.harness == "test"

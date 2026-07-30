@@ -387,10 +387,15 @@ class TurnContext:
         response_id: str,
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
+        conversation_id: str | None = None,
     ) -> None:
         self.response_id = response_id
         self._event_queue = event_queue
         self.cancelled = cancelled
+        # The conversation this turn belongs to. Set by the scaffold when
+        # serving a shared (multi-conversation) runner so run_turn
+        # implementations can key per-session state by conversation_id.
+        self.conversation_id: str | None = conversation_id
         # Layer 3 per-tool-dispatch state: ``call_id`` →
         # Future[ToolResult-output-string]. Populated by
         # ``dispatch_tool``; resolved by the ``tool_result``
@@ -792,6 +797,18 @@ class HarnessApp:
         The base implementation is a no-op.
         """
 
+    async def close_session(self, conversation_id: str) -> None:
+        """
+        Subclass hook to release per-conversation resources.
+
+        Called by ``_post_session_close`` when the process manager
+        signals that a conversation has terminated. Subclasses
+        (e.g. :class:`ExecutorAdapter`) override this to free
+        the executor and in-memory state for that conversation.
+
+        The base implementation is a no-op.
+        """
+
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
         Per-harness turn execution.
@@ -1008,6 +1025,12 @@ class HarnessApp:
             # heterogeneous return type.
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/close",
+            self._post_session_close,
+            methods=["POST"],
+            response_model=None,
+        )
         return router
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
@@ -1041,17 +1064,34 @@ class HarnessApp:
         """
         bound = getattr(request.app.state, "conversation_id", None)
         if bound is None:
-            raise OmnigentError(
-                "harness scaffold has no conversation_id bound on app.state — "
-                "the runner must set app.state.conversation_id before serving",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
+            # Shared runner: no single conversation_id is bound on app.state;
+            # the adapter routes per-conversation state internally. Accept any
+            # well-formed id.
+            return
         if bound != conversation_id:
             raise OmnigentError(
                 f"conversation {conversation_id!r} not served by this harness "
                 f"(bound to {bound!r})",
                 code=ErrorCode.NOT_FOUND,
             )
+
+    async def _post_session_close(
+        self,
+        conversation_id: str,
+        request: Request,
+    ) -> Response:
+        """
+        Handle ``POST /v1/sessions/{conversation_id}/close``.
+
+        Called by the process manager when a conversation terminates to
+        release per-conversation resources from a shared runner subprocess
+        without killing the subprocess itself.
+        """
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        await self.close_session(conversation_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _post_session_event(
         self,
@@ -1107,7 +1147,7 @@ class HarnessApp:
             return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
-            return await self._start_or_inject_turn(body.to_create_request())
+            return await self._start_or_inject_turn(body.to_create_request(), conversation_id)
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
         if isinstance(body, ToolResultEvent):
@@ -1196,7 +1236,7 @@ class HarnessApp:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
-        self, request: CreateResponseRequest
+        self, request: CreateResponseRequest, conversation_id: str | None = None
     ) -> StreamingResponse | Response:
         """
         Start a new turn or inject into the in-flight one.
@@ -1255,6 +1295,7 @@ class HarnessApp:
                 response_id=response_id,
                 event_queue=event_queue,
                 cancelled=cancelled,
+                conversation_id=conversation_id,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx
