@@ -798,14 +798,7 @@ async def create_response(
         sse_body = sse_text_response(qr.text)
 
     async def _generate() -> AsyncIterator[str]:
-        # Chunk with a small inter-event delay so mid-turn steering
-        # messages can arrive while the harness turn is still in-flight.
-        # Without this, a warm (shared) harness subprocess completes the
-        # response before steering reaches it.
-        for chunk in sse_body.split("\n\n"):
-            if chunk:
-                yield chunk + "\n\n"
-                await asyncio.sleep(0.02)
+        yield sse_body
 
     return StreamingResponse(
         _generate(),
@@ -855,10 +848,7 @@ async def create_message(
         sse_body = anthropic_sse_text_response(qr.text)
 
     async def _generate() -> AsyncIterator[str]:
-        for chunk in sse_body.split("\n\n"):
-            if chunk:
-                yield chunk + "\n\n"
-                await asyncio.sleep(0.02)
+        yield sse_body
 
     return StreamingResponse(
         _generate(),
@@ -1073,15 +1063,7 @@ async def reset(request: Request) -> dict[str, bool]:
             if queue is not None:
                 queue.reset()
         else:
-            # Partial reset: clear gates and captured requests but leave
-            # keyed queues intact so concurrent xdist workers don't
-            # clobber each other's configured responses.
-            old_gates = _state.pending_gates
-            _state.pending_gates = []
-            for qr in old_gates:
-                qr._gate.set()
-            _state.captured_requests.clear()
-            _state.request_count = 0
+            _state.reset()
     return {"reset": True}
 
 
