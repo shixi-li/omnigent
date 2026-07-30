@@ -91,3 +91,27 @@ subagents, with mid-session toggles live. Open: user visual confirms
 (chip placement, fresh-session panel), the top-level Smart Routing
 harness (in flight), fork routing policy, and the external GLM/codex
 model-list gap.
+
+## 7. Canonical matrix run (plan §11) — 2026-07-30, post 158042a3
+
+| Row | Surface / prompt | Expected | Decision (raw → applied) | Bar |
+|---|---|---|---|---|
+| A1 | Smart Routing harness / P-OPUS | opus | claude-opus-4-8 → **system.ai.claude-opus-5** | ❌ substitution (pre-session claude catalog lacks 4-8; fix in flight) |
+| A2 | Smart Routing harness / P-GLM | opus (both-scenario all-hold) | claude-opus-4-8 → system.ai.claude-opus-5 | ❌ same; recipe quirk confirmed: GLM case escalates to opus under 'both' |
+| A3 | Smart Routing harness / P-SOL | sol | gpt-5-6-sol → gpt-5-6-sol | ✅ exact |
+| A4 | Smart Routing harness / "hi" | luna | gpt-5-6-luna → luna | ✅ exact |
+| B1 | Claude Code / P-OPUS | opus | claude-opus-4-8 → claude-opus-4-8 | 🟡 decision exact, but the PROCESS runs Opus 5 (alias pin drifted to the new workspace opus-5) — honest-record fix in flight |
+| B2 | Claude Code / "hi" | sonnet | claude-sonnet-5 → sonnet-5 | ✅ exact ("hi"→5-4-mini was a misread: 5-4-mini is the extraction model) |
+| B-sub | Claude Task spawns | claude-only, per-prompt | Explore→sonnet-5, general-purpose→opus-4-8 | ✅ family-constrained, exact |
+| B-tog | Toggle off mid-session | immediate, no chips | gate declined per call, 0 new decisions, spawn proceeded | ✅ |
+| C1 | Codex / P-GLM | glm-5-2 | glm-5-2 → **databricks-glm-5-2**, process config.toml = glm | ✅ exact — GLM on codex works end to end (whitelist + catalog filter fix; the "external list gap" was partly our own family filter) |
+| C2 | Codex / P-SOL | sol | gpt-5-6-sol → sol | ✅ exact |
+| C3 | Codex / "hi" | luna | gpt-5-6-luna → luna | ✅ exact |
+| C-sub | Codex spawns | codex-only; unnamed→placeholder→luna | 4/4 placeholder→luna exact; NOTE: a requested "named" spawn carried no task_name — codex spawn tool naming rarely reaches hooks (follow-up) | ✅ w/ note |
+| C-tog | Toggle off / on | immediate both ways | off: 0 decisions; on: next spawn routed | ✅ |
+| A-sub | Cross-harness under auto | allowed | claude-native auto session spawn routed codex/sol (cross-family decision permitted); redirect-follow not observed this run (soft by design) | ✅ decision layer |
+
+Open from this run: claude apply exactness + honest record under workspaces
+serving newer generations than the frozen arms (agent in flight); codex
+spawn naming rarely reaches hooks; GLM-case→opus under 'both' is recipe
+feedback for Ivan (task_v2).
