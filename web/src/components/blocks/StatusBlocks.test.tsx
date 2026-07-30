@@ -134,8 +134,7 @@ describe("routing decision — harness / scope / raw pick", () => {
         applied
         rationale="short task"
         agent="researcher"
-        harness="claude-native"
-        scope="native_subagent"
+        routing={{ harness: "claude-native", scope: "native_subagent" }}
       />,
     );
     const chip = screen.getByTestId("routing-decision-chip");
@@ -151,8 +150,7 @@ describe("routing decision — harness / scope / raw pick", () => {
         model="databricks-claude-sonnet-5"
         applied
         rationale="x"
-        harness="codex"
-        scope="turn"
+        routing={{ harness: "codex", scope: "turn" }}
       />,
     );
     expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
@@ -164,7 +162,7 @@ describe("routing decision — harness / scope / raw pick", () => {
         model="databricks-claude-sonnet-5"
         applied
         rationale="x"
-        rawModel="gpt-5-6-sol"
+        routing={{ rawModel: "gpt-5-6-sol" }}
       />,
     );
     // The router's vocabulary pick had no endpoint and was mapped to a
@@ -179,7 +177,7 @@ describe("routing decision — harness / scope / raw pick", () => {
         model="databricks-claude-sonnet-5"
         applied
         rationale="x"
-        rawModel="claude-sonnet-5"
+        routing={{ rawModel: "claude-sonnet-5" }}
       />,
     );
     expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
@@ -202,11 +200,13 @@ describe("routing decision — harness / scope / raw pick", () => {
         applied
         rationale="short task"
         agent="researcher"
-        harness="codex-native"
-        scope="child_session"
-        decisionId="dec_123"
-        rawModel="gpt-5-6-sol"
-        attemptedOverride="databricks-claude-opus-4-8"
+        routing={{
+          harness: "codex-native",
+          scope: "child_session",
+          decisionId: "dec_123",
+          rawModel: "gpt-5-6-sol",
+          attemptedOverride: "databricks-claude-opus-4-8",
+        }}
       />,
     );
     expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex-native");

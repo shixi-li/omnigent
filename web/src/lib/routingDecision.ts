@@ -1,13 +1,11 @@
-// Shared shape for the additive intelligent-routing decision fields.
+// Shared shape for the routing-identity fields that ride alongside a routing
+// decision's `model`/`applied`/`rationale`/`agent`.
 //
-// The server's `RoutingDecisionData` grew harness/scope/decision identity
-// alongside the original `model`/`applied`/`rationale`/`agent`. Every hop of
-// the transcript pipeline (SSE event → block → bubble → chip/card) carries
-// them through unchanged, so the shape lives here once instead of being
-// re-declared five times. All fields are optional: legacy rows (and any
-// deployment running an older server) render exactly as before.
+// Every hop of the transcript pipeline (SSE event → block → bubble →
+// chip/card) carries this shape through unchanged under a single `routing`
+// field. All fields are optional; legacy rows carry none and render as before.
 
-/** Where a routing decision was taken. Absent on legacy rows. */
+/** Where a routing decision was taken. Optional; legacy rows omit it. */
 export type RoutingScope = "session" | "turn" | "child_session" | "native_subagent";
 
 export interface RoutingDecisionExtras {
@@ -33,7 +31,7 @@ function str(value: unknown): string | undefined {
 }
 
 /**
- * Read the additive routing fields off a snake_case wire record (an SSE
+ * Read the routing-identity fields off a snake_case wire record (an SSE
  * `routing_decision` payload or a stored transcript item).
  *
  * Unknown/blank values are dropped rather than coerced, so a partial or
@@ -57,14 +55,16 @@ export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDeci
 }
 
 /**
- * Copy the set routing extras out of an already-parsed carrier, for the
- * camelCase hops (event → block → bubble). Unset fields stay unset so
- * spreading never introduces `undefined` keys.
+ * Re-copy already-parsed extras for the camelCase hops (event → block →
+ * bubble). Unset fields stay unset, so the result never carries `undefined`.
  *
- * @param source - Any carrier of the extras, e.g. a `RoutingDecisionBlock`.
+ * @param source - The carrier's `routing` field, or null/undefined when absent.
  * @returns Only the fields actually present.
  */
-export function routingExtras(source: RoutingDecisionExtras): RoutingDecisionExtras {
+export function routingExtras(
+  source: RoutingDecisionExtras | null | undefined,
+): RoutingDecisionExtras {
+  if (source == null) return {};
   return {
     ...(source.harness != null && { harness: source.harness }),
     ...(source.scope != null && { scope: source.scope }),
@@ -76,7 +76,7 @@ export function routingExtras(source: RoutingDecisionExtras): RoutingDecisionExt
 
 /**
  * Whether a decision belongs to the session's own turn rather than to a
- * sub-agent it spawned. Legacy rows carry no scope and count as the session's.
+ * sub-agent it spawned. Rows with no scope count as the session's.
  *
  * @param scope - Decision scope, or null/undefined on legacy rows.
  * @returns True for `session`/`turn`/absent, false for the sub-agent scopes.

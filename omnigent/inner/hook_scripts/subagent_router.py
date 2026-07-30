@@ -16,17 +16,19 @@ is unreachable: the hook allows the spawn unchanged and emits nothing.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES, claude_model_alias
+from omnigent.claude_model_vocabulary import claude_model_alias
 
 # Advertisement file written by the runner's subagent-routing endpoint,
 # mirroring the ``tool_relay.json`` discovery pattern.
@@ -62,11 +64,19 @@ _FORK_SUFFIXES = ("-fork", "_fork", ":fork")
 # runner.
 REQUEST_TIMEOUT_S = 30.0
 
-# Claude Code's Agent/Task ``model`` parameter is a closed enum of family
-# aliases — a servable catalog id ("databricks-claude-sonnet-5") fails its
-# schema and the spawn dies. Same vocabulary as ``/model``, so the
-# translation lives in one place.
-AGENT_TOOL_MODEL_ALIASES: tuple[str, ...] = CLAUDE_MODEL_ALIASES
+# ``tool_input`` keys naming the requested subagent, in preference order.
+# Claude Code sends ``subagent_type``; codex sends ``task_name`` /
+# ``agent_name``.
+DEFAULT_TASK_KEYS: tuple[str, ...] = ("subagent_type",)
+
+# Flags every harness hook entrypoint accepts. None is required: a hook
+# misconfiguration must degrade to "no opinion", not an argparse exit.
+STANDARD_HOOK_FLAGS: tuple[str, ...] = (
+    "--bridge-dir",
+    "--router-dir",
+    "--session-id",
+    "--harness",
+)
 
 
 @dataclass(frozen=True)
@@ -209,18 +219,40 @@ def is_agent_tool(tool_name: Any) -> bool:  # type: ignore[explicit-any]  # hook
     return isinstance(tool_name, str) and tool_name in AGENT_TOOL_NAMES
 
 
-def is_fork_spawn(tool_input: dict[str, Any]) -> bool:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
+def spawn_task_name(
+    tool_input: dict[str, Any],  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
+    task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
+) -> str:
+    """
+    Read the requested subagent's name out of a spawn's ``tool_input``.
+
+    :param tool_input: ``tool_input`` from the hook payload.
+    :param task_keys: Keys to try, in preference order.
+    :returns: The name, or ``""`` when the spawn names none (the server
+        supplies the placeholder task; the hook does not invent one).
+    """
+    for key in task_keys:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def is_fork_spawn(
+    tool_input: dict[str, Any],  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
+    task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
+) -> bool:
     """
     Detect a context-inheriting (fork-typed) spawn.
 
     :param tool_input: ``tool_input`` from the hook payload.
+    :param task_keys: Extra name keys to try when ``subagent_type`` is
+        absent, e.g. codex's ``task_name``.
     :returns: ``True`` when the requested subagent type inherits the
         caller's context.
     """
-    subagent_type = tool_input.get("subagent_type")
-    if not isinstance(subagent_type, str):
-        return False
-    normalized = subagent_type.strip().lower()
+    keys = dict.fromkeys(("subagent_type", *task_keys))
+    normalized = spawn_task_name(tool_input, tuple(keys)).strip().lower()
     return normalized in FORK_SUBAGENT_TYPES or normalized.endswith(_FORK_SUFFIXES)
 
 
@@ -229,6 +261,8 @@ def build_route_request(
     *,
     harness: str,
     parent_model: str | None = None,
+    task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
+    include_prompt: bool = True,
 ) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON request body
     """
     Build the ``route-subagent`` request body.
@@ -236,15 +270,18 @@ def build_route_request(
     :param tool_input: ``tool_input`` from the hook payload.
     :param harness: Requesting harness, e.g. ``"claude-native"``.
     :param parent_model: Model the parent session runs on, when known.
+    :param task_keys: ``tool_input`` keys naming the subagent, in
+        preference order.
+    :param include_prompt: ``False`` sends ``prompt: null``, for harnesses
+        whose spawn message is encrypted in hook payloads (codex).
     :returns: JSON-serializable request body.
     """
-    task_name = tool_input.get("subagent_type")
-    prompt = tool_input.get("prompt")
+    prompt = tool_input.get("prompt") if include_prompt else None
     return {
         "harness": harness,
-        "task_name": task_name if isinstance(task_name, str) else "",
+        "task_name": spawn_task_name(tool_input, task_keys),
         "prompt": prompt if isinstance(prompt, str) and prompt else None,
-        "fork": is_fork_spawn(tool_input),
+        "fork": is_fork_spawn(tool_input, task_keys),
         "parent_model": parent_model,
     }
 
@@ -310,21 +347,21 @@ def _deny(reason: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # hook 
     }
 
 
-def claude_agent_tool_model(
-    model: str,
-    env: Mapping[str, str] | None = None,
-) -> str | None:
+def claude_model_translator(
+    bridge_dir: str | Path | None,
+) -> Callable[[str], str | None]:
     """
-    Translate a servable model id into Claude's Agent-tool vocabulary.
+    Build the model translator for Claude's spawn tool.
 
-    :param model: Model id from the routing decision, or an alias.
-    :param env: Environment mapping holding the workspace's alias
-        pinning. ``None`` uses :data:`os.environ`.
-    :returns: An accepted alias, or ``None`` when the id maps to nothing
-        Claude would accept — callers must then leave the spawn alone
-        rather than inject a value the CLI rejects.
+    :param bridge_dir: Directory whose ``bridge.json`` records the
+        session's alias pinning.
+    :returns: Callable mapping a servable id to an accepted alias.
     """
-    return claude_model_alias(model, env)
+    # Claude's Agent/Task ``model`` is a closed enum of family aliases, so a
+    # catalog id ("databricks-claude-sonnet-5") fails its schema and the
+    # spawn dies. Same vocabulary as ``/model``.
+    vocabulary_env = resolve_model_vocabulary_env(bridge_dir)
+    return lambda model: claude_model_alias(model, vocabulary_env)
 
 
 def redirect_reason(harness: str, model: str) -> str:
@@ -381,7 +418,7 @@ def decision_to_hook_output(
         # A redirect without a target can't be followed — fail open.
         return None
     if action == "deny":
-        return _deny(rationale or "Spawn denied by Omnigent intelligent routing.")
+        return _deny(rationale or "Spawn denied by Omnigent smart routing.")
     return None
 
 
@@ -392,24 +429,42 @@ def route_pre_tool_use(
     router_dir: str | Path | None = None,
     bridge_dir: str | Path | None = None,
     parent_model: str | None = None,
+    session_id: str | None = None,
     timeout: float = REQUEST_TIMEOUT_S,
+    tool_matcher: Callable[[Any], bool] = is_agent_tool,  # type: ignore[explicit-any]  # untrusted tool_name
+    task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
+    include_prompt: bool = True,
+    parent_model_resolver: Callable[[dict[str, Any]], str | None] | None = None,  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
+    model_translator_factory: Callable[[str | Path | None], Callable[[str], str | None]]
+    | None = claude_model_translator,
+    post_process: Callable[[dict[str, Any] | None], dict[str, Any] | None] | None = None,  # type: ignore[explicit-any]  # hook output JSON
 ) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook output JSON
     """
     Route one ``PreToolUse`` payload end to end.
 
-    :param payload: Claude ``PreToolUse`` hook payload.
+    :param payload: ``PreToolUse`` hook payload.
     :param harness: Requesting harness, e.g. ``"claude-sdk"``.
     :param router_dir: Advertisement directory; ``None`` discovers it.
     :param bridge_dir: Claude-native bridge directory for session-id
         fallback.
     :param parent_model: Model the parent session runs on, when known.
+    :param session_id: Session baked into the hook command, used when the
+        advertisement carries none.
     :param timeout: Socket timeout in seconds.
+    :param tool_matcher: Recognizes the harness's spawn tool by name.
+    :param task_keys: ``tool_input`` keys naming the subagent.
+    :param include_prompt: ``False`` withholds the spawn prompt.
+    :param parent_model_resolver: Derives the parent model from the
+        payload; ``None`` reads the bridge config instead.
+    :param model_translator_factory: Builds the decision-model translator
+        for this harness's spawn tool. ``None`` injects the routed id
+        verbatim, which is what codex's ``spawn_agent`` expects.
+    :param post_process: Last pass over the hook output, e.g. codex's
+        routed-model notice.
     :returns: Hook output, or ``None`` for "no opinion" — every failure
-        (no advertisement, unreachable router, malformed response, a model
-        id with no Agent-tool alias) lands here so a spawn is never
-        blocked by routing infrastructure.
+        lands here so a spawn is never blocked by routing infrastructure.
     """
-    if not is_agent_tool(payload.get("tool_name")):
+    if not tool_matcher(payload.get("tool_name")):
         return None
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -417,21 +472,129 @@ def route_pre_tool_use(
     endpoint = read_router_endpoint(discover_router_dir(router_dir))
     if endpoint is None:
         return None
-    session_id = resolve_session_id(endpoint, bridge_dir=bridge_dir or router_dir)
-    if not session_id:
+    resolved_session = (
+        endpoint.session_id
+        or session_id
+        or resolve_session_id(endpoint, bridge_dir=bridge_dir or router_dir)
+    )
+    if not resolved_session:
         return None
+    if parent_model is None:
+        parent_model = (
+            parent_model_resolver(payload)
+            if parent_model_resolver is not None
+            else resolve_parent_model(bridge_dir)
+        )
     body = build_route_request(
         tool_input,
         harness=harness,
-        parent_model=parent_model or resolve_parent_model(bridge_dir),
+        parent_model=parent_model,
+        task_keys=task_keys,
+        include_prompt=include_prompt,
     )
-    decision = request_decision(endpoint, session_id, body, timeout=timeout)
+    decision = request_decision(endpoint, resolved_session, body, timeout=timeout)
     if decision is None:
         return None
-    # Claude's Agent tool takes family aliases, not catalog ids.
-    vocabulary_env = resolve_model_vocabulary_env(bridge_dir or router_dir)
-    return decision_to_hook_output(
-        decision,
-        tool_input,
-        model_translator=lambda model: claude_agent_tool_model(model, vocabulary_env),
+    translator = (
+        model_translator_factory(bridge_dir or router_dir)
+        if model_translator_factory is not None
+        else None
     )
+    output = decision_to_hook_output(decision, tool_input, model_translator=translator)
+    return post_process(output) if post_process is not None else output
+
+
+def read_stdin_payload(
+    label: str,
+) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
+    """
+    Read one hook payload from stdin.
+
+    :param label: Diagnostic prefix, e.g. ``"omnigent codex router hook"``.
+    :returns: Decoded object, or ``None`` when stdin is empty, malformed,
+        or not a JSON object (a diagnostic goes to stderr).
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError as exc:
+        print(f"{label}: malformed JSON: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(payload, dict):
+        print(f"{label}: expected JSON object", file=sys.stderr)
+        return None
+    return payload
+
+
+def hook_arg_parser(
+    prog: str,
+    *,
+    extra_flags: Sequence[str] = (),
+) -> argparse.ArgumentParser:
+    """
+    Build the argument parser shared by the harness hook entrypoints.
+
+    :param prog: Program label for usage text.
+    :param extra_flags: Flags beyond :data:`STANDARD_HOOK_FLAGS`.
+    :returns: Parser whose every flag is optional and defaults to ``None``.
+    """
+    parser = argparse.ArgumentParser(prog=prog)
+    for flag in (*STANDARD_HOOK_FLAGS, *extra_flags):
+        parser.add_argument(flag, default=None)
+    return parser
+
+
+def parse_hook_args(
+    prog: str,
+    argv: Sequence[str],
+    *,
+    extra_flags: Sequence[str] = (),
+) -> argparse.Namespace:
+    """
+    Parse a hook entrypoint's arguments, tolerating anything unexpected.
+
+    Unknown flags are dropped rather than raising ``SystemExit(2)``: a
+    stale generated hook command must not turn into a failed spawn.
+
+    :param prog: Program label for usage text.
+    :param argv: Arguments after the subcommand, if any.
+    :param extra_flags: Flags beyond :data:`STANDARD_HOOK_FLAGS`.
+    :returns: Parsed namespace.
+    """
+    args, _unknown = hook_arg_parser(prog, extra_flags=extra_flags).parse_known_args(list(argv))
+    return args
+
+
+def run_route_subagent_main(
+    argv: Sequence[str],
+    *,
+    prog: str,
+    harness: str,
+    label: str | None = None,
+    **route_kwargs: Any,  # type: ignore[explicit-any]  # forwarded to route_pre_tool_use
+) -> int:
+    """
+    Run a hook entrypoint's spawn-routing body.
+
+    :param argv: Arguments after the subcommand, if any.
+    :param prog: Program label for usage text.
+    :param harness: Requesting harness, used when argv names none.
+    :param label: Diagnostic prefix; ``None`` uses *prog*.
+    :param route_kwargs: Per-harness seams for
+        :func:`route_pre_tool_use`.
+    :returns: Always ``0`` so a routing failure never blocks a spawn.
+    """
+    args = parse_hook_args(prog, argv)
+    payload = read_stdin_payload(label or prog)
+    if payload is None:
+        return 0
+    output = route_pre_tool_use(
+        payload,
+        harness=args.harness or harness,
+        router_dir=args.router_dir or args.bridge_dir,
+        bridge_dir=args.bridge_dir,
+        session_id=args.session_id,
+        **route_kwargs,
+    )
+    if output is not None:
+        sys.stdout.write(json.dumps(output))
+    return 0

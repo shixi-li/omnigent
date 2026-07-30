@@ -66,13 +66,3 @@ def snapshot_for(session_id: str) -> list[dict[str, Any]]:
     """
     with _lock:
         return [dict(entry) for entry in _warnings.get(session_id, ())]
-
-
-def clear(session_id: str) -> None:
-    """
-    Drop every warning recorded for *session_id*.
-
-    :param session_id: Session/conversation identifier.
-    """
-    with _lock:
-        _warnings.pop(session_id, None)

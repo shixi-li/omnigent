@@ -104,19 +104,24 @@ export const AUTO_HARNESS_ID = "auto";
 export const AUTO_NATIVE_HARNESS_ID = "auto-native";
 
 /**
- * User-facing name for the per-harness Model option where the router picks the
- * model per turn (the ``__smart__`` sentinel). One constant so the composer
- * label, the Model dropdown and the gear tooltip can't drift.
+ * User-facing name for smart routing, covering both the per-harness Model
+ * option (the ``__smart__`` sentinel, router picks the model per turn) and the
+ * fully-auto harness ({@link AUTO_HARNESS_ID}, router picks harness AND model).
  */
-export const INTELLIGENT_ROUTING_LABEL = "Smart Routing";
+export const SMART_ROUTING_LABEL = "Smart Routing";
 
 /**
- * User-facing name for the fully-auto harness ({@link AUTO_HARNESS_ID}), where
- * the router picks the harness AND the model.
+ * Whether a harness id is one of the fully-auto sentinels, i.e. the router owns
+ * the harness pick. Use the individual ids where the two flavors differ.
+ *
+ * @param harness - Harness id from picker state, or null/undefined when unset.
+ * @returns True for {@link AUTO_HARNESS_ID} or {@link AUTO_NATIVE_HARNESS_ID}.
  */
-export const AUTO_HARNESS_LABEL = "Smart Routing";
+export function isAutoHarness(harness: string | null | undefined): boolean {
+  return harness === AUTO_HARNESS_ID || harness === AUTO_NATIVE_HARNESS_ID;
+}
 
-/** One-line behavior blurb for {@link AUTO_HARNESS_LABEL}, shown next to the
+/** One-line behavior blurb for {@link SMART_ROUTING_LABEL}, shown next to the
  *  harness-picker row and as the composer chip's hover text. */
 export const AUTO_HARNESS_DESCRIPTION = "Harness and model picked per task by smart routing";
 
@@ -124,7 +129,7 @@ export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<strin
   const base = useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS);
   if (!smartRoutingEnabled) return base;
   // Prepend the "auto" sentinel so it appears first in the picker.
-  return { [AUTO_HARNESS_ID]: AUTO_HARNESS_LABEL, ...base };
+  return { [AUTO_HARNESS_ID]: SMART_ROUTING_LABEL, ...base };
 }
 
 const _NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};

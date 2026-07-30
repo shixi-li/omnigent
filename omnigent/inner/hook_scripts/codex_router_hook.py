@@ -22,7 +22,6 @@ original ``tool_input`` is echoed back verbatim on a rewrite.
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import time
@@ -30,11 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner.hook_scripts.subagent_router import (
-    REQUEST_TIMEOUT_S,
-    decision_to_hook_output,
-    read_router_endpoint,
-    request_decision,
-    resolve_session_id,
+    parse_hook_args,
+    read_stdin_payload,
+    run_route_subagent_main,
 )
 
 # Codex flattens MCP-ish tool names, so the spawn tool arrives as
@@ -44,8 +41,11 @@ SPAWN_AGENT_TOOL_SUFFIX = "spawn_agent"
 # Bridge-dir artifacts the canary / audit subcommands write.
 CANARY_FILENAME = "subagent_routing_canary"
 AUDIT_FILENAME = "subagent_spawn_audit.jsonl"
-# Harness label sent to the endpoint (§5.1 request ``harness``).
+# Harness label sent to the endpoint when argv names none.
 DEFAULT_HARNESS = "codex"
+
+_LABEL = "omnigent codex router hook"
+_MODULE = "omnigent.inner.hook_scripts.codex_router_hook"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,47 +60,23 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     command = raw_argv[0] if raw_argv else ""
     if command == "route-subagent":
-        return _main_route_subagent(raw_argv[1:])
+        return run_route_subagent_main(
+            raw_argv[1:],
+            prog=_prog(command),
+            harness=DEFAULT_HARNESS,
+            label=_LABEL,
+            **ROUTE_SEAMS,
+        )
     if command == "session-canary":
         return _main_session_canary(raw_argv[1:])
     if command == "record-subagent":
         return _main_record_subagent(raw_argv[1:])
-    print(f"omnigent codex router hook: unknown subcommand {command!r}", file=sys.stderr)
+    print(f"{_LABEL}: unknown subcommand {command!r}", file=sys.stderr)
     return 0
 
 
-def _parse_args(prog: str, argv: list[str], *, harness: bool = False) -> argparse.Namespace:
-    """
-    Parse one subcommand's arguments.
-
-    :param prog: Program label for usage errors.
-    :param argv: Argv after the subcommand.
-    :param harness: Accept the routing-only ``--harness`` /
-        ``--parent-model`` flags.
-    :returns: Parsed namespace.
-    """
-    parser = argparse.ArgumentParser(prog=prog)
-    parser.add_argument("--bridge-dir", required=True)
-    parser.add_argument("--session-id", default=None)
-    if harness:
-        parser.add_argument("--harness", default=DEFAULT_HARNESS)
-        parser.add_argument("--parent-model", default=None)
-    return parser.parse_args(argv)
-
-
-def _read_payload() -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
-    """
-    Read the hook payload from stdin.
-
-    :returns: Decoded object, or ``None`` when stdin is empty or not a
-        JSON object.
-    """
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError as exc:
-        print(f"omnigent codex router hook: malformed JSON: {exc}", file=sys.stderr)
-        return None
-    return payload if isinstance(payload, dict) else None
+def _prog(command: str) -> str:
+    return f"python -m {_MODULE} {command}"
 
 
 def is_spawn_agent_tool(tool_name: Any) -> bool:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
@@ -117,110 +93,6 @@ def is_spawn_agent_tool(tool_name: Any) -> bool:  # type: ignore[explicit-any]  
     return tool_name.strip().lower().endswith(SPAWN_AGENT_TOOL_SUFFIX)
 
 
-def build_route_request(
-    tool_input: dict[str, Any],  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
-    *,
-    harness: str,
-    parent_model: str | None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON request body
-    """
-    Build the ``route-subagent`` request body for a codex spawn.
-
-    ``prompt`` is always ``null``: codex encrypts the spawn ``message``,
-    so the task text is unavailable and the router sees ``task_name``
-    plus session metadata only.
-
-    :param tool_input: ``tool_input`` from the hook payload.
-    :param harness: Requesting harness, e.g. ``"codex"``.
-    :param parent_model: Model the parent session runs on, when known.
-    :returns: JSON-serializable request body.
-    """
-    task_name = tool_input.get("task_name") or tool_input.get("agent_name")
-    fork = tool_input.get("fork")
-    return {
-        "harness": harness,
-        "task_name": task_name if isinstance(task_name, str) else "",
-        "prompt": None,
-        "fork": fork is True,
-        "parent_model": parent_model,
-    }
-
-
-def _main_route_subagent(argv: list[str]) -> int:
-    """
-    Route one codex ``spawn_agent`` ``PreToolUse`` payload.
-
-    Every failure path — non-spawn tool, missing advertisement,
-    unreachable router, malformed response — emits nothing, which codex
-    reads as "no opinion" and the spawn proceeds unchanged.
-
-    :param argv: Argv after the ``route-subagent`` subcommand.
-    :returns: Process exit code. Always ``0``.
-    """
-    args = _parse_args(
-        "python -m omnigent.inner.hook_scripts.codex_router_hook route-subagent",
-        argv,
-        harness=True,
-    )
-    payload = _read_payload()
-    if payload is None:
-        return 0
-    output = route_pre_tool_use(
-        payload,
-        router_dir=args.bridge_dir,
-        session_id=args.session_id,
-        harness=args.harness,
-        parent_model=args.parent_model,
-    )
-    if output is not None:
-        sys.stdout.write(json.dumps(output))
-    return 0
-
-
-def route_pre_tool_use(
-    payload: dict[str, Any],  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
-    *,
-    router_dir: str | Path,
-    session_id: str | None = None,
-    harness: str = DEFAULT_HARNESS,
-    parent_model: str | None = None,
-    timeout: float = REQUEST_TIMEOUT_S,
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook output JSON
-    """
-    Route one codex ``PreToolUse`` payload end to end.
-
-    :param payload: Codex ``PreToolUse`` hook payload.
-    :param router_dir: Bridge directory holding the router advertisement.
-    :param session_id: Session baked into the hook command; the
-        advertisement wins when it carries one.
-    :param harness: Requesting harness, e.g. ``"codex-native"``.
-    :param parent_model: Model the parent session runs on, when known.
-    :param timeout: Socket timeout in seconds.
-    :returns: Hook output, or ``None`` for "no opinion".
-    """
-    if not is_spawn_agent_tool(payload.get("tool_name")):
-        return None
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return None
-    endpoint = read_router_endpoint(router_dir)
-    if endpoint is None:
-        return None
-    resolved = endpoint.session_id or session_id or resolve_session_id(endpoint)
-    if not resolved:
-        return None
-    body = build_route_request(
-        tool_input,
-        harness=harness,
-        parent_model=parent_model or _payload_model(payload),
-    )
-    decision = request_decision(endpoint, resolved, body, timeout=timeout)
-    if decision is None:
-        return None
-    # The encrypted ``message`` rides along in *tool_input* untouched.
-    return with_system_message(decision_to_hook_output(decision, tool_input))
-
-
 def with_system_message(
     output: dict[str, Any] | None,  # type: ignore[explicit-any]  # hook output JSON
 ) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook output JSON
@@ -229,10 +101,9 @@ def with_system_message(
 
     A rewrite is otherwise invisible: codex reports no model change of its
     own, so the top-level ``systemMessage`` (alongside, not inside,
-    ``hookSpecificOutput``) is the only place the decision shows up. Same
-    wording as ucode's codex routing (databricks/ucode PR 251).
+    ``hookSpecificOutput``) is the only place the decision shows up.
 
-    :param output: Hook output from :func:`decision_to_hook_output`, or
+    :param output: Hook output from ``decision_to_hook_output``, or
         ``None`` for "no opinion".
     :returns: *output* with a ``systemMessage`` when it rewrote the spawn's
         model, otherwise *output* unchanged.
@@ -248,7 +119,7 @@ def with_system_message(
     model = updated_input.get("model")
     if not isinstance(model, str) or not model:
         return output
-    return {**output, "systemMessage": f"Using Intelligent Routing. Routing to {model}."}
+    return {**output, "systemMessage": f"Using Smart Routing. Routing to {model}."}
 
 
 def _payload_model(payload: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
@@ -260,6 +131,19 @@ def _payload_model(payload: dict[str, Any]) -> str | None:  # type: ignore[expli
     """
     model = payload.get("model")
     return model if isinstance(model, str) and model else None
+
+
+#: How codex differs from the claude-native default: its own spawn-tool
+#: name, its task-name keys, no prompt (codex encrypts the spawn message),
+#: catalog ids injected verbatim, and the TUI routing notice.
+ROUTE_SEAMS: dict[str, Any] = {  # type: ignore[explicit-any]  # route_pre_tool_use seams
+    "tool_matcher": is_spawn_agent_tool,
+    "task_keys": ("task_name", "agent_name"),
+    "include_prompt": False,
+    "parent_model_resolver": _payload_model,
+    "model_translator_factory": None,
+    "post_process": with_system_message,
+}
 
 
 def canary_path(bridge_dir: str | Path) -> Path:
@@ -289,9 +173,11 @@ def _main_session_canary(argv: list[str]) -> int:
     :param argv: Argv after the ``session-canary`` subcommand.
     :returns: Process exit code. Always ``0``.
     """
-    args = _parse_args(
-        "python -m omnigent.inner.hook_scripts.codex_router_hook session-canary", argv
-    )
+    command = "session-canary"
+    args = parse_hook_args(_prog(command), argv)
+    if not args.bridge_dir:
+        print(f"{_LABEL}: {command} needs --bridge-dir", file=sys.stderr)
+        return 0
     path = canary_path(args.bridge_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,7 +186,7 @@ def _main_session_canary(argv: list[str]) -> int:
             encoding="utf-8",
         )
     except OSError as exc:
-        print(f"omnigent codex router hook: could not write canary: {exc}", file=sys.stderr)
+        print(f"{_LABEL}: could not write canary: {exc}", file=sys.stderr)
     return 0
 
 
@@ -311,10 +197,12 @@ def _main_record_subagent(argv: list[str]) -> int:
     :param argv: Argv after the ``record-subagent`` subcommand.
     :returns: Process exit code. Always ``0``.
     """
-    args = _parse_args(
-        "python -m omnigent.inner.hook_scripts.codex_router_hook record-subagent", argv
-    )
-    payload = _read_payload()
+    command = "record-subagent"
+    args = parse_hook_args(_prog(command), argv)
+    if not args.bridge_dir:
+        print(f"{_LABEL}: {command} needs --bridge-dir", file=sys.stderr)
+        return 0
+    payload = read_stdin_payload(_LABEL)
     if payload is None:
         return 0
     record = {
@@ -329,7 +217,7 @@ def _main_record_subagent(argv: list[str]) -> int:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
     except OSError as exc:
-        print(f"omnigent codex router hook: could not write audit record: {exc}", file=sys.stderr)
+        print(f"{_LABEL}: could not write audit record: {exc}", file=sys.stderr)
     return 0
 
 

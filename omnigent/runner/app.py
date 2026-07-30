@@ -9786,26 +9786,18 @@ async def _ensure_session_subagent_router(
         ``None`` (in-process tests) skips the start.
     """
     from omnigent.runner.subagent_routing import (
-        ensure_session_router,
+        ensure_session_router_quietly,
         router_dir_for_session,
     )
 
-    if server_client is None or is_native_harness(harness):
+    if is_native_harness(harness):
         return
-    try:
-        ensure_session_router(
-            session_id,
-            bridge_dir=router_dir_for_session(session_id),
-            server_client=server_client,
-        )
-    except OSError:
-        _logger.warning(
-            "subagent router could not start for session=%s harness=%s",
-            session_id,
-            harness,
-            exc_info=True,
-        )
-        return
+    ensure_session_router_quietly(
+        session_id,
+        bridge_dir=router_dir_for_session(session_id),
+        server_client=server_client,
+        harness=harness,
+    )
 
 
 def _build_spawn_env_from_spec(

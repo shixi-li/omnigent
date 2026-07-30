@@ -310,7 +310,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     applied: item.applied,
     rationale: typeof item.rationale === "string" ? item.rationale : "",
     ...(item.agent !== undefined && { agent: item.agent }),
-    ...routingExtrasFromWire(item as unknown as Record<string, unknown>),
+    routing: routingExtrasFromWire(item as unknown as Record<string, unknown>),
   };
 }
 

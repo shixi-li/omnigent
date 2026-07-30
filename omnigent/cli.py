@@ -106,39 +106,33 @@ def _parse_model_prefixes(
 
 def _parse_scenario_menus(
     raw: Any,  # type: ignore[explicit-any]  # parsed YAML block
-    router_name: str,
 ) -> Any | None:  # type: ignore[explicit-any]  # nested menu mapping | None
-    """Normalize a ``routing.scenario_menus`` override into the nested form.
+    """Normalize a ``routing.scenario_menus`` override.
 
-    Accepts either the nested shape keyed by router version
-    (``{task_v1: {codex: [...]}}``) or the flat shape
-    (``{codex: [...]}``), which is scoped to *router_name*.
+    Keyed by router version, since a router is frozen per version:
+    ``{task_v1: {codex: [arm, ...]}}``.
 
     :param raw: The parsed ``scenario_menus`` value.
-    :param router_name: Router the flat shape applies to.
     :returns: ``{router: {scenario: (arm, ...)}}``, or ``None`` when unset or
         unusable (the built-in menus stay in place).
     """
-
-    def _scenarios(block: Any) -> dict[str, tuple[str, ...]]:  # type: ignore[explicit-any]
-        out: dict[str, tuple[str, ...]] = {}
-        if not isinstance(block, dict):
-            return out
-        for scenario, arms in block.items():
-            if isinstance(scenario, str) and isinstance(arms, list):
-                out[scenario] = tuple(a for a in arms if isinstance(a, str) and a)
-        return out
-
     if not isinstance(raw, dict) or not raw:
         return None
-    if any(isinstance(v, dict) for v in raw.values()):
-        nested = {k: _scenarios(v) for k, v in raw.items() if isinstance(k, str)}
-        return {k: v for k, v in nested.items() if v} or None
-    flat = _scenarios(raw)
-    return {router_name: flat} if flat else None
+    nested: dict[str, dict[str, tuple[str, ...]]] = {}
+    for router, block in raw.items():
+        if not isinstance(router, str) or not isinstance(block, dict):
+            continue
+        scenarios = {
+            scenario: tuple(a for a in arms if isinstance(a, str) and a)
+            for scenario, arms in block.items()
+            if isinstance(scenario, str) and isinstance(arms, list)
+        }
+        if scenarios:
+            nested[router] = scenarios
+    return nested or None
 
 
-def _parse_routing_settings(
+def parse_routing_settings(
     routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
 ) -> Any:  # type: ignore[explicit-any]  # RoutingSettings
     """Parse the ``routing:`` block into the shared ``RoutingSettings``.
@@ -157,7 +151,7 @@ def _parse_routing_settings(
         return RoutingSettings()
     router_name = (routing_cfg.get("router_name") or "").strip() or DEFAULT_ROUTER_NAME
     selection_model = (routing_cfg.get("selection_model") or "").strip() or None
-    menus = _parse_scenario_menus(routing_cfg.get("scenario_menus"), router_name) or TASK_V1_MENUS
+    menus = _parse_scenario_menus(routing_cfg.get("scenario_menus")) or TASK_V1_MENUS
     fail_mode = "closed" if routing_cfg.get("subagent_fail_mode") == "closed" else "open"
     try:
         cache_ttl = float(routing_cfg.get("subagent_cache_ttl_s", 300.0))
@@ -167,6 +161,7 @@ def _parse_routing_settings(
         router_name=router_name,
         selection_model=selection_model,
         scenario_menus=menus,
+        model_prefixes=tuple(_parse_model_prefixes(routing_cfg.get("model_prefix"))),
         subagent_fail_mode=fail_mode,
         subagent_cache_ttl_s=cache_ttl,
     )
@@ -218,7 +213,7 @@ def _build_default_databricks_routing_client(
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
     """Route through the workspace's AI Gateway when no ``routing:`` block exists.
 
-    A Databricks-backed deployment gets intelligent routing without extra
+    A Databricks-backed deployment gets smart routing without extra
     config: the client points at that workspace's routing API and authenticates
     with the same profile. Returns ``None`` for any other deployment, so the
     built-in judge stays the fallback.
@@ -238,7 +233,7 @@ def _build_default_databricks_routing_client(
     except Exception:  # noqa: BLE001 — unresolvable workspace just means no routing
         logging.getLogger(__name__).info(
             "routing: could not resolve workspace host for Databricks profile %r; "
-            "leaving intelligent routing off",
+            "leaving smart routing off",
             profile,
         )
         return None
@@ -274,17 +269,17 @@ def _build_external_routing_client(
     :param routing_cfg: The parsed ``routing:`` mapping (a dict with
         ``provider == "external"``, per the caller).
     :param settings: The parsed routing settings, supplying the extraction
-        model and scenario menus. ``None`` uses the built-in defaults.
+        model, scenario menus, and model prefixes. ``None`` parses them from
+        *routing_cfg*.
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
     if settings is None:
-        settings = _parse_routing_settings(routing_cfg)
+        settings = parse_routing_settings(routing_cfg)
     base_url = (routing_cfg.get("base_url") or "").strip()
     router_name = (routing_cfg.get("router_name") or "").strip()
     api_key = (routing_cfg.get("api_key") or "").strip()
     profile = (routing_cfg.get("profile") or "").strip()
-    model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
 
     if not base_url or not router_name:
         click.echo(
@@ -316,7 +311,7 @@ def _build_external_routing_client(
         router_name=router_name,
         auth=auth,
         databricks_profile=databricks_profile,
-        model_prefixes=model_prefixes,
+        model_prefixes=list(settings.model_prefixes),
         selection_model=settings.selection_model,
         scenario_menus=settings.scenario_menus,
     )
@@ -3577,7 +3572,7 @@ def server(
     # its own workspace AI Gateway; other deployments fall back to the judge.
     # Managed deployments override RuntimeCaps.routing_client themselves.
     routing_cfg = cfg.get("routing")
-    routing_settings = _parse_routing_settings(routing_cfg)
+    routing_settings = parse_routing_settings(routing_cfg)
     if isinstance(routing_cfg, dict):
         provider = routing_cfg.get("provider")
         if provider == "external":

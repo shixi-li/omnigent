@@ -1066,7 +1066,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
       ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
-      ...routingExtrasFromWire(rec),
+      routing: routingExtrasFromWire(rec),
       itemId,
       responseId,
     } satisfies RoutingDecision;

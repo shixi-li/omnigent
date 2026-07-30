@@ -413,7 +413,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
-        codex_cli_version: tuple[int, int, int] | None = None
+        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1412,6 +1412,12 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     launched_sandbox = launch_captured["spec"].os_env.sandbox
     assert launched_sandbox is not None and launched_sandbox.type == "none"
     assert launch_captured["parent_os_env"] is codex_os_env
+
+    # This fake app-server reports no codex version (an unparseable / failed
+    # probe). The hook-trust bypass flag must be omitted: an older binary
+    # exits immediately on the unknown flag, killing the terminal.
+    assert app_server.codex_cli_version is None
+    assert "--dangerously-bypass-hook-trust" not in launch_captured["spec"].args
 
 
 @pytest.mark.asyncio

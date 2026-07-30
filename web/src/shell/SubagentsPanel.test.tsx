@@ -1470,7 +1470,6 @@ describe("SubagentsPanel", () => {
           id: "conv_routed",
           tool: "researcher",
           routed_model: "databricks-claude-sonnet-5",
-          routing_decision_id: "dec_1",
         }),
         childInfo({ id: "conv_plain", tool: "researcher" }),
       ],

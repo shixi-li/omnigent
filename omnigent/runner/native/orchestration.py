@@ -438,25 +438,15 @@ def _start_subagent_router_for_native_session(
     :returns: The advertisement directory to point hooks at, or ``None``
         when the endpoint could not start.
     """
-    from omnigent.runner.subagent_routing import ensure_session_router
+    from omnigent.runner.subagent_routing import ensure_session_router_quietly
 
-    if server_client is None:
-        return None
-    try:
-        ensure_session_router(
-            session_id,
-            bridge_dir=bridge_dir,
-            server_client=server_client,
-        )
-    except OSError:
-        _logger.warning(
-            "subagent router could not start for session=%s harness=%s",
-            session_id,
-            harness,
-            exc_info=True,
-        )
-        return None
-    return bridge_dir
+    router = ensure_session_router_quietly(
+        session_id,
+        bridge_dir=bridge_dir,
+        server_client=server_client,
+        harness=harness,
+    )
+    return bridge_dir if router is not None else None
 
 
 def _required_runner_env(name: str) -> str:
@@ -3797,11 +3787,12 @@ async def _auto_create_codex_terminal(
                     # Omnigent provisions the private CODEX_HOME and vets
                     # hook sources itself; skip the interactive trust prompt
                     # that headless sub-agents can never answer.
-                    # Gated on version: the flag was added in 0.140.0; on
-                    # older binaries it causes an immediate exit error.
+                    # Gated on _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION; a version
+                    # we could not parse counts as too old, so a failed probe
+                    # leaves the prompt in place instead of a dead terminal.
                     bypass_hook_trust=(
-                        app_server.codex_cli_version is None
-                        or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                        app_server.codex_cli_version is not None
+                        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
                     ),
                 ),
                 env=codex_terminal_env(app_server),

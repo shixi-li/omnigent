@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.claude_model_vocabulary import claude_model_alias
 from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
 
 
@@ -105,16 +106,14 @@ def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.Mo
     ],
 )
 def test_agent_tool_model_translation(model: str, expected: str | None) -> None:
-    assert subagent_router.claude_agent_tool_model(model, env={}) == expected
+    assert claude_model_alias(model, {}) == expected
 
 
 def test_agent_tool_model_prefers_workspace_alias_pinning() -> None:
     # The workspace pins "sonnet" to a model whose own name says otherwise;
     # the env mapping is authoritative over the name heuristic.
     env = {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-mystery-9"}
-    assert subagent_router.claude_agent_tool_model("databricks-claude-mystery-9", env=env) == (
-        "sonnet"
-    )
+    assert claude_model_alias("databricks-claude-mystery-9", env) == "sonnet"
 
 
 def test_untranslatable_model_allows_spawn_unchanged(

@@ -1199,9 +1199,9 @@ def register_hooks_routes(
             omits ``harness``.
         """
         from omnigent.runner.subagent_routing import (
-            AUTO_HARNESS_LABEL_KEY,
             SubagentRouteDecision,
             SubagentRouteRequest,
+            auto_harness_session,
             resolve_subagent_route,
             store_persister,
             subagent_routing_enabled,
@@ -1261,9 +1261,7 @@ def register_hooks_routes(
         # Only a session started in auto-harness mode may be moved across
         # harness families; everyone else is offered their own family, so a
         # Claude Code session never gets a Codex suggestion.
-        cross_harness = conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1" or (
-            parent is not None and parent.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
-        )
+        cross_harness = auto_harness_session(conv, parent)
         # Offer the live catalog: the static table lags model generations, and
         # a pick the workspace serves must not look unservable and get
         # substituted down a tier.

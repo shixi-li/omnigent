@@ -158,18 +158,6 @@ export interface RoutingDecisionItem extends BaseItem {
   rationale: string;
   /** Sub-agent name when mirrored into the parent session; undefined otherwise. */
   agent?: string;
-  // Additive routing-identity fields, snake_case as stored by the server.
-  // Absent on rows written before intelligent routing grew them.
-  /** Harness the decision routes to, e.g. `"codex-native"`. */
-  harness?: string | null;
-  /** Decision scope, e.g. `"native_subagent"`. */
-  scope?: string | null;
-  /** Server-side decision identity. */
-  decision_id?: string | null;
-  /** Router-vocabulary pick before catalog resolution. */
-  raw_model?: string | null;
-  /** LLM-supplied model the router overrode. */
-  attempted_override?: string | null;
 }
 
 export type ConversationItem =

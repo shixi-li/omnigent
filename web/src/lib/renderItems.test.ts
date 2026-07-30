@@ -1409,7 +1409,7 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
       model: "databricks-claude-opus-4-8",
       applied: true,
       rationale: "hard turn",
-      ...(scope !== undefined ? { scope } : {}),
+      ...(scope !== undefined ? { routing: { scope } } : {}),
     };
   }
   function userBlock(itemId: string, responseId: string): AnyBlock {

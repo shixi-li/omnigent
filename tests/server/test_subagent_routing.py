@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.entities.conversation import RoutingDecisionData
+from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
     NO_SIGNAL_RATIONALE_PREFIX,
@@ -23,24 +24,23 @@ from omnigent.runner.subagent_routing import (
     clear_cache,
     decision_record,
     ensure_session_router,
+    ensure_session_router_quietly,
     harness_family,
     make_server_relay_resolver,
     model_in_family,
     persist_subagent_decision,
-    read_advertisement,
     relayed_decisions,
     resolve_subagent_route,
     routed_models,
     router_dir_for_session,
     routing_enabled,
-    session_picks,
     session_router_env,
     shutdown_session_router,
     start_subagent_router,
     subagent_routing_enabled,
     write_advertisement,
 )
-from omnigent.server.smart_routing import RoutingResult
+from omnigent.server.smart_routing import RoutingResult, RoutingSettings
 
 CLAUDE_MODEL = "databricks-claude-opus-4-8"
 GPT_MODEL = "databricks-gpt-5-5"
@@ -74,12 +74,6 @@ class _FakeRoutingClient:
         if self._error is not None:
             raise self._error
         return self._result
-
-
-@dataclass
-class _FakeSettings:
-    subagent_fail_mode: str = "open"
-    subagent_cache_ttl_s: float = 300.0
 
 
 @dataclass
@@ -152,21 +146,24 @@ def test_candidate_models_ignores_an_empty_catalog() -> None:
     assert CLAUDE_MODEL in candidates["claude-native"]
 
 
-def test_candidate_models_keeps_codex_compatible_catalog_models() -> None:
-    """A codex catalog's GLM/Kimi rows survive the in-family constraint.
+def test_candidate_models_applies_the_family_constraint_to_catalog_rows() -> None:
+    """A codex ``"self"`` row keeps GLM/Kimi and loses the Claude ids.
 
-    Those endpoints serve on the Responses wire codex speaks, so dropping
-    them would hide runnable models the dispatch gate accepts.
+    The gateway behind a codex session serves Claude ids too, so the row
+    carries models codex cannot speak; offering one earns a hard
+    ``model_family_mismatch`` at dispatch. GLM and Kimi serve on the
+    Responses wire codex does speak, so they must survive.
     """
     catalog = {"self": [GPT_MODEL, GLM_MODEL, KIMI_MODEL, CLAUDE_MODEL]}
     candidates = candidate_models("codex-native", catalog=catalog)
-    assert candidates == {"codex-native": [GPT_MODEL, GLM_MODEL, KIMI_MODEL, CLAUDE_MODEL]}
-    # The family constraint the routing paths apply keeps GLM/Kimi on codex
-    # and still rejects them on Claude.
+    assert candidates == {"codex-native": [GPT_MODEL, GLM_MODEL, KIMI_MODEL]}
     assert model_in_family(harness_family("codex-native"), GLM_MODEL) is True
-    assert model_in_family(harness_family("codex-native"), KIMI_MODEL) is True
     assert model_in_family(harness_family("claude-native"), GLM_MODEL) is False
-    assert model_in_family(harness_family("claude-native"), KIMI_MODEL) is False
+
+
+def test_candidate_models_drops_a_harness_with_nothing_servable() -> None:
+    catalog = {"self": [CLAUDE_MODEL]}
+    assert candidate_models("codex-native", catalog=catalog) == {}
 
 
 def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
@@ -190,9 +187,34 @@ async def test_same_family_pick_rewrites() -> None:
     assert decision.action == "rewrite"
     assert decision.model == CLAUDE_MODEL
     assert decision.harness is None
-    assert decision.raw_model == CLAUDE_MODEL
+    assert decision.raw_model is None
     assert decision.rationale == "deep reasoning"
     assert len(decision.decision_id) == 36
+
+
+@pytest.mark.asyncio
+async def test_raw_model_is_omitted_when_it_matches_the_resolved_model() -> None:
+    client = _FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="r", raw_model=CLAUDE_MODEL)
+    )
+    decision = await resolve_subagent_route(
+        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+    )
+    assert decision.model == CLAUDE_MODEL
+    assert decision.raw_model is None
+
+
+@pytest.mark.asyncio
+async def test_raw_model_is_preserved_when_the_router_named_another_arm() -> None:
+    client = _FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="r", raw_model="claude-opus-4-8-thinking")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+    )
+    assert decision.model == CLAUDE_MODEL
+    assert decision.raw_model == "claude-opus-4-8-thinking"
+    assert decision_record(_request(), decision).raw_model == "claude-opus-4-8-thinking"
 
 
 @pytest.mark.asyncio
@@ -252,6 +274,8 @@ async def test_pick_outside_candidate_set_denies() -> None:
     assert decision.action == "deny"
     assert decision.model is None
     assert "cannot run" in decision.rationale
+    # The deny message still names the pick it rejected.
+    assert decision.raw_model == "databricks-kimi-k2"
 
 
 @pytest.mark.asyncio
@@ -349,7 +373,7 @@ async def test_router_outage_fails_closed_when_configured() -> None:
     client = _FakeRoutingClient(error=RuntimeError("router down"))
     caps = _FakeCaps(
         routing_client=client,
-        routing_settings=_FakeSettings(subagent_fail_mode="closed"),
+        routing_settings=RoutingSettings(subagent_fail_mode="closed"),
     )
     decision = await resolve_subagent_route("conv_1", _request(), caps=caps)
     assert decision.action == "deny"
@@ -367,7 +391,7 @@ async def test_no_verdict_surfaces_last_error() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_routing_client_uses_fail_mode() -> None:
-    caps = _FakeCaps(routing_settings=_FakeSettings(subagent_fail_mode="closed"))
+    caps = _FakeCaps(routing_settings=RoutingSettings(subagent_fail_mode="closed"))
     decision = await resolve_subagent_route("conv_1", _request(), caps=caps)
     assert decision.action == "deny"
 
@@ -385,9 +409,6 @@ async def test_identical_spawns_hit_cache_once() -> None:
     second = await resolve_subagent_route("conv_1", _request(), caps=caps)
     assert len(client.calls) == 1
     assert second.decision_id == first.decision_id
-    picks = session_picks("conv_1")
-    assert len(picks) == 1
-    assert picks[0]["model"] == CLAUDE_MODEL
 
 
 @pytest.mark.asyncio
@@ -396,7 +417,7 @@ async def test_cache_expires_after_ttl() -> None:
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
     caps = _FakeCaps(
-        routing_client=client, routing_settings=_FakeSettings(subagent_cache_ttl_s=5.0)
+        routing_client=client, routing_settings=RoutingSettings(subagent_cache_ttl_s=5.0)
     )
     await resolve_subagent_route("conv_1", _request(), caps=caps, now=1000.0)
     await resolve_subagent_route("conv_1", _request(), caps=caps, now=1006.0)
@@ -447,7 +468,9 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
     data = records[0].model_dump()
     assert data["scope"] == "native_subagent"
     assert data["decision_id"] == decision.decision_id
-    assert data["raw_model"] == CLAUDE_MODEL
+    # The router named the model it resolved to, so there is no raw pick to
+    # report separately.
+    assert data["raw_model"] is None
     assert data["model"] == CLAUDE_MODEL
     assert data["harness"] == "claude-native"
     assert data["applied"] is True
@@ -464,7 +487,7 @@ async def test_deny_is_persisted_unapplied() -> None:
 
     caps = _FakeCaps(
         routing_client=client,
-        routing_settings=_FakeSettings(subagent_fail_mode="closed"),
+        routing_settings=RoutingSettings(subagent_fail_mode="closed"),
     )
     await resolve_subagent_route("conv_1", _request(), caps=caps, persist=_persist)
     assert records[0].applied is False
@@ -525,11 +548,9 @@ async def test_persist_failure_does_not_break_the_decision() -> None:
 def test_advertisement_roundtrip(tmp_path: Path) -> None:
     path = write_advertisement(tmp_path, url="http://127.0.0.1:1234", token="tok")
     assert path.name == ADVERTISEMENT_FILE
-    assert read_advertisement(tmp_path) == {"url": "http://127.0.0.1:1234", "token": "tok"}
-
-
-def test_read_advertisement_missing(tmp_path: Path) -> None:
-    assert read_advertisement(tmp_path) is None
+    endpoint = read_router_endpoint(tmp_path)
+    assert endpoint is not None
+    assert (endpoint.url, endpoint.token) == ("http://127.0.0.1:1234", "tok")
 
 
 def _post(url: str, body: dict[str, Any], token: str | None) -> tuple[int, dict[str, Any]]:
@@ -567,9 +588,9 @@ async def test_loopback_endpoint_serves_decisions_and_checks_token(tmp_path: Pat
         loop=asyncio.get_running_loop(),
     )
     try:
-        advertised = read_advertisement(tmp_path)
+        advertised = read_router_endpoint(tmp_path)
         assert advertised is not None
-        url = f"{advertised['url']}/v1/sessions/conv_1/route-subagent"
+        url = f"{advertised.url}/v1/sessions/conv_1/route-subagent"
         body = {
             "harness": "claude-native",
             "task_name": "code-reviewer",
@@ -578,7 +599,7 @@ async def test_loopback_endpoint_serves_decisions_and_checks_token(tmp_path: Pat
             "parent_model": PARENT_MODEL,
         }
 
-        status, payload = await asyncio.to_thread(_post, url, body, advertised["token"])
+        status, payload = await asyncio.to_thread(_post, url, body, advertised.token)
         assert status == 200
         assert payload == canned.to_payload()
         assert seen[0].task_name == "code-reviewer"
@@ -591,13 +612,13 @@ async def test_loopback_endpoint_serves_decisions_and_checks_token(tmp_path: Pat
 
         status, _ = await asyncio.to_thread(
             _post,
-            f"{advertised['url']}/v1/sessions/other/route-subagent",
+            f"{advertised.url}/v1/sessions/other/route-subagent",
             body,
-            advertised["token"],
+            advertised.token,
         )
         assert status == 404
 
-        status, _ = await asyncio.to_thread(_post, url, {"task_name": "x"}, advertised["token"])
+        status, _ = await asyncio.to_thread(_post, url, {"task_name": "x"}, advertised.token)
         assert status == 400
     finally:
         router.close()
@@ -666,13 +687,13 @@ async def test_loopback_endpoint_applies_fail_mode_when_resolver_errors(tmp_path
         fail_mode="closed",
     )
     try:
-        advertised = read_advertisement(tmp_path)
+        advertised = read_router_endpoint(tmp_path)
         assert advertised is not None
         status, payload = await asyncio.to_thread(
             _post,
-            f"{advertised['url']}/v1/sessions/conv_1/route-subagent",
+            f"{advertised.url}/v1/sessions/conv_1/route-subagent",
             {"harness": "claude-native"},
-            advertised["token"],
+            advertised.token,
         )
         assert status == 200
         assert payload["action"] == "deny"
@@ -751,7 +772,7 @@ def test_ensure_session_router_is_idempotent_and_advertises_everywhere(
         )
         assert again is router
         # Same rendezvous advertised in both directories.
-        assert read_advertisement(first_dir) == read_advertisement(second_dir)
+        assert read_router_endpoint(first_dir) == read_router_endpoint(second_dir)
         env = session_router_env("conv_lifecycle")
         assert env["OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"] == "conv_lifecycle"
         assert env["OMNIGENT_CODEX_SUBAGENT_ROUTER_DIR"] == str(first_dir)
@@ -759,6 +780,61 @@ def test_ensure_session_router_is_idempotent_and_advertises_everywhere(
         assert session_router_env("conv_lifecycle") == {}
 
     asyncio.run(_run())
+
+
+def test_ensure_session_router_quietly_skips_without_a_server_client(tmp_path: Path) -> None:
+    assert (
+        ensure_session_router_quietly(
+            "conv_no_client",
+            bridge_dir=tmp_path,
+            server_client=None,
+        )
+        is None
+    )
+    assert not (tmp_path / ADVERTISEMENT_FILE).exists()
+
+
+def test_ensure_session_router_quietly_passes_the_configured_fail_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import subagent_routing as module
+
+    seen: list[str] = []
+
+    def _fake_ensure(session_id: str, **kwargs: Any) -> None:
+        seen.append(kwargs["fail_mode"])
+
+    monkeypatch.setattr(module, "ensure_session_router", _fake_ensure)
+    ensure_session_router_quietly(
+        "conv_fail_closed",
+        bridge_dir=tmp_path,
+        server_client=object(),  # type: ignore[arg-type]
+        caps=_FakeCaps(routing_settings=RoutingSettings(subagent_fail_mode="closed")),
+    )
+    assert seen == ["closed"]
+
+
+def test_ensure_session_router_quietly_swallows_a_bind_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import subagent_routing as module
+
+    def _boom(session_id: str, **kwargs: Any) -> None:
+        raise OSError("address in use")
+
+    monkeypatch.setattr(module, "ensure_session_router", _boom)
+    assert (
+        ensure_session_router_quietly(
+            "conv_bind_fail",
+            bridge_dir=tmp_path,
+            server_client=object(),  # type: ignore[arg-type]
+            harness="codex-native",
+            caps=_FakeCaps(),
+        )
+        is None
+    )
 
 
 def test_relayed_decisions_start_empty() -> None:

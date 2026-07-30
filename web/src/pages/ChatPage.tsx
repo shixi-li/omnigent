@@ -75,7 +75,7 @@ import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
   BRAIN_HARNESS_LABELS,
-  INTELLIGENT_ROUTING_LABEL,
+  SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
@@ -176,6 +176,7 @@ import {
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
+  RoutingModelSelect,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -3052,11 +3053,7 @@ export const BubbleView = memo(
           applied={bubble.applied}
           rationale={bubble.rationale}
           agent={bubble.agent}
-          harness={bubble.harness}
-          scope={bubble.scope}
-          decisionId={bubble.decisionId}
-          rawModel={bubble.rawModel}
-          attemptedOverride={bubble.attemptedOverride}
+          routing={bubble.routing}
         />
       );
     }
@@ -5648,7 +5645,7 @@ function SessionConfigModal({
           Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
           {costRoutingEligible && !showModels && (
             <ConfigRow
-              label={INTELLIGENT_ROUTING_LABEL}
+              label={SMART_ROUTING_LABEL}
               description="Auto-pick the model per turn by task"
             >
               <div className="flex h-8 items-center justify-end">
@@ -5656,7 +5653,7 @@ function SessionConfigModal({
                   size="sm"
                   checked={draftRoutingOn}
                   data-testid="composer-config-smart-routing"
-                  aria-label={INTELLIGENT_ROUTING_LABEL}
+                  aria-label={SMART_ROUTING_LABEL}
                   onCheckedChange={(next) => {
                     setDraftRoutingOn(next);
                     // Routing picks the model + effort per turn, so an explicit
@@ -5669,31 +5666,14 @@ function SessionConfigModal({
           )}
           {showModels && (
             <ConfigRow label="Model" description="Underlying LLM">
-              <Select value={modelValue} onValueChange={onModelChange}>
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-model"
-                  aria-label="Model"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {costRoutingEligible && (
-                    <SelectItem value={MODEL_SELECT_SMART}>{INTELLIGENT_ROUTING_LABEL}</SelectItem>
-                  )}
-                  <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-                  {modelSelectOptions.map((m) => (
-                    <SelectItem
-                      key={m.id}
-                      value={m.id}
-                      data-model-id={m.id}
-                      data-active={draftModelId === m.id ? "true" : undefined}
-                    >
-                      {m.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <RoutingModelSelect
+                value={modelValue}
+                onValueChange={onModelChange}
+                offerSmartRouting={costRoutingEligible}
+                testId="composer-config-model"
+                models={modelSelectOptions}
+                activeModelId={draftModelId}
+              />
             </ConfigRow>
           )}
           {showEffort && (
@@ -5758,7 +5738,7 @@ function SessionConfigModal({
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
                   <SelectItem value="on" data-subagent-routing="on">
-                    {INTELLIGENT_ROUTING_LABEL}
+                    {SMART_ROUTING_LABEL}
                   </SelectItem>
                   <SelectItem value="off" data-subagent-routing="off">
                     Default
@@ -5931,7 +5911,7 @@ function useSessionConfigSummary({
   if (showModels) {
     rows.push({
       label: "Model",
-      value: routingOn ? INTELLIGENT_ROUTING_LABEL : (modelLabel ?? "Default"),
+      value: routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default"),
     });
   }
   // Suppress Effort while routing is on: the router picks the model and its
@@ -5943,7 +5923,7 @@ function useSessionConfigSummary({
   // Routable agents with no Model row surface routing as a standalone row;
   // those with a Model dropdown fold it into Model above (shown as the value).
   if (costRoutingEligible && !showModels && routingOn) {
-    rows.push({ label: INTELLIGENT_ROUTING_LABEL, value: "On" });
+    rows.push({ label: SMART_ROUTING_LABEL, value: "On" });
   }
   return rows;
 }
@@ -6079,14 +6059,14 @@ function ComposerModelEffortLabel({
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
   // Routing picks the model + effort per turn, so the label reads
-  // "Intelligent Routing" with no pinned model/effort — matching the tooltip.
+  // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
     return (
       <span
         data-testid="composer-model-effort-label"
         className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
       >
-        <span className="text-foreground">{INTELLIGENT_ROUTING_LABEL}</span>
+        <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
       </span>
     );
   }

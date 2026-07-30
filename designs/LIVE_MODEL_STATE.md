@@ -139,6 +139,30 @@ Secondary gaps:
   `thread/settings/update`, so the running thread converges on the routed
   model on the very first turn.)
 
+## pi harness: which models it cannot serve, and why
+
+`_HARNESS_EXCLUDED_MODELS["pi"]` in `omnigent/server/smart_routing.py` names the
+(harness, model) pairs corrected AFTER the router verdict. They are deliberately
+NOT pruned from the candidate set: the router requires its full scenario menu
+and 400s on a partial one, so the full set must be offered and an incompatible
+pick moved to a harness that can run it (`_redirect_incompatible_pick`).
+
+The pi harness reaches Databricks two incompatible ways for these families:
+
+- **Claude models** ride pi's Anthropic Messages gateway, whose request path
+  adds an `eager_input_streaming` field the serving endpoint rejects with a 400
+  when tools are present.
+- **The gpt-5.5 / gpt-5.6 reasoning models** ride pi's openai-completions path
+  (`/chat/completions`); Databricks applies a default `reasoning_effort` there
+  and rejects tool calls with "Function tools with reasoning_effort are not
+  supported for gpt-5.5 … use /v1/responses or set reasoning_effort to 'none'."
+  pi's provider cannot send that override, so tool turns 400.
+
+Where each excluded pick lands instead: `claude-sdk` serves Claude, and `codex`
+serves gpt-5.5+ over the Responses API. The gpt-5.4 family works on pi and is
+left alone. `databricks-gpt-5-6-terra` stays on the pi exclusion list (a real
+serving incompatibility) even though it is not one of the router's arms.
+
 ## Design
 
 Priority order per the goal:

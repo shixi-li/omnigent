@@ -71,7 +71,6 @@ MODEL_LISTS: dict[str, list[str]] = {
 _CURRENT_GENERATION_MODELS: dict[str, tuple[str, ...]] = {
     "gpt": (
         "databricks-gpt-5-6-luna",
-        "databricks-gpt-5-6-terra",
         "databricks-gpt-5-6-sol",
     ),
 }
@@ -194,6 +193,10 @@ class RoutingResult:
 
 class RoutingClient(Protocol):
     """Protocol for pluggable model routing implementations."""
+
+    #: Human-readable reason the most recent :meth:`route` returned ``None``,
+    #: or ``None``. Read it via :func:`routing_last_error`.
+    last_error: str | None
 
     async def route(
         self,
@@ -349,6 +352,8 @@ class LLMRoutingClient:
 
     def __init__(self, llm_client: Any) -> None:  # type: ignore[explicit-any]
         self._llm = llm_client
+        # Reason the most recent route() returned None; see RoutingClient.
+        self.last_error: str | None = None
 
     async def route(
         self,
@@ -358,6 +363,7 @@ class LLMRoutingClient:
         flat = _flatten_models(available_models)
         rubric = _build_rubric(available_models)
         _logger.info("LLMRoutingClient: available_models=%s", dict(available_models))
+        self.last_error = None
         try:
             response = await self._llm.create(
                 instructions=rubric,
@@ -379,13 +385,15 @@ class LLMRoutingClient:
             text = response.output[0].content[0].text
             _logger.info("LLMRoutingClient: raw response: %s", text[:500])
             verdict = json.loads(text)
-        except Exception:  # noqa: BLE001  # fail-open
+        except Exception as exc:  # noqa: BLE001  # fail-open
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
+            self.last_error = f"routing judge call failed: {exc}"
             return None
 
         model = verdict.get("model")
         rationale = verdict.get("rationale", "")
         if not model or not isinstance(model, str):
+            self.last_error = "routing judge returned no model"
             return None
 
         # Clamp hallucinated models to the cheapest available.
@@ -398,6 +406,7 @@ class LLMRoutingClient:
                 )
                 model = flat[0]
             else:
+                self.last_error = "no candidate models were available"
                 return None
 
         # Resolve the harness: use the judge's pick only when it is both a
@@ -545,6 +554,10 @@ class RoutingSettings:
         extraction call, sent as ``route_selector.config.model``. ``None``
         leaves the router's frozen default in place.
     :param scenario_menus: Router version → scenario → required arm menu.
+    :param model_prefixes: Prefixes this deployment's catalog attaches to
+        model ids that the router keys bare, e.g. ``("databricks-",)``. The
+        first match is stripped on the way out and restored on the answer;
+        empty sends catalog ids verbatim.
     :param subagent_fail_mode: What a native-subagent spawn does when the
         router is unreachable — ``"open"`` allows it unchanged, ``"closed"``
         denies it so the determinism guarantee can't silently lapse.
@@ -555,6 +568,7 @@ class RoutingSettings:
     router_name: str = DEFAULT_ROUTER_NAME
     selection_model: str | None = None
     scenario_menus: Mapping[str, Mapping[str, tuple[str, ...]]] = TASK_V1_MENUS
+    model_prefixes: tuple[str, ...] = ()
     subagent_fail_mode: Literal["open", "closed"] = "open"
     subagent_cache_ttl_s: float = 300.0
 
@@ -616,30 +630,16 @@ class RouteOptionSource(Protocol):
 # ``databricks-gpt-5-5`` and the bare ``gpt-5-5`` the router speaks.
 _BARE_ID_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 
-# Router arms whose family the shared token rule cannot derive from the id.
-# glm-5-2 stays pinned as a belt-and-braces anchor for the current menu.
-_ARM_FAMILY: dict[str, str] = {"glm-5-2": "gpt"}
-
 # Harness family that serves several vendors and so never wins family matching
 # outright — only used when no single-vendor harness fits.
 _MULTI_MODEL_FAMILY = "pi"
 
 # Per-harness (harness, model) incompatibilities corrected AFTER the router
-# verdict. These models are NOT pruned from the candidate set: the router
-# requires its full scenario menu and 400s on a partial one, so the full set
-# must be offered and an incompatible pick moved to a harness that can run it.
-#
-# The pi harness reaches Databricks two incompatible ways for these families:
-#   - Claude models ride pi's Anthropic Messages gateway, whose request path
-#     adds an ``eager_input_streaming`` field the serving endpoint rejects with
-#     a 400 when tools are present.
-#   - The gpt-5.5 / gpt-5.6 reasoning models ride pi's openai-completions path
-#     (``/chat/completions``); Databricks applies a default ``reasoning_effort``
-#     there and rejects tool calls with "Function tools with reasoning_effort
-#     are not supported for gpt-5.5 ... use /v1/responses or set reasoning_effort
-#     to 'none'." pi's provider can't send that override, so tool turns 400.
-# claude-sdk serves Claude and codex serves gpt-5.5+ (Responses API); the
-# gpt-5.4 family works on pi and is left alone.
+# verdict, never pruned from the candidate set (the router 400s on a partial
+# menu). On pi, Claude models 400 on its Anthropic gateway's
+# ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models 400 on its
+# openai-completions path's default ``reasoning_effort``. See
+# designs/LIVE_MODEL_STATE.md.
 _HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
     "pi": (
         "databricks-claude-haiku-4-5",
@@ -670,9 +670,6 @@ def _model_family(model: str) -> str:
     from omnigent.model_catalog import model_family_token
 
     bare = _bare_id(model).lower()
-    known = _ARM_FAMILY.get(bare)
-    if known is not None:
-        return known
     token = model_family_token(bare)
     return "gpt" if token == "openai" else token
 
@@ -769,21 +766,16 @@ class TaskV1RouteOptionSource:
         *,
         router_name: str = DEFAULT_ROUTER_NAME,
         scenario_menus: Mapping[str, Mapping[str, tuple[str, ...]]] = TASK_V1_MENUS,
-        arm_tiers: Mapping[str, Mapping[str, str]] = TASK_V1_ARM_TIERS,
         model_prefixes: Sequence[str] = (),
     ) -> None:
         """
         :param router_name: Router strategy name; selects the menu set.
         :param scenario_menus: Router version → scenario → required arms.
-        :param arm_tiers: Router version → arm → tier, used when an arm has no
-            local endpoint (see :data:`TASK_V1_ARM_TIERS`). Arms missing from
-            the mapping are treated as capable-tier.
         :param model_prefixes: Catalog prefixes to strip on the way out and
             restore on the way back, e.g. ``["databricks-", "system.ai."]``.
         """
         self._router_name = router_name
         self._menus = scenario_menus
-        self._arm_tiers = arm_tiers
         self._model_prefixes = tuple(model_prefixes)
 
     def to_router_id(self, model: str) -> str:
@@ -976,18 +968,41 @@ class TaskV1RouteOptionSource:
 
     def _arm_tier(self, arm: str) -> str:
         """Return the tier of *arm*, defaulting unknown arms to capable."""
-        tiers = self._arm_tiers.get(self._router_name, {})
+        tiers = TASK_V1_ARM_TIERS.get(self._router_name, {})
         return tiers.get(arm, ARM_TIER_CAPABLE)
 
 
-def _routing_settings() -> RoutingSettings:
-    """Read :class:`RoutingSettings` off the runtime caps, defaulted."""
-    try:
-        from omnigent.runtime._globals import _caps
-    except ImportError:
-        return RoutingSettings()
-    settings = getattr(_caps, "routing_settings", None) if _caps is not None else None
+def routing_settings(caps: Any = None) -> RoutingSettings:  # type: ignore[explicit-any]
+    """Read this deployment's :class:`RoutingSettings`, defaulted.
+
+    The single accessor for routing knobs: every consumer reads the value
+    object off the caps instead of re-parsing config.
+
+    :param caps: A :class:`~omnigent.runtime.caps.RuntimeCaps` (or structural
+        equivalent) to read from. ``None`` reads the process-global caps.
+    :returns: The configured settings, or all-defaults when none are set.
+    """
+    if caps is None:
+        try:
+            from omnigent.runtime._globals import _caps
+        except ImportError:
+            return RoutingSettings()
+        caps = _caps
+    settings = getattr(caps, "routing_settings", None) if caps is not None else None
     return settings if isinstance(settings, RoutingSettings) else RoutingSettings()
+
+
+def routing_last_error(client: Any) -> str | None:  # type: ignore[explicit-any]
+    """Read the reason *client*'s last :meth:`route` call returned ``None``.
+
+    Defensive: a custom :class:`RoutingClient` may predate the protocol's
+    ``last_error`` field, and an empty string is no reason at all.
+
+    :param client: A routing client, or ``None``.
+    :returns: The non-empty reason string, or ``None``.
+    """
+    detail = getattr(client, "last_error", None)
+    return detail if isinstance(detail, str) and detail else None
 
 
 def route_option_source(
@@ -998,14 +1013,15 @@ def route_option_source(
     """Build the route-options source for this deployment.
 
     :param settings: Routing settings; read off the runtime caps when omitted.
-    :param model_prefixes: Catalog prefixes the router does not expect.
+    :param model_prefixes: Catalog prefixes the router does not expect;
+        defaults to the settings' own ``model_prefixes`` when empty.
     :returns: The configured :class:`RouteOptionSource`.
     """
-    resolved = settings or _routing_settings()
+    resolved = settings or routing_settings()
     return TaskV1RouteOptionSource(
         router_name=resolved.router_name,
         scenario_menus=resolved.scenario_menus,
-        model_prefixes=model_prefixes,
+        model_prefixes=tuple(model_prefixes) or resolved.model_prefixes,
     )
 
 
@@ -1196,8 +1212,6 @@ class ExternalRoutingClient:
         if not selected.model:
             self.last_error = "router returned an empty model"
             return None
-        # The seam maps the pick back to a servable catalog id and derives the
-        # harness from the arm's family (the echoed tag is untrusted).
         resolved = self._source.resolve_selection(
             RoutePick(model=selected.model, harness=selected.harness or None),
             harnesses,
@@ -1314,10 +1328,10 @@ async def route_session_harness(
     try:
         from omnigent.runtime._globals import _caps
     except ImportError:
-        return None, None, None, "Intelligent routing is not available."
+        return None, None, None, "Smart routing is not available."
 
     if _caps is None or _caps.routing_client is None:
-        return None, None, None, "Intelligent routing is not configured on this server."
+        return None, None, None, "Smart routing is not configured on this server."
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
     # names + "self"), so normalize those to harness ids before matching
@@ -1388,7 +1402,7 @@ async def route_session_harness(
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
-        detail = getattr(_caps.routing_client, "last_error", None)
+        detail = routing_last_error(_caps.routing_client)
         reason = (
             f"Routing unavailable: {detail}"
             if detail
@@ -1396,8 +1410,6 @@ async def route_session_harness(
         )
         return None, None, None, reason
 
-    # The seam owns harness derivation (the router's echoed harness is
-    # untrusted) and moves a pick off a harness that can't serve it.
     resolved = route_option_source().resolve_selection(
         RoutePick(model=result.model, harness=result.harness),
         list(harness_models),

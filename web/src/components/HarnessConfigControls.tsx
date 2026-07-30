@@ -8,6 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
 // so the two "no explicit model" choices ride on reserved tokens rather than
@@ -20,6 +21,78 @@ export const EFFORT_SELECT_NONE = "__none__";
 // Shown in the frozen Effort row when the router picks the model per turn, so
 // no effort can apply. Rendered as the Select's placeholder (value "").
 export const EFFORT_UNAVAILABLE_PLACEHOLDER = "—";
+
+/** One entry in the Model row's harness-model list. */
+export interface RoutingModelOption {
+  id: string;
+  label: string;
+}
+
+/**
+ * The Model row's Select: the Smart Routing sentinel (when offered), the
+ * harness's own "Default", then the harness's models. Shared by the landing
+ * dialog and the in-session composer so the sentinels and their copy can't
+ * drift across the three places the row appears.
+ *
+ * @param value Selected value — a model id or one of the sentinels.
+ * @param onValueChange Selection callback.
+ * @param offerSmartRouting Whether to list the Smart Routing sentinel. False on
+ *   harnesses/sessions the router can't route.
+ * @param testId Trigger test id.
+ * @param ariaLabel Accessible name for the trigger (the visible ConfigRow label
+ *   is visual-only, so pass it here to name the control for AT).
+ * @param models Harness models, listed after "Default". Empty when the harness
+ *   resolves its own catalog and only the two sentinels are expressible.
+ * @param activeModelId Model marked `data-active` in the list, when any.
+ * @param contentClassName Extra classes for the dropdown popup.
+ * @param children Rendered below the model list, e.g. a loading/empty note.
+ */
+export function RoutingModelSelect({
+  value,
+  onValueChange,
+  offerSmartRouting,
+  testId,
+  ariaLabel = "Model",
+  models,
+  activeModelId,
+  contentClassName,
+  children,
+}: {
+  value: string;
+  onValueChange: (value: string) => void;
+  offerSmartRouting: boolean;
+  testId: string;
+  ariaLabel?: string;
+  models?: readonly RoutingModelOption[];
+  activeModelId?: string | null;
+  contentClassName?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <Select value={value} onValueChange={onValueChange}>
+      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent position="popper" align="start" className={contentClassName}>
+        {offerSmartRouting && (
+          <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
+        )}
+        <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+        {(models ?? []).map((m) => (
+          <SelectItem
+            key={m.id}
+            value={m.id}
+            data-model-id={m.id}
+            data-active={activeModelId === m.id ? "true" : undefined}
+          >
+            {m.label}
+          </SelectItem>
+        ))}
+        {children}
+      </SelectContent>
+    </Select>
+  );
+}
 
 // Claude-native reasoning-effort options for the new-session / scheduled-task
 // model+effort pickers. There is deliberately no hardcoded effort default: an

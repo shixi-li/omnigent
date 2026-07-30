@@ -6,8 +6,6 @@
 // routing is advisory rather than enforced for that harness.
 
 import { AlertTriangleIcon } from "lucide-react";
-import { useMemo } from "react";
-import { useSession } from "@/hooks/useSession";
 import type { SessionWarning } from "@/lib/types";
 
 /** Warning code for "a harness ran without the router hook enforcing picks". */
@@ -28,23 +26,6 @@ export function renderableWarnings(
   warnings: SessionWarning[] | null | undefined,
 ): SessionWarning[] {
   return (warnings ?? []).filter((warning) => RENDERED_CODES.has(warning.code));
-}
-
-/**
- * Live session warnings for a conversation, read off the session snapshot
- * (`GET /v1/sessions/{id}`, shared cache with `chatStore.bindStream`).
- *
- * The server does not publish `warnings` yet — until P7 wires the canary
- * event into the session-status channel this returns an empty list and the
- * banner stays hidden.
- *
- * @param conversationId - Session to read, or `null` to disable.
- * @returns Renderable warnings for that session.
- */
-export function useSessionWarnings(conversationId: string | null | undefined): SessionWarning[] {
-  const { session } = useSession(conversationId ?? null);
-  const warnings = session?.warnings;
-  return useMemo(() => renderableWarnings(warnings), [warnings]);
 }
 
 /** One line of copy per warning code: headline + optional detail. */

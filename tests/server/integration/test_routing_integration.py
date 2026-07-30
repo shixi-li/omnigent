@@ -627,6 +627,40 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
     assert set(routing_client.offered[1]) == {"claude-native", "codex-native"}
 
 
+async def test_unlabelled_auto_sentinel_still_allows_cross_harness_picks(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The ``auto`` sentinel alone is enough, with no auto-harness label.
+
+    The label and the sentinel are written by different create paths, so the
+    endpoint must read both through ``auto_harness_session`` — otherwise a
+    session carrying only the sentinel is silently pinned to one family.
+    """
+    session_id = await _session_with_routing_flags(
+        client,
+        agent_name="routing-auto-sentinel",
+        subagent_routing="on",
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.update_conversation(session_id, harness_override="auto")
+    assert conv is not None
+    assert conv.harness_override == "auto"
+    assert AUTO_HARNESS_LABEL_KEY not in (conv.labels or {})
+
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert resp.status_code == 200, resp.text
+    assert set(routing_client.offered[0]) == {"claude-native", "codex-native"}
+    assert resp.json()["action"] == "redirect"
+
+
 # ── 7. Omnigent child sessions stay in the parent's family ─────────
 
 

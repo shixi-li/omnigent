@@ -8045,7 +8045,11 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import fetch_runner_models, infer_models
+    from omnigent.server.smart_routing import (
+        _WORKER_NAME_TO_HARNESS,
+        fetch_runner_models,
+        infer_models,
+    )
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
@@ -8078,12 +8082,6 @@ async def _handle_advise_models_mcp(
                     "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
                 )
 
-    _WORKER_HARNESS: dict[str, str] = {
-        "claude_code": "claude-sdk",
-        "codex": "codex",
-        "pi": "pi",
-    }
-
     def _resolve_harness_for_worker(agent: str) -> str | None:
         if spec is not None:
             sub_agents = getattr(spec, "sub_agents", None) or []
@@ -8093,7 +8091,7 @@ async def _handle_advise_models_mcp(
                     if h:
                         return h
                     break
-        return _WORKER_HARNESS.get(agent)
+        return _WORKER_NAME_TO_HARNESS.get(agent)
 
     recommendations: list[dict[str, Any]] = []
     for task in tasks:

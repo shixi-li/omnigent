@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner import subagent_routing
 from omnigent.runner.app import _ensure_session_subagent_router
 from omnigent.runner.native.orchestration import _start_subagent_router_for_native_session
@@ -38,7 +39,7 @@ def test_native_launch_installs_the_router_for_an_unrouted_session(tmp_path: Pat
         # No session flag consulted: the hooks are installed either way and
         # the server decides per spawn.
         assert advertised == tmp_path
-        assert subagent_routing.read_advertisement(tmp_path) is not None
+        assert read_router_endpoint(tmp_path) is not None
 
     asyncio.run(_run())
 

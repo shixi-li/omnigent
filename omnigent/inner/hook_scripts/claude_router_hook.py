@@ -12,23 +12,13 @@ emits nothing and Claude proceeds unchanged.
 
 from __future__ import annotations
 
-import argparse
-import json
 import sys
 
-from omnigent.inner.hook_scripts.subagent_router import route_pre_tool_use
+from omnigent.inner.hook_scripts.subagent_router import run_route_subagent_main
 
 _HARNESS = "claude-native"
-
-
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="omnigent-claude-router-hook")
-    parser.add_argument("--bridge-dir", default=None)
-    # Advertisement directory, when it isn't the bridge dir itself.
-    parser.add_argument("--router-dir", default=None)
-    parser.add_argument("--parent-model", default=None)
-    args, _unknown = parser.parse_known_args(argv)
-    return args
+_LABEL = "omnigent claude router hook"
+_PROG = "omnigent-claude-router-hook"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,25 +29,12 @@ def main(argv: list[str] | None = None) -> int:
         ``None`` uses :data:`sys.argv`.
     :returns: Always ``0`` so a routing failure never blocks a spawn.
     """
-    args = _parse_args(list(sys.argv[1:] if argv is None else argv))
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError as exc:
-        print(f"omnigent claude router hook: malformed JSON: {exc}", file=sys.stderr)
-        return 0
-    if not isinstance(payload, dict):
-        print("omnigent claude router hook: expected JSON object", file=sys.stderr)
-        return 0
-    output = route_pre_tool_use(
-        payload,
+    return run_route_subagent_main(
+        list(sys.argv[1:] if argv is None else argv),
+        prog=_PROG,
         harness=_HARNESS,
-        router_dir=args.router_dir or args.bridge_dir,
-        bridge_dir=args.bridge_dir,
-        parent_model=args.parent_model,
+        label=_LABEL,
     )
-    if output is not None:
-        sys.stdout.write(json.dumps(output))
-    return 0
 
 
 if __name__ == "__main__":

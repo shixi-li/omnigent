@@ -661,7 +661,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         applied: event.applied,
         rationale: event.rationale,
         ...(event.agent !== undefined && { agent: event.agent }),
-        ...routingExtras(event),
+        routing: routingExtras(event.routing),
       } satisfies RoutingDecisionBlock;
       return;
     }

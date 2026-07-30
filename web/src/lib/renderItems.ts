@@ -155,14 +155,16 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string }
   | { kind: "compaction"; itemId: string }
-  | ({
+  | {
       kind: "routing_decision";
       itemId: string;
       model: string;
       applied: boolean;
       rationale: string;
       agent?: string;
-    } & RoutingDecisionExtras);
+      /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+      routing?: RoutingDecisionExtras;
+    };
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
 const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "reasoning_block"]);
@@ -380,7 +382,8 @@ function chipPendingBeforeRegion(blocks: AnyBlock[], startBlock: number): boolea
   while (k >= 0 && isChipPairingSkippable(blocks[k]!)) k -= 1;
   if (k < 0) return false;
   const chip = blocks[k]!;
-  if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.scope)) return false;
+  if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope))
+    return false;
   for (let j = k + 1; j < blocks.length; j += 1) {
     const b = blocks[j]!;
     if (!isChipPairingSkippable(b) && b.type !== "user_message") return false;
@@ -597,7 +600,7 @@ function routingChipBubble(b: RoutingDecisionBlock, index: number): Bubble {
     applied: b.applied,
     rationale: b.rationale,
     ...(b.agent !== undefined && { agent: b.agent }),
-    ...routingExtras(b),
+    routing: routingExtras(b.routing),
   };
 }
 
@@ -630,7 +633,7 @@ function deferredRoutingChips(
   const indexes = new Set<number>();
   for (let j = startIndex; j < blocks.length; j += 1) {
     const chip = blocks[j]!;
-    if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.scope)) continue;
+    if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) continue;
     // Already below its message — leave it where it is.
     if (adjacent(blocks, j, -1)?.type === "user_message") continue;
     const next = adjacent(blocks, j, 1);

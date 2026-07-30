@@ -173,18 +173,19 @@ def discover_databricks_claude_catalog(
 ) -> DatabricksClaudeCatalog:
     """Discover every Claude endpoint a Databricks workspace serves.
 
-    Same sources and precedence as
-    :func:`discover_databricks_claude_models`, which is this function's
-    family half.
+    Unity Catalog model services are authoritative when they expose Claude
+    models. The Anthropic AI Gateway model-list endpoint is the compatibility
+    fallback for workspaces that have not moved to model services yet.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
-    :returns: The workspace's Claude catalog. Empty ``families`` with
-        empty ``model_ids`` is authoritative (see
-        :func:`discover_databricks_claude_models`).
-    :raises httpx.HTTPError: Same contract as the family lookup.
-    :raises ValueError: Same contract as the family lookup.
+    :returns: The workspace's Claude catalog. Empty ``families`` with empty
+        ``model_ids`` is authoritative: at least one endpoint answered
+        successfully and no Claude models are exposed.
+    :raises httpx.HTTPError: When the primary listing fails and the fallback
+        cannot compensate (it fails too, or exposes no Claude models).
+    :raises ValueError: Same contract for malformed responses.
     """
     headers = {"Authorization": f"Bearer {token}"}
     primary_error: Exception | None = None
@@ -221,56 +222,3 @@ def discover_databricks_claude_catalog(
         families=gateway_models,
         model_ids=_all_claude_models(gateway_ids, marker="databricks-claude-"),
     )
-
-
-def discover_databricks_claude_models(
-    workspace_url: str,
-    token: str,
-    *,
-    transport: httpx.BaseTransport | None = None,
-) -> dict[str, str]:
-    """Discover the live Claude family mapping for a Databricks workspace.
-
-    Unity Catalog model services are authoritative when they expose Claude
-    models. The Anthropic AI Gateway model-list endpoint is the compatibility
-    fallback for workspaces that have not moved to model services yet.
-
-    :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
-    :param token: Workspace bearer token.
-    :param transport: Optional HTTP transport used by tests.
-    :returns: Family aliases mapped to routable model ids. An empty mapping is
-        authoritative: at least one endpoint answered successfully and no
-        Claude models are exposed.
-    :raises httpx.HTTPError: When the primary listing fails and the fallback
-        cannot compensate (it fails too, or exposes no Claude models).
-    :raises ValueError: Same contract for malformed responses.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    primary_error: Exception | None = None
-    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        try:
-            model_service_ids = _list_model_service_ids(client, workspace_url, headers)
-        except (httpx.HTTPError, ValueError) as exc:
-            primary_error = exc
-        else:
-            models = _models_by_claude_family(model_service_ids, marker="claude-")
-            if models:
-                return models
-
-        try:
-            gateway_ids = _list_anthropic_gateway_ids(client, workspace_url, headers)
-        except (httpx.HTTPError, ValueError) as exc:
-            if primary_error is not None:
-                raise exc from primary_error
-            # A successful permission-aware UC listing is authoritative even
-            # when the compatibility endpoint is not enabled.
-            return {}
-    gateway_models = _models_by_claude_family(gateway_ids, marker="databricks-claude-")
-    if not gateway_models and primary_error is not None:
-        # The gateway answered but routes no Claude models, and the primary
-        # listing failed — an empty result here is NOT authoritative (e.g. a
-        # transient UC 503 plus an unused legacy gateway). Surface the primary
-        # failure so callers fall back to cached models instead of treating
-        # the workspace as having none.
-        raise primary_error
-    return gateway_models

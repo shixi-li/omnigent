@@ -44,9 +44,7 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
-    codex_hook_trust_bypass_args,
     codex_router_bridge_dir,
-    codex_router_hooks_generated,
     codex_router_hooks_settings,
     codex_router_session_id,
 )
@@ -97,9 +95,9 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
-# Added in openai/codex PR #21768, shipped in rust-v0.131.0 (2026-05-18).
-# Below this the flag is unknown and codex exits immediately with an error,
-# so we skip it and fall back to the old behaviour (trust prompt may appear).
+# Older binaries exit immediately on the unknown flag, so below this floor
+# (including a version we could not parse) the flag is omitted and the
+# interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 
 
@@ -682,23 +680,8 @@ class CodexNativeAppServer:
             f"{Path(self.codex_path).name} "
             f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
         )
-        # Codex silently skips hooks it does not trust, which for the
-        # subagent-routing gate is a fail-open. The bypass flag covers the
-        # interactive / exec paths; app-server threads honor persisted trust
-        # only, so it is belt-and-braces on top of the trust handshake run
-        # after readiness (see _trust_session_hooks).
-        trust_args = codex_hook_trust_bypass_args(self.codex_home, codex_version)
-        _logger.info(
-            "codex hook trust: bypass flag %s (generated hooks=%s, codex=%s, minimum=%s); "
-            "app-server hooks additionally rely on the persisted-trust handshake",
-            "applied" if trust_args else "skipped",
-            codex_router_hooks_generated(self.codex_home),
-            _format_codex_version(codex_version) if codex_version else "unknown",
-            _format_codex_version(_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION),
-        )
         argv = [
             tagged_argv0,
-            *trust_args,
             "app-server",
             "--listen",
             resolved_listen,
@@ -1291,15 +1274,19 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
     """
     Trust the generated subagent-routing hooks so codex runs them.
 
+    Codex skips untrusted hooks without a word, which for the routing gate
+    is a fail-open, and app-server threads honor persisted trust only (the
+    ``--dangerously-bypass-hook-trust`` flag covers the interactive /
+    ``exec`` paths, not this one), so the handshake is the only way in.
+
     The routing gate (``PreToolUse`` on the spawn tool), the
     ``SessionStart`` canary and the ``SubagentStart`` audit live in the
     same generated ``hooks.json`` as the policy hook but under a different
-    module, so the policy trust pass leaves them ``untrusted`` — and codex
-    skips untrusted hooks without a word, which for the routing gate is a
-    fail-open. Same ``hooks/list`` → ``config/batchWrite`` flow, but
-    best-effort: a routing-trust failure must not disable policy
-    enforcement, so it is reported instead of raised (the canary watcher
-    then surfaces the session warning).
+    module, so the policy trust pass leaves them ``untrusted``. Same
+    ``hooks/list`` → ``config/batchWrite`` flow, but best-effort: a
+    routing-trust failure must not disable policy enforcement, so it is
+    reported instead of raised (the canary watcher then surfaces the
+    session warning).
 
     :param request: Bound app-server JSON-RPC request coroutine, e.g.
         ``client.request`` (or the SDK executor's ``_request``).

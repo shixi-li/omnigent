@@ -202,9 +202,11 @@ export function slashCommandEchoItemId(slashItemId: string): string {
  * server keeps the matching `routing_decision` item out of the model's
  * history.
  */
-export interface RoutingDecisionBlock extends RoutingDecisionExtras {
+export interface RoutingDecisionBlock {
   type: "routing_decision";
   ctx: BlockContext;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */

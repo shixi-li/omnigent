@@ -18,10 +18,8 @@ from omnigent.inner.codex_executor import (
     SUBAGENT_ROUTING_UNENFORCED_WARNING,
     _CodexAppServerSession,
     _populate_codex_home_config,
-    codex_hook_trust_bypass_args,
     codex_router_bridge_dir,
     codex_router_canary_fired,
-    codex_router_hooks_generated,
     codex_router_hooks_settings,
     codex_router_session_id,
     merge_codex_user_hooks,
@@ -167,49 +165,6 @@ def test_write_router_hooks_file_without_user_hooks(tmp_path: Path) -> None:
     assert len(payload["hooks"]["PreToolUse"]) == 1
 
 
-def test_router_hooks_generated_detection(tmp_path: Path) -> None:
-    source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
-    codex_home = tmp_path / "private"
-    codex_home.mkdir()
-    assert not codex_router_hooks_generated(codex_home)
-
-    _populate_codex_home_config(codex_home, source)
-    assert not codex_router_hooks_generated(codex_home)
-
-    write_codex_router_hooks_file(
-        codex_home, tmp_path / "bridge", python_executable="/usr/bin/python3"
-    )
-    assert codex_router_hooks_generated(codex_home)
-
-
-def test_hook_trust_bypass_args_requires_generated_hooks(tmp_path: Path) -> None:
-    codex_home = tmp_path / "private"
-    codex_home.mkdir()
-
-    assert codex_hook_trust_bypass_args(codex_home, (0, 145, 0)) == []
-
-    write_codex_router_hooks_file(
-        codex_home, tmp_path / "bridge", python_executable="/usr/bin/python3"
-    )
-    assert codex_hook_trust_bypass_args(codex_home, (0, 145, 0)) == [
-        "--dangerously-bypass-hook-trust"
-    ]
-
-
-def test_hook_trust_bypass_args_version_gated(tmp_path: Path) -> None:
-    codex_home = tmp_path / "private"
-    codex_home.mkdir()
-    write_codex_router_hooks_file(
-        codex_home, tmp_path / "bridge", python_executable="/usr/bin/python3"
-    )
-
-    assert codex_hook_trust_bypass_args(codex_home, (0, 130, 9)) == []
-    assert codex_hook_trust_bypass_args(codex_home, (0, 131, 0)) == [
-        "--dangerously-bypass-hook-trust"
-    ]
-    assert codex_hook_trust_bypass_args(codex_home, None) == []
-
-
 def test_router_env_discovery(tmp_path: Path) -> None:
     env = {
         CODEX_ROUTER_DIR_ENV_VAR: str(tmp_path),
@@ -261,7 +216,6 @@ def _start_app_server(
     monkeypatch: pytest.MonkeyPatch,
     *,
     env: dict[str, str],
-    version: tuple[int, int, int] | None,
 ) -> tuple[tuple[str, ...], _HooksSnapshot]:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     workspace = tmp_path / "work"
@@ -275,12 +229,8 @@ def _start_app_server(
         captured.append((argv, _HooksSnapshot(home / "hooks.json")))
         raise RuntimeError("stop")
 
-    async def fake_version(codex_path: str) -> tuple[int, int, int] | None:
-        return version
-
     monkeypatch.setattr(codex_executor, "populate_codex_skills_from_bundle", lambda *a, **k: None)
     monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source)
-    monkeypatch.setattr(codex_executor, "_codex_cli_version", fake_version)
     monkeypatch.setattr(codex_executor, "_create_subprocess_exec", fake_exec)
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
@@ -294,7 +244,7 @@ def _start_app_server(
     return captured[0]
 
 
-def test_app_server_argv_bypasses_trust_for_generated_hooks(
+def test_app_server_argv_carries_no_hook_trust_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge = tmp_path / "bridge"
@@ -307,36 +257,20 @@ def test_app_server_argv_bypasses_trust_for_generated_hooks(
             CODEX_ROUTER_DIR_ENV_VAR: str(bridge),
             CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
         },
-        version=(0, 145, 0),
     )
 
-    assert argv[:3] == ("/bin/echo", "--dangerously-bypass-hook-trust", "app-server")
+    assert argv[:2] == ("/bin/echo", "app-server")
+    assert "--dangerously-bypass-hook-trust" not in argv
     assert hooks.payload is not None
     payload = hooks.payload
     assert len(payload["hooks"]["PreToolUse"]) == 2
     assert "--session-id conv_abc" in payload["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
 
 
-def test_app_server_argv_omits_flag_below_min_version(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    bridge = tmp_path / "bridge"
-    bridge.mkdir()
-
-    argv, _ = _start_app_server(
-        tmp_path,
-        monkeypatch,
-        env={CODEX_ROUTER_DIR_ENV_VAR: str(bridge)},
-        version=(0, 130, 0),
-    )
-
-    assert argv[:2] == ("/bin/echo", "app-server")
-
-
 def test_app_server_keeps_symlinked_hooks_when_routing_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    argv, hooks = _start_app_server(tmp_path, monkeypatch, env={}, version=(0, 145, 0))
+    argv, hooks = _start_app_server(tmp_path, monkeypatch, env={})
 
     assert argv[:2] == ("/bin/echo", "app-server")
     assert hooks.is_symlink

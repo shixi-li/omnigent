@@ -1076,67 +1076,6 @@ def codex_router_session_id(env: Mapping[str, str] | None = None) -> str | None:
     return (source.get(CODEX_ROUTER_SESSION_ID_ENV_VAR) or "").strip() or None
 
 
-def codex_router_hooks_generated(codex_home: Path) -> bool:
-    """
-    Report whether a generated (non-symlink) routing hooks file is in play.
-
-    This is the condition gating the hook-trust bypass flag on
-    omnigent-launched codex argv: only a file Omnigent itself wrote is
-    ours to vouch for.
-
-    :param codex_home: Private per-session ``CODEX_HOME``.
-    :returns: ``True`` when ``hooks.json`` is a regular file registering
-        the Omnigent routing hook.
-    """
-    path = codex_home / _CODEX_HOOKS_FILENAME
-    if path.is_symlink() or not path.is_file():
-        return False
-    try:
-        return _CODEX_ROUTER_HOOK_MODULE in path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-
-
-def codex_hook_trust_bypass_args(
-    codex_home: Path, codex_version: tuple[int, int, int] | None
-) -> list[str]:
-    """
-    Build the hook-trust bypass argv for an omnigent-launched codex.
-
-    Codex silently skips untrusted hooks, which for the routing gate is a
-    fail-open. The flag covers codex's interactive / ``exec`` paths only:
-    hooks dispatched by ``codex app-server`` threads still require persisted
-    trust (verified empirically on codex-cli 0.145.0 — an untrusted
-    ``SessionStart`` hook does not run with the flag, and does run once
-    ``hooks.state.<key>.trusted_hash`` is written). App-server launches
-    therefore also run the trust handshake; see
-    :func:`omnigent.codex_native_app_server.trust_codex_router_hooks`.
-
-    The bypass flag is applied only when the hooks file in play
-    is one Omnigent generated (never the user's own) and only on a codex
-    that knows the flag — older binaries exit immediately on an unknown
-    flag, and an unparseable version is treated as too old for the same
-    reason (the trust handshake then applies as before).
-
-    :param codex_home: Private per-session ``CODEX_HOME``.
-    :param codex_version: Parsed ``codex --version``, or ``None`` when the
-        probe failed.
-    :returns: ``["--dangerously-bypass-hook-trust"]`` or ``[]``.
-    """
-    if not codex_router_hooks_generated(codex_home):
-        return []
-    # Imported lazily: the app-server module imports this one, and the flag
-    # plus its version gate are defined there.
-    from omnigent.codex_native_app_server import (
-        _CODEX_BYPASS_HOOK_TRUST_FLAG,
-        _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
-    )
-
-    if codex_version is None or codex_version < _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION:
-        return []
-    return [_CODEX_BYPASS_HOOK_TRUST_FLAG]
-
-
 def codex_router_canary_fired(bridge_dir: Path) -> bool:
     """
     Report whether the ``SessionStart`` canary hook ran.
@@ -1837,13 +1776,7 @@ class _CodexAppServerSession:
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
         try:
-            trust_args: list[str] = []
-            if router_bridge_dir is not None:
-                trust_args = codex_hook_trust_bypass_args(
-                    self._codex_home_dir,
-                    await _codex_cli_version(self._codex_path),
-                )
-            argv = [self._codex_path, *trust_args, "app-server"]
+            argv = [self._codex_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
             self._proc = await _create_subprocess_exec(
@@ -1871,9 +1804,8 @@ class _CodexAppServerSession:
             )
             self._started = True
             if router_bridge_dir is not None:
-                # The bypass flag above only covers codex's interactive /
-                # exec paths; app-server threads run persisted-trusted hooks
-                # only, so the routing hooks need the trust handshake too.
+                # App-server threads run persisted-trusted hooks only, so the
+                # routing hooks need the trust handshake to be enforced.
                 # Imported here: the app-server module imports this one.
                 from omnigent.codex_native_app_server import trust_codex_router_hooks
 

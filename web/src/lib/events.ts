@@ -327,8 +327,10 @@ export interface SlashCommand {
  * turn start; the reducer produces a `RoutingDecisionBlock` rendered as
  * a muted chip. Display-only — never enters the model's history.
  */
-export interface RoutingDecision extends RoutingDecisionExtras {
+export interface RoutingDecision {
   type: "routing_decision";
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */

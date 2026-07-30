@@ -5,10 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.databricks_model_discovery import (
-    discover_databricks_claude_catalog,
-    discover_databricks_claude_models,
-)
+from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
 
 
 def test_model_services_are_paginated_filtered_and_version_sorted() -> None:
@@ -44,13 +41,13 @@ def test_model_services_are_paginated_filtered_and_version_sorted() -> None:
             },
         )
 
-    models = discover_databricks_claude_models(
+    families = discover_databricks_claude_catalog(
         "https://workspace.example.com/",
         "token",
         transport=httpx.MockTransport(_handler),
-    )
+    ).families
 
-    assert models == {
+    assert families == {
         "opus": "system.ai.claude-opus-4-10",
         "sonnet": "system.ai.claude-sonnet-5",
         "haiku": "system.ai.claude-haiku-4-5",
@@ -83,13 +80,13 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
             },
         )
 
-    models = discover_databricks_claude_models(
+    families = discover_databricks_claude_catalog(
         "https://workspace.example.com",
         "token",
         transport=httpx.MockTransport(_handler),
-    )
+    ).families
 
-    assert models == {
+    assert families == {
         "opus": "databricks-claude-opus-4-8",
         "sonnet": "databricks-claude-3-7-sonnet",
         "haiku": "databricks-claude-3-5-haiku",
@@ -109,11 +106,11 @@ def test_successful_empty_discovery_is_authoritative() -> None:
         return httpx.Response(200, json={"data": []})
 
     assert (
-        discover_databricks_claude_models(
+        discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),
-        )
+        ).families
         == {}
     )
 
@@ -126,11 +123,11 @@ def test_primary_failure_can_still_use_gateway_fallback() -> None:
             return httpx.Response(503)
         return httpx.Response(200, json={"data": [{"id": "databricks-claude-haiku-4-5"}]})
 
-    assert discover_databricks_claude_models(
+    assert discover_databricks_claude_catalog(
         "https://workspace.example.com",
         "token",
         transport=httpx.MockTransport(_handler),
-    ) == {"haiku": "databricks-claude-haiku-4-5"}
+    ).families == {"haiku": "databricks-claude-haiku-4-5"}
 
 
 def test_primary_failure_with_empty_gateway_raises_instead_of_empty() -> None:
@@ -147,7 +144,7 @@ def test_primary_failure_with_empty_gateway_raises_instead_of_empty() -> None:
         return httpx.Response(200, json={"data": []})
 
     with pytest.raises(httpx.HTTPStatusError):
-        discover_databricks_claude_models(
+        discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),
@@ -163,7 +160,7 @@ def test_primary_failure_with_non_claude_gateway_raises_instead_of_empty() -> No
         return httpx.Response(200, json={"data": [{"id": "databricks-gpt-5-5"}]})
 
     with pytest.raises(httpx.HTTPStatusError):
-        discover_databricks_claude_models(
+        discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),
@@ -184,13 +181,13 @@ def test_truncated_pagination_warns(caplog: pytest.LogCaptureFixture) -> None:
         )
 
     with caplog.at_level("WARNING", logger="omnigent.databricks_model_discovery"):
-        models = discover_databricks_claude_models(
+        families = discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),
-        )
+        ).families
 
-    assert models == {"opus": "system.ai.claude-opus-99"}
+    assert families == {"opus": "system.ai.claude-opus-99"}
     assert any("truncated" in record.message for record in caplog.records)
 
 
@@ -203,11 +200,11 @@ def test_successful_primary_empty_is_authoritative_when_legacy_is_unavailable() 
         return httpx.Response(404)
 
     assert (
-        discover_databricks_claude_models(
+        discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),
-        )
+        ).families
         == {}
     )
 
@@ -219,7 +216,7 @@ def test_both_discovery_endpoints_failing_raises() -> None:
         return httpx.Response(503, request=request)
 
     with pytest.raises(httpx.HTTPStatusError):
-        discover_databricks_claude_models(
+        discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),
@@ -233,7 +230,7 @@ def test_both_discovery_endpoints_malformed_raises() -> None:
         return httpx.Response(200, json=["not", "an", "object"], request=request)
 
     with pytest.raises(ValueError, match="must be an object"):
-        discover_databricks_claude_models(
+        discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
             transport=httpx.MockTransport(_handler),

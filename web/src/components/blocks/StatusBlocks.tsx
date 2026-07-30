@@ -118,12 +118,14 @@ export function CompactionMarker() {
   );
 }
 
-interface RoutingDecisionChipProps extends RoutingDecisionExtras {
+interface RoutingDecisionChipProps {
   model: string;
   applied: boolean;
   rationale: string;
-  /** Sub-agent name, used with `scope` for the sub-agent badge. */
+  /** Sub-agent name, used with `routing.scope` for the sub-agent badge. */
   agent?: string;
+  /** Routing identity (harness, scope, raw pick …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
 }
 
 /**
@@ -146,10 +148,9 @@ export function RoutingDecisionChip({
   applied,
   rationale,
   agent,
-  harness,
-  scope,
-  rawModel,
+  routing,
 }: RoutingDecisionChipProps) {
+  const { harness, scope, rawModel } = routing ?? {};
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const scopeLabel = subagentScopeLabel(scope, agent);
@@ -193,12 +194,14 @@ export function RoutingDecisionChip({
   );
 }
 
-interface RoutingDecisionCardProps extends RoutingDecisionExtras {
+interface RoutingDecisionCardProps {
   model: string;
   applied: boolean;
   rationale: string;
   /** Sub-agent name when this card is shown in the parent session. */
   agent?: string;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
 }
 
 /**
@@ -216,12 +219,9 @@ export function RoutingDecisionCard({
   applied,
   rationale,
   agent,
-  harness,
-  scope,
-  decisionId,
-  rawModel,
-  attemptedOverride,
+  routing,
 }: RoutingDecisionCardProps) {
+  const { harness, scope, decisionId, rawModel, attemptedOverride } = routing ?? {};
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const scopeLabel = subagentScopeLabel(scope, agent);

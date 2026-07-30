@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     import httpx
 
     from omnigent.entities.conversation import RoutingDecisionData
+    from omnigent.server.smart_routing import RoutingSettings
 
 from omnigent._platform import stable_user_id
 from omnigent.telemetry import record_routing_decision
@@ -58,9 +59,9 @@ ROUTE_PATH_TEMPLATE = "/v1/sessions/{session_id}/route-subagent"
 #: process is the only one holding ``RuntimeCaps.routing_client``).
 SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-subagent"
 
-#: ``RoutingSettings`` fallbacks used when caps carry no settings yet.
+#: Fail mode applied when no ``RoutingSettings`` are in reach — the runner-side
+#: relay decides locally when the server hop itself fails.
 DEFAULT_FAIL_MODE: Literal["open", "closed"] = "open"
-DEFAULT_CACHE_TTL_S = 300.0
 
 #: Conversation label carrying the routing decision behind a session's
 #: ``model_override``, so the child-sessions API can join the two without
@@ -79,10 +80,8 @@ _PROMPT_CAP = 4000
 #: Task text scored when a spawn carries no signal of its own — codex
 #: encrypts the spawn message, so an unnamed subagent has nothing to score.
 #: Routing on a fixed placeholder beats skipping the router: it lands
-#: deterministically on the task router's default (cheap) arm instead of
-#: silently inheriting the session model. The exact string matches ucode's
-#: codex routing (databricks/ucode PR 251) so both products' decisions stay
-#: comparable.
+#: deterministically on the task router's cheap arm instead of silently
+#: inheriting the session model.
 NO_SIGNAL_TASK = "Codex subagent task"
 
 #: Prefix marking a decision the router made from :data:`NO_SIGNAL_TASK`
@@ -110,7 +109,7 @@ def routing_enabled(
     parent_cost_control_mode: str | None = None,
     caps: Any = None,
 ) -> bool:
-    """Report whether intelligent routing is on for one session.
+    """Report whether smart routing is on for one session.
 
     The shared gate for main-agent routing, so "routing is on" means the
     same thing everywhere the server decides to route. Two conditions:
@@ -148,7 +147,7 @@ def subagent_routing_enabled(
     Read per spawn (not at launch) so the setting can be flipped at any
     point in a session and take effect on the next spawn. ``"on"`` /
     ``"off"`` win outright; unset inherits the session's main routing
-    state, so a session started on Intelligent Routing routes its
+    state, so a session started on Smart Routing routes its
     subagents and one started on a manual model does not.
 
     :param subagent_routing_override: The session's
@@ -280,14 +279,6 @@ class SubagentRouteDecision:
         )
 
 
-@dataclass(frozen=True)
-class _Settings:
-    """Subagent-relevant slice of ``RoutingSettings`` (§5.4)."""
-
-    fail_mode: Literal["open", "closed"] = DEFAULT_FAIL_MODE
-    cache_ttl_s: float = DEFAULT_CACHE_TTL_S
-
-
 def decision_record(
     req: SubagentRouteRequest,
     decision: SubagentRouteDecision,
@@ -323,9 +314,6 @@ class _CacheEntry:
 
 
 _cache: dict[tuple[str, str], _CacheEntry] = {}
-# Per-session pick log, shaped to populate the router's ``session_history``
-# once a shipped recipe reads it.
-_picks: dict[str, list[dict[str, Any]]] = {}
 _cache_lock = threading.Lock()
 
 
@@ -363,7 +351,6 @@ def _cached(session_id: str, key: str, now: float) -> SubagentRouteDecision | No
 def _remember(
     session_id: str,
     key: str,
-    req: SubagentRouteRequest,
     decision: SubagentRouteDecision,
     ttl_s: float,
     now: float,
@@ -372,40 +359,19 @@ def _remember(
         return
     with _cache_lock:
         _cache[(session_id, key)] = _CacheEntry(decision=decision, expires_at=now + ttl_s)
-        _picks.setdefault(session_id, []).append(
-            {
-                "task_name": req.task_name,
-                "model": decision.model,
-                "harness": decision.harness or req.harness,
-                "decision_id": decision.decision_id,
-                "at": now,
-            }
-        )
-
-
-def session_picks(session_id: str) -> tuple[dict[str, Any], ...]:
-    """Return this session's routed picks, oldest first.
-
-    :param session_id: Session/conversation identifier.
-    :returns: Pick records ``{task_name, model, harness, decision_id, at}``.
-    """
-    with _cache_lock:
-        return tuple(_picks.get(session_id, ()))
 
 
 def clear_cache(session_id: str | None = None) -> None:
-    """Drop cached decisions and picks.
+    """Drop cached decisions.
 
     :param session_id: Only this session when set, otherwise everything.
     """
     with _cache_lock:
         if session_id is None:
             _cache.clear()
-            _picks.clear()
             return
         for cache_key in [k for k in _cache if k[0] == session_id]:
             del _cache[cache_key]
-        _picks.pop(session_id, None)
 
 
 # ── Policy ─────────────────────────────────────────────────────────────────
@@ -415,16 +381,21 @@ def _opt_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _resolved_settings(caps: Any) -> _Settings:
-    """Read the §5.4 settings off *caps*, falling back to defaults."""
-    settings = getattr(caps, "routing_settings", None)
-    fail_mode = getattr(settings, "subagent_fail_mode", None)
-    if fail_mode not in ("open", "closed"):
-        fail_mode = DEFAULT_FAIL_MODE
-    ttl = getattr(settings, "subagent_cache_ttl_s", None)
-    if not isinstance(ttl, (int, float)):
-        ttl = DEFAULT_CACHE_TTL_S
-    return _Settings(fail_mode=fail_mode, cache_ttl_s=float(ttl))
+def _settings(caps: Any = None) -> RoutingSettings:
+    """Read the deployment's routing settings, defaulted.
+
+    Imported lazily: the runner starts this module on every session and the
+    server package is heavier than the loopback relay needs.
+    """
+    from omnigent.server.smart_routing import routing_settings
+
+    return routing_settings(caps)
+
+
+def _fail_mode(settings: RoutingSettings) -> Literal["open", "closed"]:
+    """Return the configured subagent fail mode, defaulted when malformed."""
+    mode = settings.subagent_fail_mode
+    return mode if mode in ("open", "closed") else DEFAULT_FAIL_MODE
 
 
 def _harness_family(harness: str) -> str | None:
@@ -526,6 +497,12 @@ def candidate_models(
         models = catalog_models_for_harness(
             catalog, candidate, allow_self=candidate == harness
         ) or infer_models(candidate)
+        # A catalog row can hold models the harness cannot speak — a codex
+        # session's ``"self"`` row lists the Claude ids its gateway also
+        # serves. Offering one earns a hard ``model_family_mismatch`` at
+        # dispatch, so drop it here instead.
+        family = harness_family(candidate)
+        models = [m for m in models if model_in_family(family, m)]
         if models:
             result[candidate] = list(models)
     return result
@@ -546,8 +523,10 @@ def _routing_task(req: SubagentRouteRequest) -> tuple[str, bool]:
     return NO_SIGNAL_TASK, True
 
 
-def _fail_mode_decision(settings: _Settings, reason: str) -> SubagentRouteDecision:
-    if settings.fail_mode == "closed":
+def _fail_mode_decision(
+    fail_mode: Literal["open", "closed"], reason: str
+) -> SubagentRouteDecision:
+    if fail_mode == "closed":
         return SubagentRouteDecision(
             action="deny",
             rationale=f"Subagent routing is required but unavailable: {reason}",
@@ -604,7 +583,7 @@ async def resolve_subagent_route(
         from omnigent.runtime import get_caps
 
         caps = get_caps()
-    settings = _resolved_settings(caps)
+    settings = _settings(caps)
     clock = time.time() if now is None else now
 
     decision = await _decide(
@@ -637,7 +616,7 @@ async def _decide(
     session_id: str,
     req: SubagentRouteRequest,
     caps: Any,
-    settings: _Settings,
+    settings: RoutingSettings,
     available_models: dict[str, list[str]] | None,
     catalog: Mapping[str, list[str]] | None,
     cross_harness: bool,
@@ -658,7 +637,7 @@ async def _decide(
 
     client = getattr(caps, "routing_client", None)
     if client is None:
-        return _fail_mode_decision(settings, "no routing client configured")
+        return _fail_mode_decision(_fail_mode(settings), "no routing client configured")
 
     candidates = (
         available_models
@@ -666,7 +645,9 @@ async def _decide(
         else candidate_models(req.harness, cross_harness=cross_harness, catalog=catalog)
     )
     if not candidates:
-        return _fail_mode_decision(settings, f"no candidate models for harness {req.harness}")
+        return _fail_mode_decision(
+            _fail_mode(settings), f"no candidate models for harness {req.harness}"
+        )
 
     try:
         result = await client.route(task, candidates)
@@ -677,13 +658,13 @@ async def _decide(
         result = None
     if result is None or not getattr(result, "model", None):
         detail = _opt_str(getattr(client, "last_error", None)) or "router returned no verdict"
-        return _fail_mode_decision(settings, detail)
+        return _fail_mode_decision(_fail_mode(settings), detail)
 
     decision = _decision_from_result(req, result, candidates)
     if placeholder:
         decision = _mark_placeholder_routed(decision)
     if decision.action != "deny":
-        _remember(session_id, key, req, decision, settings.cache_ttl_s, clock)
+        _remember(session_id, key, decision, settings.subagent_cache_ttl_s, clock)
     return decision
 
 
@@ -707,14 +688,17 @@ def _decision_from_result(
 ) -> SubagentRouteDecision:
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
-    raw_model = _opt_str(getattr(result, "raw_model", None)) or model
+    # Only report a raw pick that actually differs from the resolved model, so
+    # the telemetry field means "the router asked for something else".
+    raw = _opt_str(getattr(result, "raw_model", None))
+    raw_model = raw if raw and raw != model else None
     offered = {m for models in candidates.values() for m in models}
     if offered and model not in offered:
         # Never let an unoffered pick through: "didn't spawn" beats "wrong model".
         return SubagentRouteDecision(
             action="deny",
             rationale=f"Router picked {model}, which this harness cannot run",
-            raw_model=raw_model,
+            raw_model=raw_model or model,
         )
 
     picked_harness = _opt_str(getattr(result, "harness", None))
@@ -844,26 +828,6 @@ def write_advertisement(
     return path
 
 
-def read_advertisement(bridge_dir: Path) -> dict[str, str] | None:
-    """Read the endpoint advertisement (used by hook scripts).
-
-    :param bridge_dir: Session bridge directory.
-    :returns: ``{"url": ..., "token": ...}``, or ``None`` when the file
-        is absent or malformed.
-    """
-    try:
-        payload = json.loads((bridge_dir / ADVERTISEMENT_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    url = _opt_str(payload.get("url"))
-    token = _opt_str(payload.get("token"))
-    if url is None or token is None:
-        return None
-    return {"url": url, "token": token}
-
-
 @dataclass
 class SubagentRouter:
     """Handle for the running loopback router.
@@ -933,7 +897,6 @@ def _handler_factory(
 ) -> type[BaseHTTPRequestHandler]:
     """Build the request handler class for one session's router."""
     expected_path = ROUTE_PATH_TEMPLATE.format(session_id=session_id)
-    settings = _Settings(fail_mode=fail_mode)
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -961,7 +924,7 @@ def _handler_factory(
                 _logger.warning(
                     "route-subagent: resolver failed for session=%s", session_id, exc_info=True
                 )
-                decision = _fail_mode_decision(settings, "routing endpoint failed")
+                decision = _fail_mode_decision(fail_mode, "routing endpoint failed")
             self._send(200, decision.to_payload())
 
         def _send(self, status: int, body: dict[str, Any]) -> None:
@@ -986,9 +949,8 @@ def make_server_relay_resolver(
 ) -> Resolver:
     """Build a resolver that forwards to the server's relay route.
 
-    The policy runs server-side because only that process holds
-    ``RuntimeCaps.routing_client``. When the hop itself fails the
-    server's settings are unreachable, so *fail_mode* decides locally.
+    When the hop itself fails the server's settings are out of reach, so
+    *fail_mode* decides locally.
 
     :param server_client: Async HTTP client pointed at the AP server.
     :param fail_mode: Behavior when the server hop fails — ``"open"``
@@ -996,7 +958,6 @@ def make_server_relay_resolver(
     :param timeout_s: Per-request timeout in seconds.
     :returns: Resolver for :func:`start_subagent_router`.
     """
-    settings = _Settings(fail_mode=fail_mode)
 
     async def _resolve(session_id: str, req: SubagentRouteRequest) -> SubagentRouteDecision:
         body = {
@@ -1018,9 +979,9 @@ def make_server_relay_resolver(
             _logger.warning(
                 "route-subagent: server relay failed for session=%s", session_id, exc_info=True
             )
-            return _fail_mode_decision(settings, "routing server unreachable")
+            return _fail_mode_decision(fail_mode, "routing server unreachable")
         if not isinstance(payload, dict):
-            return _fail_mode_decision(settings, "unreadable verdict from routing server")
+            return _fail_mode_decision(fail_mode, "unreadable verdict from routing server")
         return SubagentRouteDecision.from_payload(payload)
 
     return _resolve
@@ -1096,8 +1057,7 @@ def ensure_session_router(
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Directory the advertisement is written into — the
         same directory the harness's hooks are pointed at.
-    :param server_client: Runner→server client used to relay verdicts to
-        the process holding ``RuntimeCaps.routing_client``.
+    :param server_client: Runner→server client used to relay verdicts.
     :param loop: Event loop owning the relay. ``None`` uses the running
         loop.
     :param fail_mode: Behavior when the server hop fails.
@@ -1128,6 +1088,58 @@ def ensure_session_router(
         "subagent router started: session=%s url=%s dir=%s", session_id, router.url, bridge_dir
     )
     return router
+
+
+def ensure_session_router_quietly(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    server_client: httpx.AsyncClient | None,
+    harness: str | None = None,
+    loop: asyncio.AbstractEventLoop | None = None,
+    caps: Any = None,
+) -> SubagentRouter | None:
+    """Start the session's router, or return ``None`` instead of failing.
+
+    The launch-site wrapper: a session with no server client has nowhere to
+    relay verdicts to, and a router that cannot bind a socket must not take
+    the harness launch down with it. The configured fail mode is resolved
+    here so the runner hop honours ``subagent_fail_mode: closed`` rather
+    than silently failing open.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Directory the advertisement is written into.
+    :param server_client: Runner→server client. ``None`` skips the router.
+    :param harness: Harness being launched, for the warning log only.
+    :param loop: Event loop owning the relay. ``None`` uses the running
+        loop.
+    :param caps: ``RuntimeCaps``-shaped object carrying
+        ``routing_settings``. ``None`` reads the process-global caps.
+    :returns: The running router handle, or ``None`` when it could not
+        start.
+    """
+    if server_client is None:
+        return None
+    if caps is None:
+        from omnigent.runtime import get_caps
+
+        caps = get_caps()
+    try:
+        return ensure_session_router(
+            session_id,
+            bridge_dir=bridge_dir,
+            server_client=server_client,
+            loop=loop,
+            fail_mode=_fail_mode(_settings(caps)),
+        )
+    except OSError:
+        _logger.warning(
+            "subagent router could not start for session=%s harness=%s",
+            session_id,
+            harness,
+            exc_info=True,
+        )
+        return None
 
 
 def shutdown_session_router(session_id: str) -> None:

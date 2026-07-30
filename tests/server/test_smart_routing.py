@@ -75,6 +75,20 @@ class _FakeRoutingClient:
         return self._result
 
 
+@dataclass
+class _SettingsCaps:
+    """Caps stub carrying only the routing settings."""
+
+    routing_settings: Any = None  # type: ignore[explicit-any]
+
+
+@dataclass
+class _LastError:
+    """Routing-client stub with an arbitrary ``last_error`` value."""
+
+    last_error: Any = None  # type: ignore[explicit-any]
+
+
 # ── infer_models ────────────────────────────────────────────────────
 
 
@@ -1747,14 +1761,120 @@ def test_config_supplied_menu_without_tiers_defaults_to_capable() -> None:
     assert resolved.model == "gpt-5-5"
 
 
+# ── routing_settings / routing_last_error accessors ───────────────────────
+
+
+def test_routing_settings_reads_the_caps_it_is_handed() -> None:
+    from omnigent.server.smart_routing import RoutingSettings, routing_settings
+
+    settings = RoutingSettings(router_name="task_v9")
+    assert routing_settings(_SettingsCaps(routing_settings=settings)) is settings
+
+
+def test_routing_settings_defaults_without_caps_or_settings() -> None:
+    from omnigent.server.smart_routing import RoutingSettings, routing_settings
+
+    with patch("omnigent.runtime._globals._caps", new=None):
+        assert routing_settings() == RoutingSettings()
+    assert routing_settings(_SettingsCaps(routing_settings="not-settings")) == RoutingSettings()
+
+
+def test_routing_settings_falls_back_to_the_process_globals() -> None:
+    from omnigent.server.smart_routing import RoutingSettings, routing_settings
+
+    settings = RoutingSettings(subagent_fail_mode="closed")
+    with patch("omnigent.runtime._globals._caps", new=_SettingsCaps(routing_settings=settings)):
+        assert routing_settings() is settings
+
+
+@pytest.mark.parametrize(
+    ("client", "expected"),
+    [
+        (object(), None),  # a custom client predating the protocol field
+        (_FakeRoutingClient(None), None),
+        (_LastError(None), None),
+        (_LastError(""), None),
+        (_LastError(123), None),
+        (_LastError("router returned HTTP 401"), "router returned HTTP 401"),
+    ],
+)
+def test_routing_last_error_normalizes_to_a_non_empty_string(
+    client: Any, expected: str | None
+) -> None:
+    from omnigent.server.smart_routing import routing_last_error
+
+    assert routing_last_error(client) == expected
+
+
+def test_llm_routing_client_starts_with_no_last_error() -> None:
+    assert LLMRoutingClient(_FakeLLMClient({})).last_error is None
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_records_last_error_on_fail_open() -> None:
+    class _Boom:
+        async def create(self, **kwargs: Any) -> Any:
+            raise RuntimeError("judge exploded")
+
+    client = LLMRoutingClient(_Boom())
+    assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]}) is None
+    assert client.last_error is not None
+    assert "judge exploded" in client.last_error
+
+
+# ── model_prefixes flow from RoutingSettings to the seam ───────────────────
+
+_PREFIXED_CODEX_CATALOG: dict[str, list[str]] = {
+    "codex": ["databricks-gpt-5-6-sol", "databricks-gpt-5-5-pro"]
+}
+
+
+def test_route_option_source_takes_model_prefixes_from_the_settings() -> None:
+    from omnigent.server.smart_routing import RoutePick, RoutingSettings, route_option_source
+
+    caps = _SettingsCaps(routing_settings=RoutingSettings(model_prefixes=("databricks-",)))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        resolved = route_option_source().resolve_selection(
+            RoutePick(model="gpt-5-6-sol"), ["codex"], _PREFIXED_CODEX_CATALOG
+        )
+    assert resolved is not None
+    assert resolved.model == "databricks-gpt-5-6-sol"
+
+
+def test_route_option_source_without_prefixes_cannot_match_the_catalog_id() -> None:
+    from omnigent.server.smart_routing import RoutePick, RoutingSettings, route_option_source
+
+    with patch("omnigent.runtime._globals._caps", new=_SettingsCaps(RoutingSettings())):
+        resolved = route_option_source().resolve_selection(
+            RoutePick(model="gpt-5-6-sol"), ["codex"], _PREFIXED_CODEX_CATALOG
+        )
+    # The prefixed id never matches the bare pick, so the arm substitutes.
+    assert resolved is not None
+    assert resolved.raw_model == "gpt-5-6-sol"
+    assert resolved.model == "databricks-gpt-5-5-pro"
+
+
+def test_explicit_model_prefixes_win_over_the_settings() -> None:
+    from omnigent.server.smart_routing import RoutePick, RoutingSettings, route_option_source
+
+    catalog = {"codex": ["system.ai.gpt-5-6-sol"]}
+    caps = _SettingsCaps(routing_settings=RoutingSettings(model_prefixes=("databricks-",)))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        resolved = route_option_source(model_prefixes=["system.ai."]).resolve_selection(
+            RoutePick(model="gpt-5-6-sol"), ["codex"], catalog
+        )
+    assert resolved is not None
+    assert resolved.model == "system.ai.gpt-5-6-sol"
+
+
 # ── RoutingSettings parsing (cli) ─────────────────────────────────────────
 
 
 def test_parse_routing_settings_defaults() -> None:
-    from omnigent.cli import _parse_routing_settings
+    from omnigent.cli import parse_routing_settings
     from omnigent.server.smart_routing import TASK_V1_MENUS
 
-    settings = _parse_routing_settings(None)
+    settings = parse_routing_settings(None)
     assert settings.router_name == "task_v1"
     assert settings.selection_model is None
     assert settings.scenario_menus is TASK_V1_MENUS
@@ -1763,30 +1883,39 @@ def test_parse_routing_settings_defaults() -> None:
 
 
 def test_parse_routing_settings_reads_every_key() -> None:
-    from omnigent.cli import _parse_routing_settings
+    from omnigent.cli import parse_routing_settings
 
-    settings = _parse_routing_settings(
+    settings = parse_routing_settings(
         {
             "provider": "external",
             "router_name": "task_v2",
             "selection_model": "gpt-5-4-mini",
             "subagent_fail_mode": "closed",
             "subagent_cache_ttl_s": 30,
-            "scenario_menus": {"codex": ["arm-a", "arm-b"]},
+            "model_prefix": ["databricks-", "system.ai."],
+            "scenario_menus": {"task_v2": {"codex": ["arm-a", "arm-b"]}},
         }
     )
     assert settings.router_name == "task_v2"
     assert settings.selection_model == "gpt-5-4-mini"
     assert settings.subagent_fail_mode == "closed"
     assert settings.subagent_cache_ttl_s == 30.0
-    # The flat form is scoped to the configured router version.
+    assert settings.model_prefixes == ("databricks-", "system.ai.")
     assert settings.scenario_menus == {"task_v2": {"codex": ("arm-a", "arm-b")}}
 
 
-def test_parse_routing_settings_nested_scenario_menus() -> None:
-    from omnigent.cli import _parse_routing_settings
+def test_parse_routing_settings_ignores_a_flat_scenario_menu_block() -> None:
+    from omnigent.cli import parse_routing_settings
+    from omnigent.server.smart_routing import TASK_V1_MENUS
 
-    settings = _parse_routing_settings(
+    settings = parse_routing_settings({"scenario_menus": {"codex": ["arm-a"]}})
+    assert settings.scenario_menus is TASK_V1_MENUS
+
+
+def test_parse_routing_settings_nested_scenario_menus() -> None:
+    from omnigent.cli import parse_routing_settings
+
+    settings = parse_routing_settings(
         {"scenario_menus": {"task_v1": {"cc": ["claude-opus-4-8"], "both": []}}}
     )
     assert settings.scenario_menus == {"task_v1": {"cc": ("claude-opus-4-8",), "both": ()}}
@@ -1796,7 +1925,7 @@ def test_parse_routing_settings_nested_scenario_menus() -> None:
 
 
 def test_default_on_synthesizes_client_for_databricks_provider() -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, _parse_routing_settings
+    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     cfg = {
@@ -1811,7 +1940,7 @@ def test_default_on_synthesizes_client_for_databricks_provider() -> None:
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
         return_value=creds,
     ):
-        client = _build_default_databricks_routing_client(cfg, _parse_routing_settings(None))
+        client = _build_default_databricks_routing_client(cfg, parse_routing_settings(None))
 
     assert isinstance(client, ExternalRoutingClient)
     assert client._url == (
@@ -1823,9 +1952,9 @@ def test_default_on_synthesizes_client_for_databricks_provider() -> None:
 
 
 def test_default_on_skips_without_databricks_provider() -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, _parse_routing_settings
+    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
 
-    settings = _parse_routing_settings(None)
+    settings = parse_routing_settings(None)
     assert (
         _build_default_databricks_routing_client(
             {"providers": {"openrouter": {"kind": "gateway"}}}, settings
@@ -1841,7 +1970,7 @@ def test_default_on_skips_without_databricks_provider() -> None:
 
 
 def test_default_on_reads_global_providers_block() -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, _parse_routing_settings
+    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     creds = MagicMock()
@@ -1856,20 +1985,20 @@ def test_default_on_reads_global_providers_block() -> None:
             return_value=creds,
         ),
     ):
-        client = _build_default_databricks_routing_client({}, _parse_routing_settings(None))
+        client = _build_default_databricks_routing_client({}, parse_routing_settings(None))
     assert isinstance(client, ExternalRoutingClient)
     assert client._databricks_profile == "oss"
 
 
 def test_default_on_skips_when_workspace_host_unresolvable() -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, _parse_routing_settings
+    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
 
     cfg = {"providers": {"ws": {"kind": "databricks", "profile": "gone"}}}
     with patch(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
         side_effect=OSError("no such profile"),
     ):
-        assert _build_default_databricks_routing_client(cfg, _parse_routing_settings(None)) is None
+        assert _build_default_databricks_routing_client(cfg, parse_routing_settings(None)) is None
 
 
 @pytest.mark.asyncio
