@@ -1149,7 +1149,7 @@ class HarnessApp:
         if isinstance(body, MessageEvent):
             return await self._start_or_inject_turn(body.to_create_request(), conversation_id)
         if isinstance(body, InterruptEvent):
-            return await self._handle_interrupt_event()
+            return await self._handle_interrupt_event(conversation_id)
         if isinstance(body, ToolResultEvent):
             return await self._handle_tool_result_event(body)
         if isinstance(body, ApprovalEvent):
@@ -1166,32 +1166,40 @@ class HarnessApp:
             code=ErrorCode.INVALID_INPUT,
         )
 
-    async def _handle_interrupt_event(self) -> Response:
+    async def _handle_interrupt_event(self, conversation_id: str | None = None) -> Response:
         """
-        Apply an :class:`InterruptEvent` to the in-flight turn.
+        Apply an :class:`InterruptEvent` to the in-flight turn for
+        *conversation_id*.
 
-        The harness has at most one in-flight turn per conversation
-        in practice, but the registry is a dict so this iterates
-        defensively. If no turn is in flight, 404s — fail loud
-        rather than silently no-op so a stray interrupt arriving
-        after a turn ended surfaces as an obvious operator error.
+        In shared-runner mode only the turns belonging to the target
+        conversation are cancelled; other conversations' turns are
+        unaffected. When *conversation_id* is ``None`` (single-conversation
+        legacy mode) all in-flight turns are cancelled as before.
 
+        :param conversation_id: The conversation to interrupt, or ``None``
+            to interrupt all (legacy single-conversation mode).
         :returns: 204 on success.
-        :raises OmnigentError: 404 if no turn is in flight.
+        :raises OmnigentError: 404 if no turn is in flight for this
+            conversation.
         """
-        if not self._in_flight:
+        target_ctxs = [
+            ctx
+            for ctx in self._in_flight.values()
+            if conversation_id is None or ctx.conversation_id == conversation_id
+        ]
+        if not target_ctxs:
             raise OmnigentError(
                 "no in-flight turn to interrupt",
                 code=ErrorCode.NOT_FOUND,
             )
-        for ctx in self._in_flight.values():
+        for ctx in target_ctxs:
             ctx.cancelled.set()
             ctx._cancel_pending()
-        # Drop the cancelled turn as the inject target so the next message
-        # starts a fresh turn (rebuilds with the marker), not into the dying one
-        # — otherwise it resumes the abandoned turn and the agent runs one behind.
         async with self._lock:
-            self._active_turn_ctx = None
+            if self._active_turn_ctx is not None and (
+                conversation_id is None or self._active_turn_ctx.conversation_id == conversation_id
+            ):
+                self._active_turn_ctx = None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _handle_tool_result_event(self, body: ToolResultEvent) -> Response:
@@ -1270,14 +1278,16 @@ class HarnessApp:
 
         async with self._lock:
             # Sessions-native steering: no previous_response_id on
-            # the wire, but a turn is actively streaming. Inject.
-            # Serialized under _lock so two concurrent requests
-            # can't both pass the guard before either sets
-            # _active_turn_ctx.
+            # the wire, but a turn is actively streaming. Inject only
+            # into the active turn for this conversation.
             if (
                 request.previous_response_id is None
                 and self._active_turn_ctx is not None
                 and not self._active_turn_ctx.cancelled.is_set()
+                and (
+                    conversation_id is None
+                    or self._active_turn_ctx.conversation_id == conversation_id
+                )
             ):
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)

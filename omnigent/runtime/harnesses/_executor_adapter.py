@@ -498,28 +498,21 @@ class ExecutorAdapter(HarnessApp):
             sess.current_ctx = None
             sess.current_agent = None
 
-    async def _handle_interrupt_event(self) -> Response:
+    async def _handle_interrupt_event(self, conversation_id: str | None = None) -> Response:
         """Cancel the turn AND drop the inner executor session.
 
-        The base handler sets ``ctx.cancelled`` (terminal event becomes
-        ``response.cancelled``) and clears the inject target. But the live
-        client — dropping which is what actually stops the in-flight
-        generation and forces the next turn to rebuild fresh — was only
-        dropped by the run loop's between-events ``interrupt_session`` call,
-        which is skipped when the turn is blocked awaiting the first token or
-        torn down via HTTP disconnect. The next turn then reuses the client
-        and flushes the abandoned generation: the post-cancel stream dump +
-        the off-by-one. Drop it here, synchronously on the interrupt.
-
-        :returns: The base handler's 204 response.
-        :raises OmnigentError: 404 (from the base handler) when no turn is
-            in flight.
+        Only interrupts the session for *conversation_id*. In legacy
+        single-conversation mode (``None``) all sessions are interrupted.
         """
-        response = await super()._handle_interrupt_event()
-        # Interrupt all sessions that have a live executor. The base handler
-        # already resolved which turn is in-flight; we just need to ensure
-        # the inner executor drops its session so the next turn rebuilds fresh.
-        for sess in self._sessions.values():
+        response = await super()._handle_interrupt_event(conversation_id)
+        # Only interrupt the executor(s) for the target conversation so
+        # co-tenant conversations are not affected.
+        target_sessions = (
+            [self._sessions[conversation_id]]
+            if conversation_id is not None and conversation_id in self._sessions
+            else list(self._sessions.values())
+        )
+        for sess in target_sessions:
             if sess.executor is not None:
                 await sess.executor.interrupt_session(sess.session_key)
         return response

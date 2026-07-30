@@ -757,9 +757,17 @@ class HarnessProcessManager:
                     )
                 self._entries[hkey] = entry
             entry.last_used_at = time.monotonic()
-            if conversation_id not in self._conv_to_hkey:
-                # First time this conversation uses this harness entry.
+            old_hkey = self._conv_to_hkey.get(conversation_id)
+            if old_hkey != hkey:
+                # First use, or hkey changed (harness/model switch): update
+                # refcounts for both old and new entries.
                 self._hkey_refcounts[hkey] = self._hkey_refcounts.get(hkey, 0) + 1
+                if old_hkey is not None:
+                    old_ref = self._hkey_refcounts.get(old_hkey, 1) - 1
+                    if old_ref <= 0:
+                        self._hkey_refcounts.pop(old_hkey, None)
+                    else:
+                        self._hkey_refcounts[old_hkey] = old_ref
             self._conv_to_hkey[conversation_id] = hkey
             return entry.client
 
