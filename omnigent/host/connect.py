@@ -1143,8 +1143,24 @@ class HostProcess:
             try:
                 token_dir = pending_tokens_dir(stable_id)
                 token_dir.mkdir(parents=True, exist_ok=True)
-                (token_dir / frame.binding_token).write_text(frame.binding_token)
+                token_file = token_dir / frame.binding_token
+                token_file.write_text(frame.binding_token)
                 existing_handle.proc.send_signal(RUNNER_ADD_SESSION_SIGNAL)
+                # Wait for the runner to pick up the token (it deletes the
+                # file after starting the extra tunnel task). This prevents
+                # the server from trying to use the new runner_id before
+                # the tunnel WebSocket has connected. Poll briefly; fall
+                # through to spawn if the runner doesn't respond in time.
+                _TOKEN_PICKUP_TIMEOUT_S = 5.0
+                _TOKEN_POLL_INTERVAL_S = 0.05
+                waited = 0.0
+                while token_file.exists() and waited < _TOKEN_PICKUP_TIMEOUT_S:
+                    await asyncio.sleep(_TOKEN_POLL_INTERVAL_S)
+                    waited += _TOKEN_POLL_INTERVAL_S
+                if token_file.exists():
+                    # Runner didn't pick up the token — fall through to spawn.
+                    token_file.unlink(missing_ok=True)
+                    raise OSError("runner did not pick up session token in time")
                 _logger.info(
                     "Reusing runner %s (pid=%d) for new session %s",
                     stable_id,
