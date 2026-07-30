@@ -2551,6 +2551,20 @@ export function NewChatLandingScreen() {
     smartRoutingWrappers.codex != null &&
     !harnessUnconfiguredOnHost("claude-native", harnessWarningHost) &&
     !harnessUnconfiguredOnHost("codex-native", harnessWarningHost);
+  // Whether we know enough to judge availability: before the agent list and the
+  // server flags land, "unavailable" only means "not loaded yet".
+  const smartRoutingAvailabilityKnown = agents !== undefined && info !== "loading";
+  // A restored (or newly unsupported) Smart Routing pick with no row behind it —
+  // routing disabled server-side, or either native arm missing on this host —
+  // would strand a "Smart Routing" chip the user can't switch away from. Drop
+  // back to the default pick, as if nothing had been stored; the stored value
+  // stays put, since the arm may come back.
+  useEffect(() => {
+    if (!smartRoutingHarnessSelected) return;
+    if (!smartRoutingAvailabilityKnown || smartRoutingHarnessAvailable) return;
+    setPickedHarness(null);
+    _setCostControlMode(null);
+  }, [smartRoutingHarnessSelected, smartRoutingAvailabilityKnown, smartRoutingHarnessAvailable]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -2956,15 +2970,16 @@ export function NewChatLandingScreen() {
   // bind the Claude wrapper as a placeholder — the server routes from the first
   // message and rebinds to the wrapper it picked, which is why the picker
   // suppresses that row's highlight while this sentinel is active.
-  // Not persisted as the placeholder's last harness: the sentinel is only valid
-  // while both CLIs are ready, and a restored one would show a "Smart Routing"
-  // chip with no matching row to switch away from.
+  // Persisted as the placeholder's last harness, like every other harness pick,
+  // so a return visit starts on Smart Routing again. A restored sentinel with no
+  // row behind it degrades to the default pick (see the guard above).
   const handleSelectSmartRoutingHarness = () => {
     const placeholder = smartRoutingWrappers.claude;
     if (placeholder == null) return;
     setPickedAgentId(placeholder.id);
     writeLastAgentId(placeholder.id);
     setPickedHarness(AUTO_NATIVE_HARNESS_ID);
+    writeLastHarness(placeholder.id, AUTO_NATIVE_HARNESS_ID);
     _setCostControlMode("on");
   };
 
@@ -2973,7 +2988,14 @@ export function NewChatLandingScreen() {
   // returning user lands on the harness they used last); explicit picks
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
-    if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
+    if (agent.id !== effectiveAgentId) {
+      const remembered = readLastHarness(agent.id);
+      // Smart Routing is stored under the wrapper it binds as a placeholder, but
+      // clicking that wrapper's own row is a pick of the wrapper — clear the
+      // sentinel so the explicit choice is what survives a reload.
+      if (remembered === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
+      else setPickedHarness(remembered);
+    }
     // Re-picking the agent that is currently on an Auto Harness drops back to
     // its own harness — the Auto Harness modal shows only Permissions, so the
     // picker is the way out of fully-auto.

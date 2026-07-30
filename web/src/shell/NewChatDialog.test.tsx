@@ -151,6 +151,10 @@ const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Per-harness remembered option knobs (see lib/modePreferences).
 const HARNESS_OPTIONS_KEY = "omnigent:last-mode-by-harness";
+// Last harness pick per agent (see lib/harnessPreferences).
+const LAST_HARNESS_KEY = "omnigent:last-harness-by-agent";
+// Last agent pick (see lib/agentPreferences).
+const LAST_AGENT_KEY = "omnigent:last-agent-id";
 
 /**
  * Build a minimal Conversation for the directory-conflict helpers/warning.
@@ -3494,6 +3498,137 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(body.agent_id).toBe("a2");
     expect(body.harness_override).toBeUndefined();
     expect(body.smart_routing_message).toBeUndefined();
+  });
+
+  // Sticky Smart Routing: the row is a harness pick like any other, so it lands
+  // in the same per-agent last-harness store and a return visit starts on it.
+  // When the row can't be offered on the next visit, the pick degrades to the
+  // default selection rather than stranding a chip with no row behind it.
+
+  /** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */
+  function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
+    cleanup();
+    resetLandingDraft();
+    renderLanding(infoOverrides);
+  }
+
+  /** Seed the store as a previous session that ended on Smart Routing. */
+  function seedStoredSmartRouting(): void {
+    localStorage.setItem(LAST_AGENT_KEY, "a1");
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ a1: "auto-native" }));
+  }
+
+  it("stores the pick under the placeholder wrapper it binds", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      a1: "auto-native",
+    });
+    expect(localStorage.getItem(LAST_AGENT_KEY)).toBe("a1");
+  });
+
+  it("preselects Smart Routing on a later visit", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+
+    remountLanding({ smart_routing_enabled: true });
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Smart Routing",
+    );
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toHaveAttribute("data-active");
+  });
+
+  it.each([
+    ["codex is missing", { "claude-native": true, "codex-native": false }],
+    ["claude is missing", { "claude-native": false, "codex-native": true }],
+  ])("falls back to the default harness when %s on this host", (_case, configured) => {
+    seedStoredSmartRouting();
+    mockHosts([{ ...host("online"), configured_harnesses: configured } as Host]);
+    renderLanding({ smart_routing_enabled: true });
+    // Exactly what an empty store would have given: the default harness pick.
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).not.toContain("Smart Routing");
+    expect(chip.textContent).toContain("Claude Code");
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+    // The arm may come back, so the pick stays remembered.
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      a1: "auto-native",
+    });
+  });
+
+  it("falls back to the default harness when routing is disabled server-side", () => {
+    seedStoredSmartRouting();
+    renderLanding({ smart_routing_enabled: false });
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).not.toContain("Smart Routing");
+    expect(chip.textContent).toContain("Claude Code");
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      a1: "auto-native",
+    });
+  });
+
+  it("sends no routing on a create after the restored pick degraded", async () => {
+    seedStoredSmartRouting();
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": false },
+      } as Host,
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_degraded" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.agent_id).toBe("a1");
+    expect(body.harness_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+    expect(body.cost_control_mode_override).toBeUndefined();
+  });
+
+  it("forgets the pick once an explicit harness row replaces it", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    // The wrapper the sentinel is stored under: clicking its row is a pick of
+    // the wrapper, so the sentinel must not come back on the next visit.
+    selectAgent("a2");
+    selectAgent("a1");
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({});
+
+    remountLanding({ smart_routing_enabled: true });
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Claude Code",
+    );
+  });
+
+  it("leaves a bundle agent's remembered brain harness alone", () => {
+    // The sentinel shares the store with per-agent brain-harness picks, so
+    // writing/degrading it must not disturb another agent's entry.
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_polly: "openai-agents" }));
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      ag_polly: "openai-agents",
+      a1: "auto-native",
+    });
   });
 });
 
