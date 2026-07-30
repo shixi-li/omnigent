@@ -29,7 +29,7 @@ Last updated: 2026-07-29 night (live headless battery run by the lead session).
 |---|---|---|
 | IR selectable in Configure Codex | ✅ user | |
 | Router decision + chip | ✅ evidence | headless battery: "hi"→luna, complex refactor→sol, both exact servable matches |
-| **Process runs the routed model** | 🟡 | rollout proved luna when routing won the launch race; live battery caught the race losing (decision luna, config pinned default, mirror stamped it back) — native push fix in flight (`live-model-state`) |
+| **Process runs the routed model** | ✅ evidence | live re-run post push+mirror+hardening (51801530): model_override holds databricks-gpt-5-6-luna across the turn and the session config.toml reads model = databricks-gpt-5-6-luna |
 | Codex TUI `/model` reflects the live model | ❌ | shows thread default (`databricks-gpt-5-5`), not the routed per-turn model. Design in flight (`live-model-state`) |
 | Post-launch model push (re-route / lost launch race) | ❌ by design gap | no omnigent→codex push exists; claude-style injection equivalent needed. Design in flight (`live-model-state`) |
 
