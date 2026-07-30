@@ -3381,12 +3381,13 @@ async def _forward_native_terminal_message(
     display_name, _, _ = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(conv, body, model_override=model_override)
     _logger.info(
-        "%s terminal message forward starting: session=%s block_types=%s",
+        "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
         session_id,
         [block.get("type") for block in event.get("content", []) if isinstance(block, dict)]
         if isinstance(event.get("content"), list)
         else type(event.get("content")).__name__,
+        event.get("model_override"),
     )
     if (
         file_store is not None

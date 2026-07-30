@@ -212,15 +212,23 @@ class ClaudeNativeExecutor(Executor):
         :returns: A ``/model`` argument, or ``None`` when no switch
             should be typed.
         """
-        if wanted_model is None or not self._should_switch_model(wanted_model):
+        if wanted_model is None:
+            _logger.info("claude-native: turn carries no routed model; not typing /model")
+            return None
+        if not self._should_switch_model(wanted_model):
+            _logger.info(
+                "claude-native: skipping /model — pane is already on %s",
+                wanted_model,
+            )
             return None
         env = read_model_env(self._bridge_dir) or None
         wanted_arg = claude_model_command_arg(wanted_model, env)
         if wanted_arg is None:
             _logger.warning(
-                "claude-native: routed model %r has no /model spelling this "
-                "session accepts; sending the turn on the current model",
+                "claude-native: skipping /model — routed model %r has no spelling this "
+                "session accepts (pins=%s); sending the turn on the current model",
                 wanted_model,
+                sorted(env or ()),
             )
             return None
         if (
@@ -229,7 +237,17 @@ class ClaudeNativeExecutor(Executor):
         ):
             # Resolves to the model the pane is already on, so the switch
             # would be a pointless prompt (and can pop a confirm dialog).
+            _logger.info(
+                "claude-native: skipping /model — %r resolves to %r, already applied",
+                wanted_model,
+                wanted_arg,
+            )
             return None
+        _logger.info(
+            "claude-native: typing /model %s for routed model %s",
+            wanted_arg,
+            wanted_model,
+        )
         return wanted_arg
 
     def _should_switch_model(self, wanted_model: str | None) -> bool:

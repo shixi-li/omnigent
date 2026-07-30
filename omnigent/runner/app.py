@@ -5851,6 +5851,19 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        # The routed model rides in-band on the forwarded message. This body is
+        # built field by field (not copied), so it must be threaded explicitly:
+        # the harness forwards it onto CreateResponseRequest.model_override and
+        # the executor adapter into ExecutorConfig.model, which is how a native
+        # terminal learns to switch models for this turn.
+        _model_override = msg_body.get("model_override")
+        if isinstance(_model_override, str) and _model_override:
+            harness_body["model_override"] = _model_override
+            _logger.info(
+                "_run_turn_bg: conv=%s received model_override=%s (forwarding to harness)",
+                conv,
+                _model_override,
+            )
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:
@@ -6698,7 +6711,8 @@ def create_runner_app(
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
         _logger.info(
-            "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s",
+            "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
+            "model_override=%s",
             conversation_id,
             body_type,
             conversation_id in _active_turns,
@@ -6706,6 +6720,7 @@ def create_runner_app(
             [b.get("type") for b in body.get("content", []) if isinstance(b, dict)]
             if isinstance(body, dict)
             else "N/A",
+            body.get("model_override") if isinstance(body, dict) else None,
         )
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
