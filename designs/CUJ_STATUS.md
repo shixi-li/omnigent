@@ -39,7 +39,7 @@ Last updated: 2026-07-29 night (live headless battery run by the lead session).
 |---|---|---|
 | "Auto" chip + dropdown item + description | ✅ user | naming iterations settled |
 | Configure Auto = Permissions only, locked Default | ✅ user | payload carries no permission override (test-pinned) |
-| Harness+model decision at session start | 🟡 ui-only | decisions seen earlier; process reality not separately verified |
+| Harness+model decision at session start | ✅ evidence | headless auto CUJ: session-scope decision picked codex/luna from the five-arm menu, model persisted, session running |
 | Cross-harness subagents allowed ONLY here | ⬜ | constraint shipped `0fb7ea95` w/ tests; not confirmed live |
 
 ## 4. Subagent routing
@@ -49,8 +49,8 @@ Last updated: 2026-07-29 night (live headless battery run by the lead session).
 | Claude subagent decisions (chips per spawn) | ✅ user | decisions fire |
 | **Claude subagent spawns get the routed model** | ✅ evidence | live re-test post-fix: Explore spawn ran to completion with routed sonnet-5 decision (was 7ms schema failure) |
 | Same-harness constraint (no codex suggestions in CC) | 🟡 | user: "seems like it's being followed" — not deliberately exercised yet |
-| **Codex subagent hooks execute at all** | 🟡 | fix landed `e32c4925` (persisted per-hook trust — the bypass flag is a no-op for app-server); needs host restart + live re-test |
-| Canary → `subagent_routing_unenforced` warning banner | 🟡 | fix landed `e32c4925` (advertisement-armed, first-turn-anchored); needs live re-test |
+| **Codex subagent hooks execute at all** | ✅ evidence | live E2E post -I fix (518376ba): canary fired, PreToolUse gate ran, SubagentStart audit recorded the spawn on the routed model (luna). Root causes: app-server ignores the bypass flag (persisted trust handshake added) + cwd shadowing killed hook imports (python -I) |
+| Canary → `subagent_routing_unenforced` warning banner | ✅ evidence | watcher posted every 30s and the warning surfaced on the session snapshot during the shadowing incident — the watcher is what caught the bug |
 | In-session Subagent routing row (IR/Default, inherit) | ✅ user | toggle enables/disables routing as expected |
 | Mid-session toggle affects next spawn (process level) | 🟡 | user observed toggling works; per-spawn process effect blocked on the claude/codex apply fixes for a clean read |
 | Fork spawns exempt (v1 policy) | ⬜ | test-pinned only |
