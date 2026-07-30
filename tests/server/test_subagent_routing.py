@@ -23,7 +23,9 @@ from omnigent.runner.subagent_routing import (
     clear_cache,
     decision_record,
     ensure_session_router,
+    harness_family,
     make_server_relay_resolver,
+    model_in_family,
     persist_subagent_decision,
     read_advertisement,
     relayed_decisions,
@@ -42,6 +44,8 @@ from omnigent.server.smart_routing import RoutingResult
 
 CLAUDE_MODEL = "databricks-claude-opus-4-8"
 GPT_MODEL = "databricks-gpt-5-5"
+GLM_MODEL = "databricks-glm-5-2"
+KIMI_MODEL = "databricks-kimi-k2-6"
 PARENT_MODEL = "databricks-claude-sonnet-4-6"
 
 
@@ -146,6 +150,23 @@ def test_candidate_models_falls_back_to_the_static_table_per_harness() -> None:
 def test_candidate_models_ignores_an_empty_catalog() -> None:
     candidates = candidate_models("claude-native", catalog={})
     assert CLAUDE_MODEL in candidates["claude-native"]
+
+
+def test_candidate_models_keeps_codex_compatible_catalog_models() -> None:
+    """A codex catalog's GLM/Kimi rows survive the in-family constraint.
+
+    Those endpoints serve on the Responses wire codex speaks, so dropping
+    them would hide runnable models the dispatch gate accepts.
+    """
+    catalog = {"self": [GPT_MODEL, GLM_MODEL, KIMI_MODEL, CLAUDE_MODEL]}
+    candidates = candidate_models("codex-native", catalog=catalog)
+    assert candidates == {"codex-native": [GPT_MODEL, GLM_MODEL, KIMI_MODEL, CLAUDE_MODEL]}
+    # The family constraint the routing paths apply keeps GLM/Kimi on codex
+    # and still rejects them on Claude.
+    assert model_in_family(harness_family("codex-native"), GLM_MODEL) is True
+    assert model_in_family(harness_family("codex-native"), KIMI_MODEL) is True
+    assert model_in_family(harness_family("claude-native"), GLM_MODEL) is False
+    assert model_in_family(harness_family("claude-native"), KIMI_MODEL) is False
 
 
 def test_candidate_models_offers_both_families_for_auto_sessions() -> None:

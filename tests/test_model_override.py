@@ -136,6 +136,18 @@ class TestModelFamilyMismatch:
             ("claude-sdk", "claude-opus-4-8"),
             ("codex-native", "databricks-gpt-5-4"),
             ("codex", "gpt-5.1-codex"),
+            # GLM and Kimi serve on the same OpenResponses wire codex speaks,
+            # so every spelling of those ids is codex-runnable.
+            ("codex", "glm-5-2"),
+            ("codex", "databricks-glm-5-2"),
+            ("codex", "system.ai.glm-5-2"),
+            ("codex-native", "databricks-glm-5-2"),
+            ("native-codex", "system.ai.glm-5-2"),
+            ("codex", "kimi-k2"),
+            ("codex", "kimi-k2-instruct"),
+            ("codex", "kimi-for-coding"),
+            ("codex", "databricks-kimi-k2-6"),
+            ("codex-native", "system.ai.kimi-k2-instruct"),
             ("openai-agents", "gpt-5.4-mini"),
             # openai-agents is multi-model like pi (a live SDK probe completed a
             # Claude tool-calling turn over the chat wire), so it accepts the
@@ -176,9 +188,23 @@ class TestModelFamilyMismatch:
             ("claude-native", "databricks-gpt-5-4", "only runs Claude models"),
             ("native-claude", "gpt-5.4", "only runs Claude models"),
             ("claude-sdk", "databricks-meta-llama-3.3-70b-instruct", "only runs Claude models"),
-            ("codex-native", "databricks-claude-sonnet-4-6", "only runs GPT models"),
-            ("native-codex", "claude-opus-4-8", "only runs GPT models"),
-            ("codex", "databricks-meta-llama-3.3-70b-instruct", "only runs GPT models"),
+            # GLM / Kimi are codex-runnable but not Claude-runnable.
+            ("claude-native", "databricks-glm-5-2", "only runs Claude models"),
+            ("claude-sdk", "system.ai.glm-5-2", "only runs Claude models"),
+            ("claude-sdk", "databricks-kimi-k2-6", "only runs Claude models"),
+            (
+                "codex-native",
+                "databricks-claude-sonnet-4-6",
+                "only runs codex-compatible models",
+            ),
+            ("native-codex", "claude-opus-4-8", "only runs codex-compatible models"),
+            (
+                "codex",
+                "databricks-meta-llama-3.3-70b-instruct",
+                "only runs codex-compatible models",
+            ),
+            # A segment merely containing the letters is not the GLM family.
+            ("codex", "glmqlfit-eval", "only runs codex-compatible models"),
             # antigravity is Gemini-native: syntactically valid non-Gemini ids
             # must fail loud at the dispatch gate rather than be persisted as
             # model_override and land in HARNESS_ANTIGRAVITY_MODEL only to fail

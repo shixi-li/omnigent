@@ -22,6 +22,7 @@ _FAMILIES: tuple[str, ...] = (
     "claude",
     "gpt",
     "codex",
+    "glm",
     "gemini",
     "llama",
     "qwen",

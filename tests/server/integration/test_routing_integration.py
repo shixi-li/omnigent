@@ -31,6 +31,7 @@ pytestmark = pytest.mark.asyncio
 ROUTED_MODEL = "databricks-claude-opus-4-8"
 LLM_PICKED_MODEL = "databricks-claude-sonnet-4-6"
 GPT_MODEL = "databricks-gpt-5-5"
+GLM_MODEL = "databricks-glm-5-2"
 
 
 class _FakeRoutingClient:
@@ -529,6 +530,56 @@ async def test_pinned_session_is_offered_only_its_own_family(
     assert set(routing_client.offered[0]) == {harness}
     assert counterpart not in routing_client.offered[0]
     assert resp.json()["action"] == "rewrite"
+
+
+async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A codex session's GLM endpoint survives filtering and a GLM pick applies.
+
+    GLM serves on the same Responses wire codex speaks, so the live catalog
+    row must reach the router and the resulting pick must pass the dispatch
+    family gate a real spawn goes through.
+    """
+    from omnigent.model_override import model_family_mismatch
+    from omnigent.server import smart_routing as smart_routing_module
+    from omnigent.server.routes import sessions as sessions_facade
+
+    session_id = await _session_with_routing_flags(
+        client,
+        agent_name="routing-codex-glm",
+        subagent_routing="on",
+    )
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=GLM_MODEL, rationale="delegate arm", harness="codex")
+    )
+    live_catalog = {"self": [GPT_MODEL, GLM_MODEL]}
+
+    async def _fake_runner_client(*_args: Any, **_kwargs: Any) -> Any:
+        return object()
+
+    async def _fake_fetch(*_args: Any, **_kwargs: Any) -> dict[str, list[str]]:
+        return live_catalog
+
+    with (
+        patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)),
+        patch.object(sessions_facade, "_get_runner_client", _fake_runner_client),
+        patch.object(smart_routing_module, "fetch_runner_models", _fake_fetch),
+    ):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json={**SPAWN_PAYLOAD, "harness": "codex-native", "parent_model": GPT_MODEL},
+        )
+
+    assert resp.status_code == 200, resp.text
+    # The GLM row reached the router as a codex candidate.
+    assert routing_client.offered[0] == {"codex-native": [GPT_MODEL, GLM_MODEL]}
+    body = resp.json()
+    assert body["action"] == "rewrite"
+    assert body["model"] == GLM_MODEL
+    # And the applied pick is one the dispatch gate accepts on codex.
+    assert model_family_mismatch("codex-native", GLM_MODEL) is None
 
 
 async def test_auto_session_and_its_children_keep_cross_harness_picks(

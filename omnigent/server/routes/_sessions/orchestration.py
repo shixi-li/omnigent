@@ -11,7 +11,7 @@ import asyncio
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -5448,6 +5448,90 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
     ]
 
 
+# Per-harness budget for the pre-session host model-options round-trip. This
+# sits on the session-create path, so it stays well under the picker's own
+# 15s ceiling: a slow or silent host degrades to the static table rather than
+# stalling the create.
+_PRE_SESSION_MODEL_OPTIONS_TIMEOUT_S = 5.0
+
+
+async def _host_model_options(
+    host_conn: HostConnection,
+    host_registry: HostRegistry,
+    harness: str,
+) -> list[str]:
+    """Ask a host which models *harness* could launch with right now.
+
+    The pre-launch preview the landing screen's model picker already reads,
+    reused as a routing candidate list. Hosts answer for the harnesses that can
+    resolve a catalog without a running CLI and reject the rest, so a failure
+    here is expected and yields no candidates.
+
+    :param host_conn: Live host connection to query.
+    :param host_registry: Registry used to enqueue the outbound frame.
+    :param harness: Native harness id, e.g. ``"claude-native"``.
+    :returns: Model ids the host reported, or an empty list.
+    """
+    from omnigent.host.frames import HostModelOptionsFrame, encode_host_frame
+
+    request_id = secrets.token_hex(8)
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    host_conn.pending_model_options[request_id] = future
+    frame = encode_host_frame(HostModelOptionsFrame(request_id=request_id, harness=harness))
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError:
+            return []
+        result = await asyncio.wait_for(future, timeout=_PRE_SESSION_MODEL_OPTIONS_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — a timeout or host error just means no candidates
+        _logger.debug("host model options unavailable for harness %r", harness, exc_info=True)
+        return []
+    finally:
+        host_conn.pending_model_options.pop(request_id, None)
+    if result.get("status") != "ok":
+        return []
+    options = result.get("models")
+    if not isinstance(options, list):
+        return []
+    models: list[str] = []
+    for option in options:
+        # Picker rows carry the launchable id in ``model``; ``id`` is the row key.
+        raw = option.get("model") or option.get("id") if isinstance(option, dict) else None
+        if isinstance(raw, str) and raw and raw not in models:
+            models.append(raw)
+    return models
+
+
+async def _pre_session_model_catalog(
+    request: Request,
+    host: Host | None,
+    harnesses: Sequence[str],
+) -> dict[str, list[str]]:
+    """Resolve a routing catalog for *harnesses* before any runner exists.
+
+    A create routes with no session, so the live runner catalog
+    (``fetch_runner_models``) is out of reach. The host is: it holds the CLIs and
+    already resolves their pre-launch model options for the picker. Harnesses it
+    cannot answer for are simply absent, and the static table covers them.
+
+    :param request: Used to reach the app's host registry.
+    :param host: The session's target host, or ``None`` (e.g. a sandbox).
+    :param harnesses: Candidate native harness ids to ask about.
+    :returns: ``{harness: model ids}`` for whatever the host answered.
+    """
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host is None or host_registry is None:
+        return {}
+    host_conn = host_registry.get(host.host_id)
+    if host_conn is None:
+        return {}
+    results = await asyncio.gather(
+        *(_host_model_options(host_conn, host_registry, harness) for harness in harnesses)
+    )
+    return {harness: models for harness, models in zip(harnesses, results, strict=True) if models}
+
+
 async def _resolve_native_smart_routing(
     body: SessionCreateRequest,
     request: Request,
@@ -5467,7 +5551,12 @@ async def _resolve_native_smart_routing(
 
     :param body: The create request; ``smart_routing_message`` carries the
         routing text and ``host_id`` selects whose CLIs are on offer.
-    :param request: Used to reach the app's host store for readiness.
+    Candidate models come from the host's pre-launch catalog
+    (:func:`_pre_session_model_catalog`) — no runner exists yet, so the live
+    per-session catalog is out of reach and the static table is last resort.
+
+    :param request: Used to reach the app's host store for readiness and the
+        host registry for the pre-session model catalog.
     :returns: ``(wrapper_agent_name, model, verdict, error)``.
         ``wrapper_agent_name`` is ``None`` only when no native CLI is
         installed; ``error`` explains a fallback for the routing card.
@@ -5487,6 +5576,7 @@ async def _resolve_native_smart_routing(
     harness, model, verdict, error = await route_session_harness(
         body.smart_routing_message or "",
         harness_candidates=installed,
+        catalog=await _pre_session_model_catalog(request, host, installed),
     )
     native_agent = native_coding_agent_for_harness(harness) if harness is not None else None
     if native_agent is None:

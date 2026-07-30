@@ -131,6 +131,35 @@ def test_model_lists_ordered_by_capability_within_each_family() -> None:
             assert keys == sorted(keys), f"{family}/{vendor} is not cheapest → most capable"
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("databricks-claude-opus-4-8", "claude"),
+        ("databricks-gpt-5-5", "gpt"),
+        ("gpt-5-6-sol", "gpt"),
+        # The router's glm arm and its servable spellings must all read as
+        # the codex family, or a pick lands on the wrong harness.
+        ("glm-5-2", "gpt"),
+        ("databricks-glm-5-2", "gpt"),
+        ("system.ai.glm-5-2", "gpt"),
+        ("databricks-kimi-k2-6", "gpt"),
+        ("databricks-meta-llama-3.3-70b-instruct", "other"),
+    ],
+)
+def test_model_family_agrees_with_the_shared_token_rule(model: str, expected: str) -> None:
+    """This file's family view must match the dispatch gate's.
+
+    :param model: Model id under test.
+    :param expected: The family it must land in.
+    """
+    from omnigent.model_override import model_family_mismatch
+    from omnigent.server.smart_routing import _model_family
+
+    assert _model_family(model) == expected
+    if expected == "gpt":
+        assert model_family_mismatch("codex", model) is None
+
+
 def test_catalog_models_for_harness_matches_worker_rows() -> None:
     from omnigent.server.smart_routing import catalog_models_for_harness
 
@@ -456,6 +485,56 @@ async def test_route_turn_drops_out_of_family_catalog_models() -> None:
         )
     assert model == "databricks-gpt-5-5"
     assert client.offered == [{"codex-native": ["databricks-gpt-5-5", "databricks-gpt-5-4-mini"]}]
+
+
+@pytest.mark.asyncio
+async def test_route_turn_offers_and_applies_a_glm_pick_on_codex() -> None:
+    """A codex session's GLM/Kimi endpoints are offered and a GLM pick applies.
+
+    They ride the same Responses wire codex speaks, so the in-family filter
+    must keep them; dropping them would leave the router unable to pick the
+    delegate arm the workspace actually serves.
+    """
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "self": {
+                "source": "catalog",
+                "verified": True,
+                "models": [
+                    {"id": "databricks-gpt-5-5"},
+                    {"id": "databricks-glm-5-2"},
+                    {"id": "databricks-kimi-k2-6"},
+                    {"id": "databricks-claude-opus-4-8"},
+                ],
+                "note": "",
+            }
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    client = _FakeRoutingClient(
+        RoutingResult(model="databricks-glm-5-2", rationale="delegate arm", harness="codex-native")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=client)):
+        model, _v = await route_turn(
+            "codex-native",
+            "refactor the parser",
+            session_id="conv_glm",
+            runner_client=mock_client,
+        )
+    assert client.offered == [
+        {
+            "codex-native": [
+                "databricks-gpt-5-5",
+                "databricks-glm-5-2",
+                "databricks-kimi-k2-6",
+            ]
+        }
+    ]
+    assert model == "databricks-glm-5-2"
 
 
 @pytest.mark.asyncio
@@ -1536,6 +1615,14 @@ def test_cheap_arm_falls_back_to_nano_when_nothing_bigger() -> None:
 def test_delegate_arm_substitutes_same_family_capable_model() -> None:
     """glm-5-2 has no local endpoint and no tier entry demoting it."""
     assert _substitute("glm-5-2", _UCODE_CODEX_CATALOG) == "gpt-5-5"
+
+
+def test_delegate_arm_resolves_to_its_own_endpoint_when_served() -> None:
+    """A workspace that serves GLM resolves the glm arm to that endpoint."""
+    assert (
+        _substitute("glm-5-2", (*_UCODE_CODEX_CATALOG, "databricks-glm-5-2"))
+        == "databricks-glm-5-2"
+    )
 
 
 def test_substitution_is_independent_of_catalog_order() -> None:

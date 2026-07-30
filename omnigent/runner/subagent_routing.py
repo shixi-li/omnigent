@@ -476,6 +476,9 @@ def auto_harness_session(conv: Any, parent: Any = None) -> bool:
 def model_in_family(family: str | None, model: str) -> bool:
     """Report whether *model* can run on a harness in *family*.
 
+    The ``"gpt"`` family means codex-compatible, not literally GPT: it
+    admits the GLM and Kimi ids codex serves over the same Responses wire.
+
     :param family: Family from :func:`harness_family`. ``None`` (unknown
         or multi-family harness) accepts every model.
     :param model: Model id, e.g. ``"databricks-gpt-5-5"``.

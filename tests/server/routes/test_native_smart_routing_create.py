@@ -11,7 +11,8 @@ rebound to the wrapper the router picked.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
@@ -19,11 +20,17 @@ import pytest
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, clear_cache
-from omnigent.server.routes._sessions.orchestration import _installed_native_harnesses
+from omnigent.server.routes._sessions.orchestration import (
+    _installed_native_harnesses,
+    _pre_session_model_catalog,
+)
 from omnigent.server.smart_routing import (
     AUTO_NATIVE_ROUTING_HARNESSES,
+    RoutePick,
     RoutingResult,
     RoutingSettings,
+    TaskV1RouteOptionSource,
+    infer_models,
     route_session_harness,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -339,3 +346,143 @@ def test_installed_native_harnesses_follows_host_readiness(
 
 def test_installed_native_harnesses_without_a_host() -> None:
     assert _installed_native_harnesses(None) == ["claude-native", "codex-native"]
+
+
+# ── Pre-session candidate catalog ───────────────────────────────────────────
+#
+# A create routes before any session (and so any runner) exists, so the live
+# per-session catalog is out of reach. The host answers instead, and the static
+# table only tops up what it could not answer for. Either way the router's
+# current arms must be servable candidates — an arm missing from the candidate
+# set is substituted down a generation (a routed gpt-5-6-sol applying 5-5).
+
+SOL = "databricks-gpt-5-6-sol"
+LUNA = "databricks-gpt-5-6-luna"
+HOST_GPT_CATALOG = [LUNA, SOL]
+
+
+@pytest.mark.asyncio
+async def test_pre_session_catalog_is_offered_instead_of_the_static_table() -> None:
+    routing_client = _FakeRoutingClient(RoutingResult(model=SOL, rationale="deep reasoning"))
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        harness, model, verdict, error = await route_session_harness(
+            ROUTING_MESSAGE,
+            harness_candidates=("codex-native",),
+            catalog={"codex-native": HOST_GPT_CATALOG},
+        )
+    assert error is None
+    assert routing_client.offered[0] == {"codex-native": HOST_GPT_CATALOG}
+    # The pick is servable, so it applies exactly — no substitution, and the
+    # card shows no divergent raw pick.
+    assert (harness, model) == ("codex-native", SOL)
+    assert verdict is not None
+    assert "raw_model" not in verdict
+
+
+@pytest.mark.asyncio
+async def test_pre_session_catalog_is_family_filtered() -> None:
+    routing_client = _FakeRoutingClient(RoutingResult(model=SOL, rationale="deep reasoning"))
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        _harness, _model, _verdict, error = await route_session_harness(
+            ROUTING_MESSAGE,
+            harness_candidates=("codex-native",),
+            catalog={"codex-native": [*HOST_GPT_CATALOG, CLAUDE_MODEL]},
+        )
+    assert error is None
+    assert routing_client.offered[0] == {"codex-native": HOST_GPT_CATALOG}
+
+
+@pytest.mark.asyncio
+async def test_static_table_tops_up_harnesses_the_host_cannot_answer_for() -> None:
+    routing_client = _FakeRoutingClient(RoutingResult(model=SOL, rationale="deep reasoning"))
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        _harness, _model, _verdict, error = await route_session_harness(
+            ROUTING_MESSAGE,
+            harness_candidates=AUTO_NATIVE_ROUTING_HARNESSES,
+            # Hosts only resolve a pre-launch catalog for the CLIs that can
+            # report one without running; the rest fall back.
+            catalog={"codex-native": HOST_GPT_CATALOG},
+        )
+    assert error is None
+    offered = routing_client.offered[0]
+    assert offered["codex-native"] == HOST_GPT_CATALOG
+    assert offered["claude-native"] == infer_models("claude-native")
+
+
+@pytest.mark.asyncio
+async def test_no_host_catalog_falls_back_to_the_static_table() -> None:
+    routing_client = _FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        harness, model, _verdict, error = await route_session_harness(
+            ROUTING_MESSAGE,
+            harness_candidates=AUTO_NATIVE_ROUTING_HARNESSES,
+            catalog={},
+        )
+    assert error is None
+    assert (harness, model) == ("codex-native", GPT_MODEL)
+    assert routing_client.offered[0] == {
+        "claude-native": infer_models("claude-native"),
+        "codex-native": infer_models("codex-native"),
+    }
+
+
+def test_static_candidates_serve_the_routers_current_codex_arms() -> None:
+    # The last-resort table must still cover the arms task_v1 picks from, or the
+    # seam substitutes them down a generation.
+    codex_models = infer_models("codex-native")
+    assert codex_models is not None
+    source = TaskV1RouteOptionSource(model_prefixes=["databricks-"])
+    for arm in ("gpt-5-6-sol", "gpt-5-6-luna"):
+        resolved = source.resolve_selection(
+            RoutePick(model=arm),
+            ["codex-native"],
+            {"codex-native": list(codex_models)},
+        )
+        assert resolved is not None
+        # Applied exactly: the same model the router named, prefixed for this
+        # workspace's catalog vocabulary.
+        assert resolved.model == f"databricks-{arm}"
+        assert resolved.raw_model == arm
+
+
+@pytest.mark.asyncio
+async def test_pre_session_catalog_reads_the_hosts_model_options() -> None:
+    from omnigent.host.frames import decode_host_frame
+
+    conn = SimpleNamespace(host_id="host_1", pending_model_options={})
+    answers = {"claude-native": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
+
+    def send_text(host_conn: Any, frame: str) -> None:  # type: ignore[explicit-any]
+        decoded = decode_host_frame(frame)
+        models = answers.get(decoded.harness)
+        future = host_conn.pending_model_options[decoded.request_id]
+        future.set_result(
+            {"status": "ok", "models": models}
+            if models is not None
+            else {"status": "failed", "error": "unsupported"}
+        )
+
+    registry = SimpleNamespace(get=lambda host_id: conn, send_text=send_text)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=registry)))
+    catalog = await _pre_session_model_catalog(
+        cast("Any", request),
+        _host(None),
+        AUTO_NATIVE_ROUTING_HARNESSES,
+    )
+    # The row's launchable ``model`` id, not its picker key; a harness the host
+    # cannot answer for is simply absent.
+    assert catalog == {"claude-native": ["databricks-claude-opus-4-8"]}
+    assert conn.pending_model_options == {}
+
+
+@pytest.mark.asyncio
+async def test_pre_session_catalog_is_empty_without_a_live_host() -> None:
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=None)))
+    assert (
+        await _pre_session_model_catalog(
+            cast("Any", request),
+            _host(None),
+            AUTO_NATIVE_ROUTING_HARNESSES,
+        )
+        == {}
+    )

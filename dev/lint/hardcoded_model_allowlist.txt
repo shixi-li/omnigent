@@ -80,9 +80,9 @@ omnigent/server/smart_routing.py databricks-gpt-5-4-mini 2
 omnigent/server/smart_routing.py databricks-gpt-5-4-nano 2
 omnigent/server/smart_routing.py databricks-gpt-5-5 3
 omnigent/server/smart_routing.py databricks-gpt-5-5-pro 1
-omnigent/server/smart_routing.py databricks-gpt-5-6-luna 1
-omnigent/server/smart_routing.py databricks-gpt-5-6-sol 1
-omnigent/server/smart_routing.py databricks-gpt-5-6-terra 1
+omnigent/server/smart_routing.py databricks-gpt-5-6-luna 2
+omnigent/server/smart_routing.py databricks-gpt-5-6-sol 2
+omnigent/server/smart_routing.py databricks-gpt-5-6-terra 2
 omnigent/tools/builtins/spawn.py databricks-claude-opus-4-8 1
 omnigent/tools/builtins/spawn.py system.ai.glm-5-2 1
 scripts/probe_routing_api.sh claude-haiku-4-5 1

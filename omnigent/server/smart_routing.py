@@ -62,6 +62,20 @@ MODEL_LISTS: dict[str, list[str]] = {
     ],
 }
 
+# Endpoints served today that the curated ordering above deliberately omits:
+# they ARE the router's current arms, and listing them in MODEL_LISTS would give
+# each arm a capability class, which is what the tier-based substitution uses to
+# stand in for an arm a workspace does NOT serve. They are offered as candidates
+# so a routed arm resolves to its own endpoint instead of substituting down a
+# generation (a routed gpt-5-6-sol landing on gpt-5-5).
+_CURRENT_GENERATION_MODELS: dict[str, tuple[str, ...]] = {
+    "gpt": (
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-terra",
+        "databricks-gpt-5-6-sol",
+    ),
+}
+
 _HARNESS_FAMILY: dict[str, str] = {
     "claude-sdk": "claude",
     "claude_sdk": "claude",
@@ -76,13 +90,21 @@ _HARNESS_FAMILY: dict[str, str] = {
 
 
 def infer_models(harness: str | None) -> list[str] | None:
-    """Return available models for *harness*, or ``None`` if unroutable."""
+    """Return available models for *harness*, or ``None`` if unroutable.
+
+    The curated ordering plus the current generation's endpoints
+    (:data:`_CURRENT_GENERATION_MODELS`), so a routed current arm resolves to
+    its own endpoint rather than substituting down a generation.
+    """
     if harness is None:
         return None
     family = _HARNESS_FAMILY.get(harness)
     if family is None:
         return None
-    return MODEL_LISTS.get(family)
+    curated = MODEL_LISTS.get(family)
+    if curated is None:
+        return None
+    return [*curated, *_CURRENT_GENERATION_MODELS.get(family, ())]
 
 
 def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
@@ -594,7 +616,8 @@ class RouteOptionSource(Protocol):
 # ``databricks-gpt-5-5`` and the bare ``gpt-5-5`` the router speaks.
 _BARE_ID_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 
-# Router arms whose family isn't obvious from the id itself.
+# Router arms whose family the shared token rule cannot derive from the id.
+# glm-5-2 stays pinned as a belt-and-braces anchor for the current menu.
 _ARM_FAMILY: dict[str, str] = {"glm-5-2": "gpt"}
 
 # Harness family that serves several vendors and so never wins family matching
@@ -638,16 +661,20 @@ def _bare_id(model: str) -> str:
 
 
 def _model_family(model: str) -> str:
-    """Tag *model* with the harness family that can serve it."""
+    """Tag *model* with the harness family that can serve it.
+
+    Defers to the shared token rule so this file, the dispatch gate, and
+    subagent candidate filtering never disagree about a family; the
+    ``"openai"`` token there is this file's ``"gpt"`` family.
+    """
+    from omnigent.model_catalog import model_family_token
+
     bare = _bare_id(model).lower()
     known = _ARM_FAMILY.get(bare)
     if known is not None:
         return known
-    if "claude" in bare:
-        return "claude"
-    if "gpt" in bare or "codex" in bare:
-        return "gpt"
-    return "other"
+    token = model_family_token(bare)
+    return "gpt" if token == "openai" else token
 
 
 # Capability ranking for substitute picks.
@@ -1217,10 +1244,11 @@ _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "codex", "pi")
 # Native terminal harnesses offered when Smart Routing is picked as a top-level
 # harness (no bundle agent). Both families are on the menu, so the seam builds
 # the router's "both" scenario and the pick maps onto the matching native
-# wrapper agent (claude-native-ui / codex-native-ui). Native candidates come
-# from the static ``infer_models`` table — the live runner catalog only knows
-# the in-process SDK workers — and are intersected with the host's installed
-# CLIs by the caller, since a missing binary cannot launch a terminal.
+# wrapper agent (claude-native-ui / codex-native-ui). The caller resolves the
+# candidates' models from the host's pre-launch model options (no runner exists
+# at create time) and falls back to the static ``infer_models`` table for the
+# harnesses the host cannot answer for; candidates are also intersected with the
+# host's installed CLIs, since a missing binary cannot launch a terminal.
 AUTO_NATIVE_ROUTING_HARNESSES: tuple[str, ...] = ("claude-native", "codex-native")
 
 # The live runner catalog (fetch_runner_models) keys rows by WORKER name — the
@@ -1245,6 +1273,7 @@ async def route_session_harness(
     runner_client: httpx.AsyncClient | None = None,
     allowed_family: str | None = None,
     harness_candidates: Sequence[str] | None = None,
+    catalog: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -1272,6 +1301,10 @@ async def route_session_harness(
         that must land on a native terminal. Callers narrow it to what the host
         can actually run; an empty sequence yields the standard "no routable
         harnesses" error. ``None`` uses :data:`_AUTO_ROUTING_HARNESSES`.
+    :param catalog: Harness → model ids resolved without a runner, e.g. the
+        host's pre-launch model options during a session create. Used when no
+        live runner catalog is in reach; the static table then only tops up the
+        candidates it could not answer for.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -1323,11 +1356,22 @@ async def route_session_harness(
                 # First worker wins for a given harness id (dedupe).
                 harness_models.setdefault(harness, in_family)
 
-    # Fall back to the static table when the live catalog produced no
-    # routable candidates (e.g. a child session whose catalog only lists
-    # "self" under an unrecognized worker name, or the runner was unreachable).
-    if not harness_models:
+    # No runner to ask (a create routes before the session exists): take the
+    # caller's pre-session catalog, family-filtered like the live one.
+    if not harness_models and catalog:
         for h in candidate_harnesses:
+            in_family = models_in_family(h, catalog.get(h) or ())
+            if in_family:
+                harness_models[h] = in_family
+
+    # Fall back to the static table when neither catalog produced routable
+    # candidates (e.g. a child session whose catalog only lists "self" under an
+    # unrecognized worker name, or the runner was unreachable), and to top up
+    # candidates a pre-session catalog could not answer for.
+    if not harness_models or (catalog and len(harness_models) < len(candidate_harnesses)):
+        for h in candidate_harnesses:
+            if h in harness_models:
+                continue
             models = infer_models(h)
             if models:
                 harness_models[h] = models
