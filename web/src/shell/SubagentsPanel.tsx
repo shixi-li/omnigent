@@ -653,7 +653,7 @@ function SubagentRow({
               // per-subagent half of routing visibility.
               <span
                 data-testid="subagent-routed-model"
-                title={`Intelligent routing picked ${child.routed_model}`}
+                title={`Smart routing picked ${child.routed_model}`}
                 className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
               >
                 {shortModelName(child.routed_model)}

@@ -96,18 +96,17 @@ export const AUTO_HARNESS_ID = "auto";
  * model per turn (the ``__smart__`` sentinel). One constant so the composer
  * label, the Model dropdown and the gear tooltip can't drift.
  */
-export const INTELLIGENT_ROUTING_LABEL = "Intelligent Routing";
+export const INTELLIGENT_ROUTING_LABEL = "Smart Routing";
 
 /**
  * User-facing name for the fully-auto harness ({@link AUTO_HARNESS_ID}), where
- * the router picks the harness AND the model. Deliberately distinct from
- * {@link INTELLIGENT_ROUTING_LABEL} — they are different products of the router.
+ * the router picks the harness AND the model.
  */
-export const AUTO_HARNESS_LABEL = "Auto";
+export const AUTO_HARNESS_LABEL = "Smart Routing";
 
 /** One-line behavior blurb for {@link AUTO_HARNESS_LABEL}, shown next to the
  *  harness-picker row and as the composer chip's hover text. */
-export const AUTO_HARNESS_DESCRIPTION = "Harness and model picked per task by intelligent routing";
+export const AUTO_HARNESS_DESCRIPTION = "Harness and model picked per task by smart routing";
 
 export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<string, string> {
   const base = useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS);

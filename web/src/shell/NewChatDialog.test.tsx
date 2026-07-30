@@ -99,7 +99,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   // Mirrors the real hook: the "auto" sentinel leads the map only when the
   // server enables routing, so the Auto-harness tests exercise the real gate.
   useBrainHarnessLabels: (smartRoutingEnabled = false) => ({
-    ...(smartRoutingEnabled ? { auto: "Auto" } : {}),
+    ...(smartRoutingEnabled ? { auto: "Smart Routing" } : {}),
     "claude-sdk": "Claude SDK",
     codex: "Codex",
     cursor: "Cursor",
@@ -2820,47 +2820,47 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Intelligent Routing (per-harness Model option) + the fully-auto Auto harness
+// Smart Routing (per-harness Model option) + the fully-auto Auto harness
 //
 // Two distinct products of the router, deliberately separate in the UI:
-//  - "Intelligent Routing" is a Model choice on the two native harnesses whose
+//  - "Smart Routing" is a Model choice on the two native harnesses whose
 //    running CLI takes a per-turn model switch (claude-native / codex-native).
 //    It sends cost_control_mode_override: "on" with NO model_override.
-//  - "Auto" is a harness choice on bundle agents: the router picks harness AND
-//    model, so its config modal has nothing but Permissions.
+//  - The Auto harness is a harness choice on bundle agents: the router picks
+//    harness AND model, so its config modal has nothing but Permissions.
 // ---------------------------------------------------------------------------
 
-describe("NewChatLandingScreen intelligent routing", () => {
+describe("NewChatLandingScreen smart routing", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
     cleanup();
     localStorage.clear();
   });
 
-  it("offers Intelligent Routing in the Claude Code Model dropdown when the server enables it", () => {
+  it("offers Smart Routing in the Claude Code Model dropdown when the server enables it", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");
     openSelect("new-chat-landing-config-model");
-    expect(screen.getByRole("option", { name: "Intelligent Routing" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
     // The harness's own models stay offered alongside it.
     expect(screen.getByRole("option", { name: "Opus 4.8" })).toBeTruthy();
   });
 
-  it("hides Intelligent Routing when the server flag is off", () => {
+  it("hides Smart Routing when the server flag is off", () => {
     renderLanding({ smart_routing_enabled: false });
     openAgentConfig("a1");
     openSelect("new-chat-landing-config-model");
-    expect(screen.queryByRole("option", { name: "Intelligent Routing" })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
     expect(screen.getByRole("option", { name: "Default" })).toBeTruthy();
   });
 
-  it("offers Intelligent Routing as Codex's only Model choice besides Default", () => {
+  it("offers Smart Routing as Codex's only Model choice besides Default", () => {
     // Codex resolves its model catalog inside the running CLI, so the
     // pre-launch row offers just the two choices the create call can express.
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a2");
     openSelect("new-chat-landing-config-model");
-    expect(screen.getByRole("option", { name: "Intelligent Routing" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "Default" })).toBeTruthy();
   });
 
@@ -2889,13 +2889,13 @@ describe("NewChatLandingScreen intelligent routing", () => {
     expect(screen.getByTestId("new-chat-landing-config-cursor-mode")).toBeTruthy();
   });
 
-  it("freezes Effort to an em-dash while Intelligent Routing is selected", () => {
+  it("freezes Effort to an em-dash while Smart Routing is selected", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");
     // Pin an effort first, so the em-dash can't pass vacuously on an unset row.
     pickSelectOption("new-chat-landing-config-effort", "High");
     expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("High");
-    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
     const effort = screen.getByTestId("new-chat-landing-config-effort");
     expect(effort).toBeDisabled();
     expect(effort.textContent).toContain("—");
@@ -2915,7 +2915,7 @@ describe("NewChatLandingScreen intelligent routing", () => {
     // Pin a model + effort first so the routing pick has something to clear.
     pickSelectOption("new-chat-landing-config-model", "Opus 4.8");
     pickSelectOption("new-chat-landing-config-effort", "High");
-    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
     saveConfig();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -2941,7 +2941,7 @@ describe("NewChatLandingScreen intelligent routing", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
-  // Sticky Intelligent Routing: the pick is remembered per harness in the same
+  // Sticky Smart Routing: the pick is remembered per harness in the same
   // localStorage store as the mode/model/effort knobs, so a returning user's
   // next session on that harness starts routed.
 
@@ -2952,10 +2952,10 @@ describe("NewChatLandingScreen intelligent routing", () => {
     renderLanding(infoOverrides);
   }
 
-  it("preselects Intelligent Routing on a later session for the same harness", () => {
+  it("preselects Smart Routing on a later session for the same harness", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
     saveConfig();
     expect(
       JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
@@ -2964,33 +2964,33 @@ describe("NewChatLandingScreen intelligent routing", () => {
     remountLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "Intelligent Routing",
+      "Smart Routing",
     );
   });
 
   it("remembers Codex's routing pick without touching Claude Code's", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
     saveConfig();
 
     remountLanding({ smart_routing_enabled: true });
     openAgentConfig("a2");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "Intelligent Routing",
+      "Smart Routing",
     );
     closeMenu();
     // Claude Code never had routing picked, so it stays on Default.
     openAgentConfig("a1");
     const model = screen.getByTestId("new-chat-landing-config-model");
     expect(model.textContent).toContain("Default");
-    expect(model.textContent).not.toContain("Intelligent Routing");
+    expect(model.textContent).not.toContain("Smart Routing");
   });
 
   it("drops back to Default once the user picks a model again", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Intelligent Routing");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
     saveConfig();
     openAgentConfig("a1");
     openSelect("new-chat-landing-config-model");
@@ -3002,7 +3002,7 @@ describe("NewChatLandingScreen intelligent routing", () => {
     openAgentConfig("a1");
     const model = screen.getByTestId("new-chat-landing-config-model");
     expect(model.textContent).toContain("Default");
-    expect(model.textContent).not.toContain("Intelligent Routing");
+    expect(model.textContent).not.toContain("Smart Routing");
   });
 
   it("falls back to Default when a remembered routing pick meets a server without routing", () => {
@@ -3014,7 +3014,7 @@ describe("NewChatLandingScreen intelligent routing", () => {
     openAgentConfig("a1");
     const model = screen.getByTestId("new-chat-landing-config-model");
     expect(model.textContent).toContain("Default");
-    expect(model.textContent).not.toContain("Intelligent Routing");
+    expect(model.textContent).not.toContain("Smart Routing");
   });
 
   it("omits cost_control_mode_override when a remembered pick can't be honored", async () => {
@@ -3092,7 +3092,7 @@ describe("NewChatLandingScreen Auto harness", () => {
   /** Select the Auto harness from the bundle agent's Agent Harness row. */
   function selectAutoHarness(): void {
     openAgentConfig("ag_polly");
-    pickSelectOption("new-chat-landing-config-harness", "Auto");
+    pickSelectOption("new-chat-landing-config-harness", "Smart Routing");
     saveConfig();
   }
 
@@ -3101,28 +3101,25 @@ describe("NewChatLandingScreen Auto harness", () => {
     openAgentConfig("ag_polly");
     openSelect("new-chat-landing-config-harness");
     const auto = screen.getByTestId("new-chat-landing-harness-auto");
-    expect(auto.textContent).toContain("Auto");
-    expect(auto.textContent).toContain("Harness and model picked per task by intelligent routing");
+    expect(auto.textContent).toContain("Smart Routing");
+    expect(auto.textContent).toContain("Harness and model picked per task by smart routing");
   });
 
-  it("reads 'Auto' on the composer chip, with the behavior as hover text", () => {
+  it("reads 'Smart Routing' on the composer chip, with the behavior as hover text", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
     const chip = screen.getByTestId("new-chat-landing-agent-select");
-    expect(chip.textContent).toContain("Auto");
+    expect(chip.textContent).toContain("Smart Routing");
     // The agent it falls back to must not be named — the router owns the pick.
     expect(chip.textContent).not.toContain("Polly");
-    expect(chip).toHaveAttribute(
-      "title",
-      "Harness and model picked per task by intelligent routing",
-    );
+    expect(chip).toHaveAttribute("title", "Harness and model picked per task by smart routing");
   });
 
-  it("shows only Permissions in the Auto config modal, titled 'Configure Auto'", () => {
+  it("shows only Permissions in the Auto config modal, titled 'Configure Smart Routing'", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByText("Configure Auto")).toBeTruthy();
+    expect(screen.getByText("Configure Smart Routing")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
     // Every harness-specific knob is undecidable before the router picks.
     expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
@@ -3160,7 +3157,9 @@ describe("NewChatLandingScreen Auto harness", () => {
   it("leaves Auto via the picker: re-selecting the agent restores its own harness", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Auto");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Smart Routing",
+    );
     selectAgent("ag_polly");
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
     // The Agent Harness row is back, so the full modal is reachable again.

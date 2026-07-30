@@ -138,7 +138,7 @@ function rawPickName(model: string, rawModel: string | null | undefined): string
 }
 
 /**
- * Muted inline chip announcing the intelligent model router's pick at
+ * Muted inline chip announcing smart routing's pick at
  * the start of a turn.
  */
 export function RoutingDecisionChip({
@@ -154,7 +154,7 @@ export function RoutingDecisionChip({
   const rawShort = rawPickName(model, rawModel);
   const scopeLabel = subagentScopeLabel(scope, agent);
   const lead = applied ? short : `would have picked ${short}`;
-  const summary = `Intelligent model router · ${lead}`;
+  const summary = `Smart routing · ${lead}`;
   return (
     <div
       className="my-1 flex flex-col items-center gap-0.5 text-muted-foreground text-xs"
@@ -165,7 +165,7 @@ export function RoutingDecisionChip({
       <span className="flex items-center gap-1.5">
         <BrainCircuitIcon className="size-3 shrink-0" />
         <span>
-          Intelligent model router{" · "}
+          Smart routing{" · "}
           {!applied && <span>would have picked </span>}
           {rawShort ? (
             <span className="text-muted-foreground/70" data-testid="routing-decision-raw-model">
@@ -202,7 +202,7 @@ interface RoutingDecisionCardProps extends RoutingDecisionExtras {
 }
 
 /**
- * Collapsible card announcing the intelligent model router's session-level
+ * Collapsible card announcing smart routing's session-level
  * pick. Mirrors the SmartRoutingCard style: same container, model pill,
  * rationale, and expandable raw verdict JSON.
  *
@@ -257,7 +257,7 @@ export function RoutingDecisionCard({
     >
       <div className="flex items-center gap-1.5 text-xs">
         <BrainCircuitIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="font-medium">Intelligent routing</span>
+        <span className="font-medium">Smart routing</span>
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
         {harness ? (
           <span className="text-muted-foreground" data-testid="routing-decision-harness">

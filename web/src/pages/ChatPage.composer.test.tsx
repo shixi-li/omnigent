@@ -671,9 +671,9 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
-  it("reads 'Intelligent Routing' with no model/effort when routing is on", () => {
+  it("reads 'Smart Routing' with no model/effort when routing is on", () => {
     // The router picks model + effort per turn, so the label must not surface a
-    // stale pinned model/effort — it reads "Intelligent Routing" instead.
+    // stale pinned model/effort — it reads "Smart Routing" instead.
     useChatStore.setState({
       selectedModel: "opus",
       selectedEffort: "high",
@@ -690,7 +690,7 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Intelligent Routing");
+    expect(label()).toHaveTextContent("Smart Routing");
     expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
   });
@@ -1625,7 +1625,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).not.toContain("Permissions");
   });
 
-  it("reflects Intelligent Routing in the Model row of the summary when routing is on", async () => {
+  it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
     useChatStore.setState({ costControlModeOverride: "on" });
     renderWithTooltips(
       <Composer
@@ -1638,7 +1638,7 @@ describe("Composer config gear", () => {
     );
     fireEvent.focus(gear()!);
     const tip = await screen.findByTestId("composer-config-gear-tooltip");
-    expect(tip.textContent).toContain("Model: Intelligent Routing");
+    expect(tip.textContent).toContain("Model: Smart Routing");
   });
 
   it("omits the Effort row from the summary when routing is on (router owns effort)", async () => {
@@ -1655,7 +1655,7 @@ describe("Composer config gear", () => {
     );
     fireEvent.focus(gear()!);
     const tip = await screen.findByTestId("composer-config-gear-tooltip");
-    expect(tip.textContent).toContain("Model: Intelligent Routing");
+    expect(tip.textContent).toContain("Model: Smart Routing");
     // The router picks effort per turn, so a pinned effort must not show.
     expect(tip.textContent).not.toContain("Effort:");
   });
@@ -1696,8 +1696,8 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("offers a standalone Intelligent Routing switch for routable agents with no Model dropdown (applied on Save)", async () => {
-    // An SDK/bundle agent (Polly) has no Model dropdown, so Intelligent Routing gets a
+  it("offers a standalone Smart Routing switch for routable agents with no Model dropdown (applied on Save)", async () => {
+    // An SDK/bundle agent (Polly) has no Model dropdown, so Smart Routing gets a
     // standalone switch. Agents WITH a dropdown (Claude, Codex) fold it in — see
     // the fold-in test below.
     const setCostControlMode = vi.fn().mockResolvedValue(undefined);
@@ -1720,8 +1720,8 @@ describe("Composer config gear", () => {
     await waitFor(() => expect(setCostControlMode).toHaveBeenCalledWith("on"));
   });
 
-  it("folds Intelligent Routing into the Codex Model dropdown (no standalone switch)", async () => {
-    // Regression: Codex has a Model dropdown, so Intelligent Routing must be an option
+  it("folds Smart Routing into the Codex Model dropdown (no standalone switch)", async () => {
+    // Regression: Codex has a Model dropdown, so Smart Routing must be an option
     // inside it (like Claude) — NOT a separate switch alongside the dropdown.
     renderWithTooltips(
       <Composer
@@ -1812,7 +1812,7 @@ describe("Composer config gear", () => {
     expect(setEffort).not.toHaveBeenCalled();
   });
 
-  it("re-pins the model when turning Intelligent Routing off, even if the shown model is unchanged", async () => {
+  it("re-pins the model when turning Smart Routing off, even if the shown model is unchanged", async () => {
     // Routing-on clears the applied override but keeps the cross-session sticky
     // (selectedModel), so the modal shows that model as "resolved". Turning
     // routing off by re-picking that same model must still PATCH setModel —
@@ -1911,7 +1911,7 @@ describe("Composer config gear", () => {
     expect(setModel).not.toHaveBeenCalled();
   });
 
-  it("folds Intelligent Routing into the Claude Model dropdown (no standalone switch)", async () => {
+  it("folds Smart Routing into the Claude Model dropdown (no standalone switch)", async () => {
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -2009,13 +2009,13 @@ describe("Composer config gear — subagent routing", () => {
     expect(gear()).not.toBeNull();
   });
 
-  it("displays the inherited value (Intelligent Routing) on a routed session", async () => {
+  it("displays the inherited value (Smart Routing) on a routed session", async () => {
     // A routed session (e.g. created with the fully-auto harness) has no
     // in-session IR control, so the inherited value comes from the committed
     // cost-control switch.
     useChatStore.setState({ costControlModeOverride: "on", subagentRoutingOverride: null });
     await openNativeModal();
-    expect(row()!.textContent).toContain("Intelligent Routing");
+    expect(row()!.textContent).toContain("Smart Routing");
     expect(screen.getByText("Following this session's model setting")).toBeTruthy();
   });
 
@@ -2023,7 +2023,7 @@ describe("Composer config gear — subagent routing", () => {
     useChatStore.setState({ costControlModeOverride: null, subagentRoutingOverride: null });
     await openNativeModal();
     expect(row()!.textContent).toContain("Default");
-    expect(row()!.textContent).not.toContain("Intelligent Routing");
+    expect(row()!.textContent).not.toContain("Smart Routing");
     expect(screen.getByText("Following this session's model setting")).toBeTruthy();
   });
 
@@ -2033,22 +2033,22 @@ describe("Composer config gear — subagent routing", () => {
     useChatStore.setState({ costControlModeOverride: "on", subagentRoutingOverride: "off" });
     await openNativeModal();
     expect(row()!.textContent).toContain("Default");
-    expect(row()!.textContent).not.toContain("Intelligent Routing");
+    expect(row()!.textContent).not.toContain("Smart Routing");
     expect(screen.queryByText("Following this session's model setting")).toBeNull();
     expect(screen.getByText("Model routing for subagents this session spawns")).toBeTruthy();
   });
 
   it("tracks the drafted Model pick while inheriting on a routing-eligible session", async () => {
-    // An SDK session CAN switch its own model to Intelligent Routing; while the
+    // An SDK session CAN switch its own model to Smart Routing; while the
     // sub-agent row inherits, it must preview that draft rather than the
     // committed value.
     useChatStore.setState({ costControlModeOverride: null, subagentRoutingOverride: null });
     await openNativeModal({ costRoutingEligible: true });
     expect(row()!.textContent).toContain("Default");
-    // Draft Intelligent Routing on the Model row.
+    // Draft Smart Routing on the Model row.
     fireEvent.click(screen.getByTestId("composer-config-model"));
-    fireEvent.click(screen.getByRole("option", { name: "Intelligent Routing" }));
-    expect(row()!.textContent).toContain("Intelligent Routing");
+    fireEvent.click(screen.getByRole("option", { name: "Smart Routing" }));
+    expect(row()!.textContent).toContain("Smart Routing");
   });
 
   it("PATCHes the picked value on Save (drafted until then)", async () => {

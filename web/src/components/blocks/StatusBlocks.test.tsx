@@ -4,7 +4,7 @@ import { RoutingDecisionCard, RoutingDecisionChip } from "./StatusBlocks";
 
 afterEach(cleanup);
 
-describe("RoutingDecisionChip — intelligent model router", () => {
+describe("RoutingDecisionChip — smart routing", () => {
   it("applied verdict: names the active model with its tier, plus the rationale line", () => {
     render(
       <RoutingDecisionChip
@@ -17,7 +17,7 @@ describe("RoutingDecisionChip — intelligent model router", () => {
     // Visible without hovering: the short model name + tier render in the
     // chip text. A missing model/tier would mean the verdict didn't thread
     // through the block pipeline.
-    expect(chip).toHaveTextContent("Intelligent model router");
+    expect(chip).toHaveTextContent("Smart routing");
     expect(chip).toHaveTextContent("opus");
     expect(chip.textContent).not.toContain("(expensive)");
     // The rationale shows as a muted second line (not hover-only).
@@ -57,7 +57,7 @@ describe("RoutingDecisionChip — intelligent model router", () => {
     const chip = screen.getByTestId("routing-decision-chip");
     // The feature was renamed from "Intelligent model control"; the chip
     // must carry the new name and never the retired one.
-    expect(chip.textContent).toContain("Intelligent model router");
+    expect(chip.textContent).toContain("Smart routing");
     expect(chip.textContent).not.toContain("model control");
     expect(chip.textContent).not.toContain("Model Control");
   });
@@ -73,7 +73,7 @@ describe("RoutingDecisionCard — session-level auto-routing", () => {
       />,
     );
     const card = screen.getByTestId("routing-decision-card");
-    expect(card).toHaveTextContent("Intelligent routing");
+    expect(card).toHaveTextContent("Smart routing");
     expect(card).toHaveTextContent("· applied");
     expect(card).toHaveTextContent("Session");
     expect(card).toHaveTextContent("opus");
@@ -188,7 +188,7 @@ describe("routing decision — harness / scope / raw pick", () => {
   it("chip: renders exactly as before when no new field is set", () => {
     render(<RoutingDecisionChip model="databricks-claude-opus-4-8" applied rationale="deep" />);
     const chip = screen.getByTestId("routing-decision-chip");
-    expect(chip).toHaveTextContent("Intelligent model router");
+    expect(chip).toHaveTextContent("Smart routing");
     expect(chip).toHaveTextContent("opus");
     expect(screen.queryByTestId("routing-decision-harness")).toBeNull();
     expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
