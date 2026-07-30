@@ -683,3 +683,212 @@ shipped on `routing-mvp`; decision 5 is in flight.
    as well as main agent routing", which the CUJ audit flagged as unimplemented:
    decision 1 covers main-agent routing at session start, decision 5 covers
    subagent routing at any time.
+
+7. **Top-level Smart Routing sessions are session-pinned; no per-turn
+   re-routing (Bryan, 2026-07-29).**  The agentless "Smart Routing" harness
+   routes once, at session start, over the five-arm `both` menu, and the pick
+   (harness *and* model) holds for the life of the session. Later turns do not
+   re-enter `routes:select`, even when they look nothing like the first one.
+   Rationale: the harness pick is physical — a session *is* a live `claude` or
+   `codex` process with its own bridge, config and pane — so "re-route turn 2"
+   means killing and relaunching a process mid-conversation. Consistent with
+   decision 4 (main-agent routing is a session-start concept); per-turn
+   routing waits on `session_history` (§1.1) and is out of MVP scope.
+
+8. **Routed `/model` writing the user's claude default is accepted for now.**
+   Applying a routed model to a native Claude Code pane types `/model <alias>`
+   into the TUI, and Claude Code persists that choice as the machine's default
+   model — so a routed session leaves the user's next *manual* `claude` launch
+   on the routed arm. This matches the pre-existing behavior of the harness
+   config modal's Model picker (which drives the same `/model` path), so
+   routing introduces no new surprise. Not worth a save/restore dance for MVP;
+   revisit if a non-persisting model API lands upstream.
+
+---
+
+## 11. Canonical CUJ test matrix (Bryan, 2026-07-29)
+
+The referencable pass for "is Smart Routing actually working". Same four
+prompts every time, so results are comparable across runs and across the
+manual UI pass and the headless driver. Expected routes are **derived from the
+frozen `task_v1` recipe** (§1), not from what we hope happens:
+
+- **`cc` scenario** (Claude arms only): rule-0 → `claude-sonnet-5` (<300 chars,
+  no code refs, `difficulty == easy`, cheapest arm, never escalates); else if
+  `not_crosscutting AND not_mixed_change AND low_ambiguity` all hold → escalate
+  `claude-opus-4-8`; else default `claude-sonnet-5`.
+- **`codex` scenario** (Codex arms only): rule-0 → `gpt-5-6-luna`; else if
+  `not_crosscutting AND prompt_short` both hold → delegate `glm-5-2`; else
+  default `gpt-5-6-sol`.
+- **`both` scenario** (all five arms): rule-0 → `gpt-5-6-luna`; else the
+  three-way conjunction all-holds → escalate `claude-opus-4-8`; else default
+  `gpt-5-6-sol`.
+
+**The bar is `raw_model == applied_model`.** A decision chip showing a
+substitution arrow (router picked X, we ran Y) is a **failure**, not a
+tolerated degrade — the two worst bugs on this branch were caught exactly that
+way. One exception is tracked in row C1 below.
+
+### 11.1 The four canonical prompts
+
+**P-OPUS** — clear, contained, code-referencing feature work (620 chars). Fails
+rule-0 (too long, backticked symbol) and satisfies the whole conjunction, so
+the `cc`/`both` recipes escalate to opus:
+
+```
+Add a --dry-run flag to our `deploy` CLI command. When passed, the command should resolve the full deployment plan — the ordered list of services to update, the target version for each, and any config changes — and print it as a human-readable table, then exit 0 without calling the orchestration API or mutating any state. Without the flag, behavior is unchanged. Reuse the existing plan-resolution logic from the real run (do not duplicate it) so the dry-run output always matches what a real deploy would do, and document the flag in the command's help text. Add tests asserting no API calls are made in dry-run mode.
+```
+
+**P-GLM** — narrow, well-specified bug fix (604 chars), inside the
+`prompt_short` bucket and not crosscutting, so the `codex` recipe delegates to
+glm:
+
+```
+The `parse_duration` helper in our config module returns None for values like "1h30m" because its regex only matches a single unit group, so any compound duration silently becomes None and the caller falls back to the default timeout. Fix the parser to accept compound durations combining days, hours, minutes, and seconds (e.g. "1h30m", "2d4h", "45s") and return the total number of seconds as an int. Preserve the current behavior for single-unit values and for the empty string, and raise a ValueError on genuinely malformed input instead of returning None. Add unit tests covering the compound cases.
+```
+
+Length matters here: keep P-GLM under ~1.2k chars. A longer variant fails
+`prompt_short` and the codex recipe falls through to `gpt-5-6-sol` — a green
+run on a bloated prompt proves nothing about the glm arm.
+
+**P-SOL** — the AIGW Intelligent Routing Brainstorm doc pasted whole (long,
+cross-cutting, many surfaces and open questions). Not embedded here; paste the
+doc verbatim from the meeting notes. `not_crosscutting` fails, so `codex`/`both`
+land on the `gpt-5-6-sol` default and `cc` falls back to `claude-sonnet-5`.
+
+**P-TRIVIAL** — literally:
+
+```
+hi
+```
+
+Under 300 chars, no code refs, easy → rule-0 fires. That means
+**`gpt-5-6-luna`** on `codex`/`both` and **`claude-sonnet-5`** on `cc` (rule-0
+picks the scenario's cheapest arm, and the `cc` menu has no luna).
+
+> **`gpt-5-4-mini` is not an arm.** It is task_v1's *extraction* model (§1.1),
+> called on every routing request to score change scope / ambiguity /
+> difficulty. "hi → 5-4-mini" is a misread of the recipe; if a decision ever
+> *applies* `gpt-5-4-mini`, that is a bug in our option list, not the router.
+
+**Probing luna specifically.** luna is rule-0's arm on every Codex-bearing
+scenario, so any short, code-free, easy prompt lands it — useful when you want
+a cheap smoke test rather than the full battery. Known-good examples: `hi`,
+`what time is it?`, `summarize what this repo does in two sentences`.
+
+### 11.2 Matrix
+
+Every row asserts four things: the decision exists, the decision is the
+expected one, the **applied** model equals the raw pick, and the harness
+process is really on that model.
+
+**Verification handles** (same for all rows):
+- **Chip** — routing chip rendered under the user message, no substitution arrow.
+- **Card** — decision card / rationale expands and names the predicates.
+- **Claude process truth** — `tmux capture-pane` on the session's pane: the
+  injected `/model <alias>` line and the resulting model banner.
+- **Codex process truth** — the TUI status-bar model, the session's
+  `config.toml` under the bridge dir's codex-home, and the newest rollout
+  `.jsonl` in that codex-home's `sessions/`.
+
+#### A. Top-level Smart Routing harness (`both` scenario, all five arms)
+
+| # | Prompt | Expected decision | Expected APPLIED model | Verify |
+|---|---|---|---|---|
+| A1 | P-OPUS | conjunction all-holds → escalate | `claude-opus-4-8` (harness: claude-code) | chip + card; claude pane banner + `/model` echo |
+| A2 | P-GLM | conjunction all-holds → escalate | `claude-opus-4-8` (harness: claude-code) | as A1 |
+| A3 | P-SOL | crosscutting → default | `gpt-5-6-sol` (harness: codex) | chip + card; codex status bar + `config.toml` + rollout jsonl |
+| A4 | P-TRIVIAL | rule-0 → cheapest arm | `gpt-5-6-luna` (harness: codex) | as A3 |
+
+Session-scope decision only (§10 decision 7) — turn 2 must **not** produce a
+second session-scope decision. Subagents here **may** be either family;
+cross-harness spawns are legal in scenario A and only here.
+
+#### B. Claude Code + Model = Smart Routing (`cc` scenario, Claude arms only)
+
+| # | Prompt | Expected decision | Expected APPLIED model | Verify |
+|---|---|---|---|---|
+| B1 | P-OPUS | conjunction all-holds → escalate | `claude-opus-4-8` | chip + card; pane banner Opus after `/model opus` |
+| B2 | P-SOL (conjunction-failing) | crosscutting → default | `claude-sonnet-5` | chip + card; pane banner Sonnet |
+| B3 | P-TRIVIAL | rule-0 → cheapest arm | `claude-sonnet-5` | as B2 |
+| B4 | Task spawns (Explore, general-purpose, …) | one decision per spawn, routed on the **Task prompt** | a Claude arm — never a Codex arm | chip per spawn + sub-agents panel model |
+| B5 | Gear → Subagent routing = **Default** mid-session | next spawn produces **no** decision chip | spawn proceeds on harness default | flip, spawn immediately, confirm chip absent |
+| B6 | Gear → Subagent routing = **Intelligent Routing** again | chips resume on the very next spawn | routed Claude arm | as B4 |
+
+B5 is the strict form of the mid-session toggle: the gate is re-checked **per
+call**, so suppression must be visible on the *next* spawn, not "eventually".
+
+#### C. Codex + Model = Smart Routing (`codex` scenario, Codex arms only)
+
+| # | Prompt | Expected decision | Expected APPLIED model | Verify |
+|---|---|---|---|---|
+| C1 | P-GLM | `not_crosscutting AND prompt_short` → delegate | `glm-5-2` | codex status bar + `config.toml` + rollout jsonl — see the flag below |
+| C2 | P-SOL | crosscutting → default | `gpt-5-6-sol` | as C1 |
+| C3 | P-TRIVIAL | rule-0 → cheapest arm | `gpt-5-6-luna` | as C1 |
+| C4 | Named `spawn_agent` calls | one decision per spawn, routed on the task/agent name | a Codex arm — never a Claude arm | chip per spawn + SubagentStart audit record |
+| C5 | Unnamed spawns | routed on the `"Codex subagent task"` placeholder (short, code-free) | `gpt-5-6-luna` | as C4 |
+| C6 | Mid-session Subagent routing → Default, then back on | chips stop on the next spawn, resume when re-enabled | harness default, then routed Codex arm | as B5/B6 |
+
+> **C1 flag (tracked, the only tolerated fallback).** `glm-5-2` must appear in
+> the codex model list for the session to *run* it — that list is
+> client-side in codex/ucode and today has no glm entry (§CUJ status), and it
+> must also pass omnigent's family whitelist. Until the list lands, C1 shows a
+> substitution arrow (`glm-5-2` → a servable Codex arm). This is the **only**
+> row where an arrow is accepted, it is an external isaac/ucode dependency, and
+> it stays on the tracked list until fixed. Every other arrow is a bug.
+
+#### D. Global assertions (apply to every row above)
+
+1. **No fallback arrows.** `raw_model == applied_model` on every decision,
+   C1 excepted.
+2. **Every decision is visible** as both a chip (paired under the triggering
+   user message) and an expandable decision card with the router's rationale.
+3. **Cross-harness spawns appear only under A.** A `cc` session must never
+   spawn a Codex arm and a `codex` session must never spawn a Claude arm — the
+   same-harness constraint covers native spawns *and* omnigent child sessions.
+4. **Process truth beats UI.** A row is only green when the harness process
+   confirms the model; a chip alone is 🟡.
+
+### 11.3 Headless driver recipe
+
+For the fast, repeatable pass (no clicking). Same server as the manual stack.
+
+1. **Create the session** — `POST /v1/sessions` with `agent_id`, `host_id`,
+   `workspace`, and `cost_control_mode_override: "on"`, and **no** model or
+   effort pin. That is exactly what the Model = Smart Routing path sends
+   (§10 decision 1); a pin silently disables routing.
+2. **Send a turn** — `POST` the session's events endpoint with
+
+   ```json
+   {"type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "<canonical prompt>"}]}}
+   ```
+
+   Paste the prompt raw — `task.prompt` is the entire routing signal (§1.1),
+   so any wrapper or summary changes the answer.
+3. **Read the decisions** — query the dev DB
+   (`$OMNIGENT_DATA_DIR/chat.db`):
+
+   ```sql
+   SELECT * FROM conversation_items WHERE data LIKE '%rationale%' ORDER BY rowid;
+   ```
+
+   Each row carries the scope, the raw pick, the applied model and the router
+   rationale — enough to score raw-vs-applied without the UI.
+4. **Codex ground truth** — in the session's bridge dir, read the codex-home
+   `config.toml` (`model = …`) and the newest rollout `.jsonl` under
+   `sessions/`; the rollout is what the process actually ran.
+5. **Claude ground truth** — take the `tmux_socket` from the runner log for the
+   session and `tmux -S <socket> capture-pane -p` the pane: assert the injected
+   `/model` line and the banner that follows it.
+
+### 11.4 Stack
+
+```sh
+./run-server.sh      # :6868, isolated OMNIGENT_CONFIG_HOME/OMNIGENT_DATA_DIR
+./run-host.sh        # runner against localhost:6868
+./run-frontend.sh    # :5273
+```
+
+Staging AIGW, `router_name: task_v1` (§1.1 dev-loop config). The manual pass
+uses the same three processes as the headless driver, so a headless red row can
+be re-checked by hand without restarting anything.
