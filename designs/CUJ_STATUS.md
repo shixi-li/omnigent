@@ -10,7 +10,7 @@ Living checklist, maintained by the lead session. Legend:
 "UI" = what chips/dropdowns/panels display. "Process" = what the harness
 process actually runs (rollout files, panes, config, spawned models).
 
-Last updated: 2026-07-29 night — all engineering rows closed; remaining items are user decisions/confirms.
+Last updated: 2026-07-29 late night — child constraint, chip pairing, rename, telemetry rework landed; top-level Smart Routing harness in flight.
 
 ## 1. Claude Code CUJ (IR main session)
 
@@ -48,7 +48,7 @@ Last updated: 2026-07-29 night — all engineering rows closed; remaining items 
 |---|---|---|
 | Claude subagent decisions (chips per spawn) | ✅ user | decisions fire |
 | **Claude subagent spawns get the routed model** | ✅ evidence | live re-test post-fix: Explore spawn ran to completion with routed sonnet-5 decision (was 7ms schema failure) |
-| Same-harness constraint (no codex suggestions in CC) | 🟡 | user: "seems like it's being followed" — not deliberately exercised yet |
+| Same-harness constraint (native spawns + omnigent children) | ✅ evidence | hook path shipped earlier; child-session gap found live (codex parent → 9 forced-auto children, some claude-opus) and fixed (5a397d6f): children stay in the parent's family unless the parent is genuinely Smart Routing |
 | **Codex subagent hooks execute at all** | ✅ evidence | live E2E post -I fix (518376ba): canary fired, PreToolUse gate ran, SubagentStart audit recorded the spawn on the routed model (luna). Root causes: app-server ignores the bypass flag (persisted trust handshake added) + cwd shadowing killed hook imports (python -I) |
 | Canary → `subagent_routing_unenforced` warning banner | ✅ evidence | watcher posted every 30s and the warning surfaced on the session snapshot during the shadowing incident — the watcher is what caught the bug |
 | In-session Subagent routing row (IR/Default, inherit) | ✅ user | toggle enables/disables routing as expected |
@@ -60,11 +60,20 @@ Last updated: 2026-07-29 night — all engineering rows closed; remaining items 
 | Layer | Status | Evidence / notes |
 |---|---|---|
 | Decision chips show raw→applied divergence | ✅ user | this is how two real bugs were caught — keep it |
-| Chip below the user message | 🟡 | render rule shipped (8fa280ea, streaming-tested both arrival orders) — awaiting user visual confirm |
+| Chip below the user message | 🟡 | render rule (8fa280ea) + claude fix: the injected /model echo broke pairing on claude only, now skipped (25b75c62) — awaiting user visual confirm on a fresh claude session |
 | Per-subagent routed model in sub-agents panel | 🟡 ui-only | displays child model_override, which for claude ≠ actual spawned model until apply fix lands |
 | Session warning banner renders when server publishes | ⬜ | component shipped; never seen live (see canary ❌) |
-| `omnigent.routing.*` OTel events | ⬜ | needs OTEL endpoint configured to observe |
-| Switch-off / fork telemetry triggers | ⬜ | |
+| Routing analytics (OSS telemetry pipeline) | 🟡 | reworked per PR review (c7f78f26): RoutingDecisionEvent/RoutingSettingChangedEvent with family/tier-only model labels; OTel helper deleted; not yet observed against a live ingestion endpoint |
+| Switch-off / fork telemetry triggers | ⬜ | browser-side spans only (routingTelemetry.ts); server-side toggle event ships in RoutingSettingChangedEvent |
+
+### Renames & new asks (2026-07-29 late)
+
+| Item | Status |
+|---|---|
+| All UI labels renamed to "Smart Routing" | ✅ user-directed, shipped e5c8a160 |
+| Top-level Smart Routing harness in the landing dropdown (agentless auto over native claude/codex) | 🔨 in flight (`smart-routing-harness` agent) |
+| GLM absent from codex model list (eng-ml-agent-platform) | ❌ external: codex's client-side model registry/ucode has no glm-5-2; gateway serves no /models on the codex path — isaac/ucode distribution question, not omnigent |
+| task_v1 escalates clear+contained prompts to opus (well-written spawn prompts always pay opus) | 📝 recipe feedback for Ivan — frozen router, needs task_v2 |
 
 ## 6. Meta
 
