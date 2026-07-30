@@ -33,7 +33,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -75,6 +75,19 @@ AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
 
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
+
+#: Task text scored when a spawn carries no signal of its own — codex
+#: encrypts the spawn message, so an unnamed subagent has nothing to score.
+#: Routing on a fixed placeholder beats skipping the router: it lands
+#: deterministically on the task router's default (cheap) arm instead of
+#: silently inheriting the session model. The exact string matches ucode's
+#: codex routing (databricks/ucode PR 251) so both products' decisions stay
+#: comparable.
+NO_SIGNAL_TASK = "Codex subagent task"
+
+#: Prefix marking a decision the router made from :data:`NO_SIGNAL_TASK`
+#: rather than the caller's own task text.
+NO_SIGNAL_RATIONALE_PREFIX = "Routed on placeholder task (encrypted prompt, no task name)"
 
 # Cross-harness counterpart used to offer the router a second family, and
 # to name the redirect target when it picks from that family.
@@ -322,8 +335,16 @@ def task_cache_key(req: SubagentRouteRequest) -> str:
     :param req: Spawn request.
     :returns: Hex digest identifying identical spawns.
     """
+    # No-signal spawns key on the placeholder they are actually routed on, so
+    # every one of them shares a single router call.
+    _, placeholder = _routing_task(req)
     material = "\x00".join(
-        [req.harness, req.task_name, req.prompt or "", req.parent_model or ""],
+        [
+            req.harness,
+            NO_SIGNAL_TASK if placeholder else req.task_name,
+            req.prompt or "",
+            req.parent_model or "",
+        ],
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -507,12 +528,19 @@ def candidate_models(
     return result
 
 
-def _routing_prompt(req: SubagentRouteRequest) -> str:
-    """Return the raw task text the router should score."""
+def _routing_task(req: SubagentRouteRequest) -> tuple[str, bool]:
+    """Return the task text the router should score.
+
+    :param req: Spawn request.
+    :returns: ``(task text, used placeholder)`` — the flag is ``True`` when
+        the spawn carried no signal of its own.
+    """
     if req.prompt:
-        return req.prompt[:_PROMPT_CAP]
+        return req.prompt[:_PROMPT_CAP], False
     # Codex encrypts the spawn message, so ``task_name`` is the only signal.
-    return req.task_name[:_PROMPT_CAP]
+    if req.task_name:
+        return req.task_name[:_PROMPT_CAP], False
+    return NO_SIGNAL_TASK, True
 
 
 def _fail_mode_decision(settings: _Settings, reason: str) -> SubagentRouteDecision:
@@ -619,23 +647,7 @@ async def _decide(
             model=req.parent_model,
         )
 
-    if not req.prompt and not req.task_name:
-        # Codex encrypts the spawn message, so an unnamed codex subagent
-        # carries nothing to score. Calling the router anyway earns an
-        # "HTTP 400: task.prompt is required" that reads on the decision chip
-        # as an outage; this is a deliberate verdict, so say so. Not cached:
-        # there is no router result to reuse. The spawn runs on the parent's
-        # thread model, which the SubagentStart audit confirms, so naming it
-        # here also keeps the audit reconciliation from flagging the spawn.
-        return SubagentRouteDecision(
-            action="allow",
-            rationale=(
-                "No routable signal (encrypted prompt, no task name); "
-                "subagent inherits the session model"
-            ),
-            model=req.parent_model,
-        )
-
+    task, placeholder = _routing_task(req)
     key = task_cache_key(req)
     cached = _cached(session_id, key, clock)
     if cached is not None:
@@ -654,7 +666,7 @@ async def _decide(
         return _fail_mode_decision(settings, f"no candidate models for harness {req.harness}")
 
     try:
-        result = await client.route(_routing_prompt(req), candidates)
+        result = await client.route(task, candidates)
     except Exception:  # noqa: BLE001 — router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True
@@ -665,9 +677,24 @@ async def _decide(
         return _fail_mode_decision(settings, detail)
 
     decision = _decision_from_result(req, result, candidates)
+    if placeholder:
+        decision = _mark_placeholder_routed(decision)
     if decision.action != "deny":
         _remember(session_id, key, req, decision, settings.cache_ttl_s, clock)
     return decision
+
+
+def _mark_placeholder_routed(decision: SubagentRouteDecision) -> SubagentRouteDecision:
+    """Disclose that *decision* was made from the placeholder task.
+
+    :param decision: Verdict the router produced from :data:`NO_SIGNAL_TASK`.
+    :returns: The same verdict with the router's own rationale preserved
+        behind a prefix naming what it actually scored.
+    """
+    return replace(
+        decision,
+        rationale=f"{NO_SIGNAL_RATIONALE_PREFIX}: {decision.rationale}",
+    )
 
 
 def _decision_from_result(

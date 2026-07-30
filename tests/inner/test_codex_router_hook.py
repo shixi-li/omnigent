@@ -76,6 +76,33 @@ def test_build_route_request_never_sends_the_encrypted_prompt() -> None:
     assert _ENCRYPTED_MESSAGE not in json.dumps(body)
 
 
+def test_build_route_request_falls_back_to_agent_name() -> None:
+    """Codex names the spawn ``agent_name`` on some paths, ``task_name`` on others."""
+    tool_input = {"agent_name": "doc-writer", "message": _ENCRYPTED_MESSAGE}
+
+    body = hook.build_route_request(tool_input, harness="codex-native", parent_model=None)
+
+    assert body["task_name"] == "doc-writer"
+
+
+def test_build_route_request_prefers_task_name_over_agent_name() -> None:
+    tool_input = {"task_name": "refactor-tests", "agent_name": "doc-writer"}
+
+    body = hook.build_route_request(tool_input, harness="codex-native", parent_model=None)
+
+    assert body["task_name"] == "refactor-tests"
+
+
+def test_build_route_request_leaves_task_name_empty_when_unnamed() -> None:
+    """The server supplies the placeholder task; the hook does not invent one."""
+    body = hook.build_route_request(
+        {"message": _ENCRYPTED_MESSAGE}, harness="codex-native", parent_model=None
+    )
+
+    assert body["task_name"] == ""
+    assert body["prompt"] is None
+
+
 def test_rewrite_injects_model_and_passes_message_verbatim(
     tmp_path: Path,
     router: _Router,
@@ -100,10 +127,42 @@ def test_rewrite_injects_model_and_passes_message_verbatim(
                 "model": "claude-sonnet-5",
             },
             "permissionDecisionReason": "cheapest arm",
-        }
+        },
+        "systemMessage": "Using Intelligent Routing. Routing to claude-sonnet-5.",
     }
     assert router.calls[0]["session_id"] == "conv_abc"
     assert router.calls[0]["body"]["prompt"] is None
+
+
+def test_rewrite_surfaces_the_routed_model_in_the_codex_tui(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    """A rewrite is otherwise invisible — codex reports no model change."""
+    _advertise(tmp_path, session_id="conv_abc")
+    router.response = {"action": "rewrite", "model": "gpt-5-6-luna", "rationale": "cheap"}
+
+    out = hook.route_pre_tool_use(_payload(), router_dir=tmp_path)
+
+    assert out is not None
+    # Top level, alongside hookSpecificOutput — codex reads it there.
+    assert out["systemMessage"] == "Using Intelligent Routing. Routing to gpt-5-6-luna."
+    assert "systemMessage" not in out["hookSpecificOutput"]
+
+
+def test_deny_carries_no_routing_notice(tmp_path: Path, router: _Router) -> None:
+    """Nothing was routed to, so there is no model to announce."""
+    _advertise(tmp_path, session_id="conv_abc")
+    router.response = {"action": "deny", "rationale": "over budget"}
+
+    out = hook.route_pre_tool_use(_payload(), router_dir=tmp_path)
+
+    assert out is not None
+    assert "systemMessage" not in out
+
+
+def test_with_system_message_passes_no_opinion_through() -> None:
+    assert hook.with_system_message(None) is None
 
 
 def test_redirect_denies_with_sys_session_send_instruction(

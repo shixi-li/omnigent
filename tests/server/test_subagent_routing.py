@@ -15,10 +15,13 @@ import pytest
 from omnigent.entities.conversation import RoutingDecisionData
 from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
+    NO_SIGNAL_RATIONALE_PREFIX,
+    NO_SIGNAL_TASK,
     SubagentRouteDecision,
     SubagentRouteRequest,
     candidate_models,
     clear_cache,
+    decision_record,
     ensure_session_router,
     make_server_relay_resolver,
     persist_subagent_decision,
@@ -254,50 +257,60 @@ async def test_fork_is_exempt_and_never_calls_router() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_routable_signal_skips_the_router_and_allows_unchanged() -> None:
-    """A codex spawn with no prompt and no task name is decided locally.
+async def test_no_routable_signal_routes_on_the_placeholder_task() -> None:
+    """A spawn with no prompt and no task name is still routed.
 
     Codex encrypts the spawn message, so an unnamed subagent carries nothing
-    to score. Calling the router anyway returned "HTTP 400: task.prompt is
-    required", which the fail-open path then dressed up as "Routing
-    unavailable (...)" on the decision chip — an outage the user does not
-    have. The spawn genuinely inherits the parent's thread model (confirmed
-    by the SubagentStart audit), so the verdict is allow-unchanged and the
-    rationale says exactly that.
+    of its own to score. Skipping the router let those spawns silently
+    inherit the session model — the expensive default. Routing on a fixed
+    placeholder instead lands them deterministically on the task router's
+    cheap arm.
     """
-    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="x"))
+    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
     decision = await resolve_subagent_route(
         "conv_1",
         _request(prompt=None, task_name=""),
         caps=_FakeCaps(routing_client=client),
     )
-    assert decision.action == "allow"
-    # The parent's model is named so the chip and the audit reconciliation
-    # both see the model the subagent actually starts on.
-    assert decision.model == PARENT_MODEL
-    assert decision.rationale == (
-        "No routable signal (encrypted prompt, no task name); subagent inherits the session model"
-    )
-    # Never reaches the router: no 400, and nothing to report as an outage.
-    assert client.calls == []
-    assert "unavailable" not in decision.rationale.lower()
+    # The router is asked, and asked about the placeholder — not an empty
+    # string, which earns "HTTP 400: task.prompt is required".
+    assert [call[0] for call in client.calls] == [NO_SIGNAL_TASK]
+    assert decision.action == "rewrite"
+    assert decision.model == CLAUDE_MODEL
+    assert decision.model != PARENT_MODEL
 
 
 @pytest.mark.asyncio
-async def test_no_routable_signal_is_not_cached_as_an_outage() -> None:
-    """The no-signal verdict is recomputed, never served from the cache.
+async def test_placeholder_rationale_discloses_what_was_scored() -> None:
+    """The chip says the pick came from the placeholder, not the caller."""
+    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(prompt=None, task_name=""),
+        caps=_FakeCaps(routing_client=client),
+    )
+    assert decision.rationale == f"{NO_SIGNAL_RATIONALE_PREFIX}: cheap arm fits"
+    # The router's own words survive the prefix.
+    assert decision.rationale.endswith("cheap arm fits")
+    # A real routed pick, so the transcript item claims the model as applied.
+    record = decision_record(_request(prompt=None, task_name=""), decision)
+    assert record.applied is True
+    assert record.model == CLAUDE_MODEL
 
-    It is not a router result, so it must not occupy a cache slot that a
-    later named spawn (or a fixed client) would be answered from.
-    """
-    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="picked"))
+
+@pytest.mark.asyncio
+async def test_placeholder_spawns_share_one_router_call() -> None:
+    """Identical no-signal spawns are the same input, so they cache together."""
+    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
     caps = _FakeCaps(routing_client=client)
-    await resolve_subagent_route("conv_1", _request(prompt=None, task_name=""), caps=caps)
-    assert client.calls == []
-    # A spawn that does carry a signal still reaches the router.
-    routed = await resolve_subagent_route("conv_1", _request(), caps=caps)
+    first = await resolve_subagent_route("conv_1", _request(prompt=None, task_name=""), caps=caps)
+    second = await resolve_subagent_route("conv_1", _request(prompt=None, task_name=""), caps=caps)
     assert len(client.calls) == 1
-    assert routed.action in ("allow", "rewrite", "redirect")
+    assert second.decision_id == first.decision_id
+    # A spawn that carries its own signal is a different key and is routed.
+    await resolve_subagent_route("conv_1", _request(), caps=caps)
+    assert len(client.calls) == 2
+    assert client.calls[1][0] == "review the diff"
 
 
 @pytest.mark.asyncio

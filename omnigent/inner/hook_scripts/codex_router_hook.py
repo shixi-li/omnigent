@@ -218,7 +218,37 @@ def route_pre_tool_use(
     if decision is None:
         return None
     # The encrypted ``message`` rides along in *tool_input* untouched.
-    return decision_to_hook_output(decision, tool_input)
+    return with_system_message(decision_to_hook_output(decision, tool_input))
+
+
+def with_system_message(
+    output: dict[str, Any] | None,  # type: ignore[explicit-any]  # hook output JSON
+) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook output JSON
+    """
+    Add the routed-model notice codex's TUI surfaces to the user.
+
+    A rewrite is otherwise invisible: codex reports no model change of its
+    own, so the top-level ``systemMessage`` (alongside, not inside,
+    ``hookSpecificOutput``) is the only place the decision shows up. Same
+    wording as ucode's codex routing (databricks/ucode PR 251).
+
+    :param output: Hook output from :func:`decision_to_hook_output`, or
+        ``None`` for "no opinion".
+    :returns: *output* with a ``systemMessage`` when it rewrote the spawn's
+        model, otherwise *output* unchanged.
+    """
+    if not isinstance(output, dict):
+        return output
+    hook_output = output.get("hookSpecificOutput")
+    if not isinstance(hook_output, dict) or hook_output.get("permissionDecision") != "allow":
+        return output
+    updated_input = hook_output.get("updatedInput")
+    if not isinstance(updated_input, dict):
+        return output
+    model = updated_input.get("model")
+    if not isinstance(model, str) or not model:
+        return output
+    return {**output, "systemMessage": f"Using Intelligent Routing. Routing to {model}."}
 
 
 def _payload_model(payload: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
