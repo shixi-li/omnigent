@@ -21,7 +21,7 @@ Last updated: 2026-07-29 night (live headless battery run by the lead session).
 | Session created with routing flag, no pin | ✅ evidence | DB session_overrides |
 | Router decision + chip (below message) | ✅ user | rationale correct (task_v1 cc) |
 | Gateway env prepared at launch (ucode) | ✅ evidence | `configured=True`, ANTHROPIC_BASE_URL, apiKeyHelper |
-| **Process runs the routed model** | ❌ | **user-verified broken**: banner "Opus 5", `/model` → "Kept model as Opus 5"; the in-band `/model databricks-claude-sonnet-5` injection silently no-ops (vocabulary mismatch). Fix in flight (`fix-claude-subagent-model`, scope extended) |
+| **Process runs the routed model** | ✅ evidence | live pane proof post-fix (82cac6fa): `/model sonnet` typed under the inject lock, banner Opus 5 → Sonnet 5, second turn idempotent; root cause was model_override dropped in _run_turn_bg + alias vocabulary |
 
 ## 2. Codex CUJ (IR main session)
 
@@ -60,7 +60,7 @@ Last updated: 2026-07-29 night (live headless battery run by the lead session).
 | Layer | Status | Evidence / notes |
 |---|---|---|
 | Decision chips show raw→applied divergence | ✅ user | this is how two real bugs were caught — keep it |
-| Chip below the user message | ❌ | native path persists decision BEFORE the message (pos 1 vs 2) so order-faithful render shows it on top — render rule fix in flight (`chip-below-message`) |
+| Chip below the user message | 🟡 | render rule shipped (8fa280ea, streaming-tested both arrival orders) — awaiting user visual confirm |
 | Per-subagent routed model in sub-agents panel | 🟡 ui-only | displays child model_override, which for claude ≠ actual spawned model until apply fix lands |
 | Session warning banner renders when server publishes | ⬜ | component shipped; never seen live (see canary ❌) |
 | `omnigent.routing.*` OTel events | ⬜ | needs OTEL endpoint configured to observe |
