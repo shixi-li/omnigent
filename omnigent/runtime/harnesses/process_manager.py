@@ -229,10 +229,12 @@ def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
     return instance_dir / f"conv-{conversation_id}.sock"
 
 
-def _harness_key(harness: str, model: str | None) -> str:
-    """Return a stable entry key for a harness + model combination."""
-    if model:
-        return f"{harness}:{model}"
+def _harness_key(harness: str, model: str | None = None) -> str:
+    """Return a stable entry key for a harness.
+
+    Model is intentionally ignored — multiple models share one runner subprocess
+    per harness type; model selection is handled per-turn via ExecutorConfig.
+    """
     return harness
 
 
@@ -715,8 +717,7 @@ class HarnessProcessManager:
                     )
                 entry.last_used_at = time.monotonic()
                 return entry.client
-        requested_model = (env or {}).get(_model_env_key(harness))
-        hkey = _harness_key(harness, requested_model)
+        hkey = _harness_key(harness)
         async with self._registry_lock:
             start_generation = self._release_generations.get(hkey, 0)
         spawn_lock = await self._get_spawn_lock(hkey)
@@ -1122,11 +1123,6 @@ class HarnessProcessManager:
                 client=client,
                 endpoint=endpoint,
                 harness=harness,
-                # Record the model this subprocess was spawned with so a later
-                # turn requesting a different model (e.g. after ``/model``)
-                # triggers a respawn in ``get_client`` — the model is a fixed
-                # process env var, not re-read per turn.
-                model=(env or {}).get(_model_env_key(harness)),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

@@ -444,50 +444,33 @@ async def test_get_client_respawns_on_harness_change(
         _HARNESS_MODULES.pop("test2", None)
 
 
-async def test_get_client_respawns_on_model_change(
+async def test_get_client_shares_subprocess_across_models(
     manager: HarnessProcessManager,
 ) -> None:
-    """A different model for the same conversation respawns the subprocess.
+    """Different models on the same harness share one subprocess.
 
-    Mirrors the harness-change branch above: the model is baked into the
-    subprocess env at spawn time, so a later turn with a different model
-    must respawn, or the cached process keeps serving the old one. Covers
-    the real ``/model`` switch path via ``post_responses`` in production,
-    previously untested. Also checks the inverse: same model, no respawn.
+    Model selection is handled per-turn via ExecutorConfig, not at spawn time.
+    The subprocess serves all models for a given harness type.
     """
     await manager.start()
     try:
-        client_first = await manager.get_client(
+        client_a = await manager.get_client(
             "conv_a",
             _TEST_HARNESS_NAME,
             env={"HARNESS_TEST_MODEL": "model-a"},
         )
-        pid_first = (await client_first.get("/pid")).json()["pid"]
+        pid_a = (await client_a.get("/pid")).json()["pid"]
 
-        # Same conversation, SAME model → must reuse the cached subprocess.
-        client_same = await manager.get_client(
-            "conv_a",
-            _TEST_HARNESS_NAME,
-            env={"HARNESS_TEST_MODEL": "model-a"},
-        )
-        pid_same = (await client_same.get("/pid")).json()["pid"]
-        assert pid_same == pid_first
-
-        # Same conversation, DIFFERENT model → must respawn.
-        client_second = await manager.get_client(
-            "conv_a",
+        client_b = await manager.get_client(
+            "conv_b",
             _TEST_HARNESS_NAME,
             env={"HARNESS_TEST_MODEL": "model-b"},
         )
-        pid_second = (await client_second.get("/pid")).json()["pid"]
+        pid_b = (await client_b.get("/pid")).json()["pid"]
 
-        # Different PID proves the model-change branch tore down the old
-        # subprocess and spawned a new one. Same PID would mean the model
-        # switch kept serving the old model (the bug this branch guards).
-        assert pid_second != pid_first
-        assert _pid_alive(pid_second)
-        # In shared-runner mode, the old subprocess stays alive (keyed by model-a).
-        assert _pid_alive(pid_first)
+        # Same harness → same subprocess regardless of model.
+        assert pid_a == pid_b
+        assert client_a is client_b
     finally:
         await manager.shutdown()
 
