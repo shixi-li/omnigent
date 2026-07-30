@@ -75,6 +75,17 @@ export function routingExtras(source: RoutingDecisionExtras): RoutingDecisionExt
 }
 
 /**
+ * Whether a decision belongs to the session's own turn rather than to a
+ * sub-agent it spawned. Legacy rows carry no scope and count as the session's.
+ *
+ * @param scope - Decision scope, or null/undefined on legacy rows.
+ * @returns True for `session`/`turn`/absent, false for the sub-agent scopes.
+ */
+export function isSessionScopedDecision(scope: RoutingScope | null | undefined): boolean {
+  return scope == null || !SUBAGENT_SCOPES.has(scope);
+}
+
+/**
  * Badge text for a sub-agent-scoped decision, e.g. `"subagent: researcher"`.
  *
  * @param scope - Decision scope; only the sub-agent scopes get a badge.
