@@ -561,6 +561,23 @@ async def _decide(
             model=req.parent_model,
         )
 
+    if not req.prompt and not req.task_name:
+        # Codex encrypts the spawn message, so an unnamed codex subagent
+        # carries nothing to score. Calling the router anyway earns an
+        # "HTTP 400: task.prompt is required" that reads on the decision chip
+        # as an outage; this is a deliberate verdict, so say so. Not cached:
+        # there is no router result to reuse. The spawn runs on the parent's
+        # thread model, which the SubagentStart audit confirms, so naming it
+        # here also keeps the audit reconciliation from flagging the spawn.
+        return SubagentRouteDecision(
+            action="allow",
+            rationale=(
+                "No routable signal (encrypted prompt, no task name); "
+                "subagent inherits the session model"
+            ),
+            model=req.parent_model,
+        )
+
     key = task_cache_key(req)
     cached = _cached(session_id, key, clock)
     if cached is not None:

@@ -254,6 +254,53 @@ async def test_fork_is_exempt_and_never_calls_router() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_routable_signal_skips_the_router_and_allows_unchanged() -> None:
+    """A codex spawn with no prompt and no task name is decided locally.
+
+    Codex encrypts the spawn message, so an unnamed subagent carries nothing
+    to score. Calling the router anyway returned "HTTP 400: task.prompt is
+    required", which the fail-open path then dressed up as "Routing
+    unavailable (...)" on the decision chip — an outage the user does not
+    have. The spawn genuinely inherits the parent's thread model (confirmed
+    by the SubagentStart audit), so the verdict is allow-unchanged and the
+    rationale says exactly that.
+    """
+    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="x"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(prompt=None, task_name=""),
+        caps=_FakeCaps(routing_client=client),
+    )
+    assert decision.action == "allow"
+    # The parent's model is named so the chip and the audit reconciliation
+    # both see the model the subagent actually starts on.
+    assert decision.model == PARENT_MODEL
+    assert decision.rationale == (
+        "No routable signal (encrypted prompt, no task name); subagent inherits the session model"
+    )
+    # Never reaches the router: no 400, and nothing to report as an outage.
+    assert client.calls == []
+    assert "unavailable" not in decision.rationale.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_routable_signal_is_not_cached_as_an_outage() -> None:
+    """The no-signal verdict is recomputed, never served from the cache.
+
+    It is not a router result, so it must not occupy a cache slot that a
+    later named spawn (or a fixed client) would be answered from.
+    """
+    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="picked"))
+    caps = _FakeCaps(routing_client=client)
+    await resolve_subagent_route("conv_1", _request(prompt=None, task_name=""), caps=caps)
+    assert client.calls == []
+    # A spawn that does carry a signal still reaches the router.
+    routed = await resolve_subagent_route("conv_1", _request(), caps=caps)
+    assert len(client.calls) == 1
+    assert routed.action in ("allow", "rewrite", "redirect")
+
+
+@pytest.mark.asyncio
 async def test_router_outage_fails_open_by_default() -> None:
     client = _FakeRoutingClient(error=RuntimeError("router down"))
     decision = await resolve_subagent_route(
