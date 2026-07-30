@@ -5063,6 +5063,7 @@ export function Composer({
             <Button
               type="submit"
               size="icon"
+              componentId="chat.composer.send"
               variant={showInterruptButton ? "destructive" : "default"}
               // Send button fades more decisively when there's no draft —
               // overrides the base 50% disabled-opacity so the affordance
