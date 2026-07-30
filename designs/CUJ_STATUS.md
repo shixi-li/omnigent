@@ -10,7 +10,7 @@ Living checklist, maintained by the lead session. Legend:
 "UI" = what chips/dropdowns/panels display. "Process" = what the harness
 process actually runs (rollout files, panes, config, spawned models).
 
-Last updated: 2026-07-29 night (live headless battery run by the lead session).
+Last updated: 2026-07-29 night — all engineering rows closed; remaining items are user decisions/confirms.
 
 ## 1. Claude Code CUJ (IR main session)
 
@@ -52,7 +52,7 @@ Last updated: 2026-07-29 night (live headless battery run by the lead session).
 | **Codex subagent hooks execute at all** | ✅ evidence | live E2E post -I fix (518376ba): canary fired, PreToolUse gate ran, SubagentStart audit recorded the spawn on the routed model (luna). Root causes: app-server ignores the bypass flag (persisted trust handshake added) + cwd shadowing killed hook imports (python -I) |
 | Canary → `subagent_routing_unenforced` warning banner | ✅ evidence | watcher posted every 30s and the warning surfaced on the session snapshot during the shadowing incident — the watcher is what caught the bug |
 | In-session Subagent routing row (IR/Default, inherit) | ✅ user | toggle enables/disables routing as expected |
-| Mid-session toggle affects next spawn (process level) | 🟡 | user observed toggling works; per-spawn process effect blocked on the claude/codex apply fixes for a clean read |
+| Mid-session toggle affects next spawn (process level) | ✅ evidence | live round-trip: off → gate declined per call ("subagent routing disabled" logged, no decision persisted, spawn proceeded); on → next spawn routed (decision count 1→2) |
 | Fork spawns exempt (v1 policy) | ⬜ | test-pinned only |
 
 ## 5. Visibility & telemetry
