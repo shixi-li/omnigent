@@ -5799,8 +5799,8 @@ def subagent_routing_warnings(session_id: str, bridge_dir: Path) -> list[dict[st
     if not codex_router_canary_fired(bridge_dir):
         return [
             subagent_routing_unenforced_warning(
-                "SessionStart canary did not fire; codex skipped the generated "
-                "routing hooks (untrusted)."
+                "SessionStart canary did not fire; codex did not run the generated "
+                "routing hooks (untrusted, or the hook command failed)."
             )
         ]
     return reconcile_spawn_audit(read_codex_spawn_audit(bridge_dir), routed_models(session_id))

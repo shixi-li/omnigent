@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -363,3 +366,55 @@ def test_reconcile_spawn_audit_flags_a_model_the_router_never_approved() -> None
 
 def test_reconcile_spawn_audit_is_silent_without_routed_models() -> None:
     assert reconcile_spawn_audit([{"model": "gpt-5-6-luna"}], set()) == []
+
+
+def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:
+    """Every routing hook command passes ``-I`` before ``-m``.
+
+    Codex runs hooks with the session's *workspace* as cwd, and ``-m``
+    prepends cwd to ``sys.path``. A workspace holding a directory named
+    ``omnigent`` — any checkout of this project, the most likely workspace
+    of all — then shadows the installed package and the hook dies on
+    ``ModuleNotFoundError``. Codex discards the failure, so the routing gate
+    fails open in total silence. Observed live: a session whose cwd was a
+    second omnigent checkout ran with all three hooks *trusted* and none of
+    them working.
+    """
+    hooks = codex_router_hooks_settings(
+        tmp_path, session_id="conv_abc", python_executable="/venv/bin/python"
+    )["hooks"]
+    commands = [h["command"] for entries in hooks.values() for e in entries for h in e["hooks"]]
+    assert commands, "no routing hook commands generated"
+    for command in commands:
+        argv = shlex.split(command)
+        assert argv[1:3] == ["-I", "-m"], f"expected isolated python in {command!r}"
+
+
+def test_router_hook_survives_a_shadowing_workspace(tmp_path: Path) -> None:
+    """The canary hook works when cwd holds a decoy ``omnigent`` package.
+
+    The end-to-end guard for the isolation flag: runs the real generated
+    command from a workspace that shadows the installed package, exactly
+    the live failure. Without ``-I`` this exits non-zero and writes nothing.
+    """
+    workspace = tmp_path / "workspace"
+    decoy = workspace / "omnigent"
+    decoy.mkdir(parents=True)
+    (decoy / "__init__.py").write_text("raise AssertionError('decoy package imported')\n")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    hooks = codex_router_hooks_settings(
+        bridge_dir, session_id="conv_abc", python_executable=sys.executable
+    )["hooks"]
+    command = hooks["SessionStart"][0]["hooks"][0]["command"]
+
+    result = subprocess.run(
+        shlex.split(command),
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert codex_router_canary_fired(bridge_dir), result.stderr

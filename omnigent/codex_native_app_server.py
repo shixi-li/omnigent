@@ -956,15 +956,33 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
 
     :param bridge_dir: Native Codex bridge directory passed to the hook
         via ``--bridge-dir``.
+    Runs python in isolated mode (``-I``): codex executes hooks with the
+    session's workspace as cwd, and ``-m`` would otherwise put that
+    workspace first on ``sys.path``. A workspace holding a directory named
+    like one of our packages (the omnigent checkout itself, most obviously)
+    then shadows the installed one and the hook dies on an import error
+    that codex discards — a silent fail-open. Mirrors the ``-I`` the
+    bridge's MCP server command already uses.
+
+    :param bridge_dir: Native Codex bridge directory passed to the hook
+        via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
     :returns: A shell-escaped command string, e.g.
-        ``"/path/python -m omnigent.codex_native_hook evaluate-policy
+        ``"/path/python -I -m omnigent.codex_native_hook evaluate-policy
         --bridge-dir /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
     return shlex.join(
-        [python, "-m", _POLICY_HOOK_MODULE, "evaluate-policy", "--bridge-dir", str(bridge_dir)]
+        [
+            python,
+            "-I",
+            "-m",
+            _POLICY_HOOK_MODULE,
+            "evaluate-policy",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
     )
 
 

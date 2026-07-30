@@ -1158,3 +1158,19 @@ async def test_trust_step_covers_router_hooks_when_routing_armed(
     for write in _batchwrite_calls(client):
         trusted.update(write.params["edits"][0]["value"])
     assert set(trusted) == {"policy", "gate"}
+
+
+async def test_policy_hook_command_runs_python_isolated() -> None:
+    """The policy hook command passes ``-I`` before ``-m``.
+
+    Same silent fail-open as the routing hooks: codex runs hooks with the
+    session workspace as cwd, so without isolation a workspace containing an
+    ``omnigent`` directory shadows the installed package and the policy gate
+    dies on an import error codex never reports.
+    """
+    import shlex
+
+    from omnigent.codex_native_app_server import _codex_policy_hook_command
+
+    argv = shlex.split(_codex_policy_hook_command(Path("/b"), "/venv/bin/python"))
+    assert argv[1:3] == ["-I", "-m"]

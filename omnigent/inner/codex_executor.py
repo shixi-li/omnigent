@@ -878,6 +878,13 @@ def _codex_router_hook_command(
     """
     Build the shell command codex runs for one routing hook event.
 
+    Runs python in isolated mode (``-I``). Codex executes hooks with the
+    session's workspace as cwd, and ``-m`` would otherwise put that
+    workspace first on ``sys.path``: a workspace containing a directory
+    named ``omnigent`` (any checkout of this project) shadows the installed
+    package, the hook dies on ``ModuleNotFoundError``, and codex discards
+    the failure — the routing gate silently fails open.
+
     :param subcommand: Hook-script subcommand, e.g. ``"route-subagent"``.
     :param bridge_dir: Session bridge directory holding the router
         advertisement and the canary / audit files.
@@ -890,6 +897,7 @@ def _codex_router_hook_command(
     """
     argv = [
         python_executable or sys.executable,
+        "-I",
         "-m",
         _CODEX_ROUTER_HOOK_MODULE,
         subcommand,
