@@ -444,13 +444,13 @@ async def test_get_client_respawns_on_harness_change(
         _HARNESS_MODULES.pop("test2", None)
 
 
-async def test_get_client_shares_subprocess_across_models(
+async def test_get_client_isolates_per_env_fingerprint(
     manager: HarnessProcessManager,
 ) -> None:
-    """Different models on the same harness share one subprocess.
+    """Same env → same subprocess; different env → different subprocess.
 
-    Model selection is handled per-turn via ExecutorConfig, not at spawn time.
-    The subprocess serves all models for a given harness type.
+    The env fingerprint includes all spawn-env keys (including model) so
+    different agent configurations get isolated subprocesses.
     """
     await manager.start()
     try:
@@ -461,16 +461,23 @@ async def test_get_client_shares_subprocess_across_models(
         )
         pid_a = (await client_a.get("/pid")).json()["pid"]
 
+        # Same env → same subprocess.
+        client_a2 = await manager.get_client(
+            "conv_c",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-a"},
+        )
+        assert client_a2 is client_a
+
+        # Different model → different subprocess.
         client_b = await manager.get_client(
             "conv_b",
             _TEST_HARNESS_NAME,
             env={"HARNESS_TEST_MODEL": "model-b"},
         )
         pid_b = (await client_b.get("/pid")).json()["pid"]
-
-        # Same harness → same subprocess regardless of model.
-        assert pid_a == pid_b
-        assert client_a is client_b
+        assert pid_a != pid_b
+        assert client_a is not client_b
     finally:
         await manager.shutdown()
 

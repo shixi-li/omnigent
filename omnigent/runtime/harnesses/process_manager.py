@@ -234,21 +234,18 @@ def _harness_key(harness: str, env: dict[str, str] | None = None) -> str:
 
     Conversations that use the same harness AND the same spawn environment
     share one subprocess. Different spawn envs (different workspaces, agent
-    bundles, permission modes, credentials) get separate subprocesses so
-    co-tenant isolation is preserved.
+    bundles, credentials, or configured models) get separate subprocesses
+    so co-tenant isolation is preserved.
 
-    Model env keys are excluded from the fingerprint because model selection
-    is handled per-turn via ExecutorConfig.model, not at spawn time.
+    All env keys including the model key are included in the fingerprint
+    because the model is baked into the executor at construction time and
+    cannot be changed per-turn for SDK harnesses.
     """
     if not env:
         return harness
-    # Exclude model env keys — those are handled per-turn, not per-process.
-    excluded = {_model_env_key(harness)}
-    relevant = {k: v for k, v in sorted(env.items()) if k not in excluded}
-    if not relevant:
-        return harness
     import hashlib
 
+    relevant = dict(sorted(env.items()))
     fingerprint = hashlib.sha256(
         "|".join(f"{k}={v}" for k, v in relevant.items()).encode()
     ).hexdigest()[:16]

@@ -33,14 +33,15 @@ class _AliveProc:
 
 
 @pytest.mark.asyncio
-async def test_get_client_shares_runner_across_models(
+async def test_get_client_isolates_per_env_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``get_client`` reuses one runner subprocess for all models on a harness.
+    """``get_client`` spawns one subprocess per unique spawn-env fingerprint.
 
-    Model selection is handled per-turn via ExecutorConfig, not at spawn time,
-    so the same harness entry serves all models. Only one spawn regardless of
-    how many different models are requested.
+    Conversations with the same harness AND the same env share a subprocess.
+    Different envs (including different models) get separate subprocesses so
+    per-spec isolation is preserved — the model and other env vars are baked
+    into the executor at construction time and cannot be changed per-turn.
 
     :param monkeypatch: Pytest monkeypatch fixture used to mock the
         subprocess-spawn boundary.
@@ -70,16 +71,17 @@ async def test_get_client_shares_runner_across_models(
     key = _model_env_key(harness)
 
     await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})
-    await pm.get_client(conv, harness, env={key: "claude-sonnet-4-6"})  # same runner
-    await pm.get_client(conv, harness, env=None)  # same runner
-    await pm.get_client("conv_y", harness, env={key: "claude-opus-4-6"})  # same runner
+    await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # same env → reuse
+    await pm.get_client("conv_y", harness, env={key: "claude-opus-4-6"})  # same env → reuse
+    await pm.get_client(
+        "conv_z", harness, env={key: "claude-sonnet-4-6"}
+    )  # diff model → new spawn
 
-    # Single spawn: all model variants share one subprocess per harness.
-    assert spawns == ["claude-opus-4-6"], spawns
+    # Two spawns: one per unique env fingerprint.
+    assert spawns == ["claude-opus-4-6", "claude-sonnet-4-6"], spawns
 
-    final = pm._entries.get(harness)
-    if final is not None:
-        await final.client.aclose()
+    for entry in pm._entries.values():
+        await entry.client.aclose()
 
 
 def test_build_harness_spawn_env_strips_binding_token_with_overrides(
