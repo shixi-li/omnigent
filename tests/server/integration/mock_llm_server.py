@@ -1047,13 +1047,41 @@ async def set_fallback(request: Request) -> dict[str, object]:
 
 
 @app.post("/mock/reset")
-async def reset() -> dict[str, bool]:
-    """Clear all regular queues, captured requests, and gates.
+async def reset(request: Request) -> dict[str, bool]:
+    """Clear queues, captured requests, and gates.
 
-    Fallbacks set via ``POST /mock/set_fallback`` are preserved.
+    When a ``key`` is provided, only that queue is cleared — safe for
+    concurrent test workers (xdist) because it does not touch other
+    workers' queues.
+
+    Without ``key``, only gates and captured requests are cleared;
+    keyed queues are left intact so concurrent workers don't wipe each
+    other's configured responses. ``POST /mock/configure`` resets its
+    own key atomically before populating it, so stale queue entries are
+    cleaned up when a key is next configured.
+
+    Fallbacks set via ``POST /mock/set_fallback`` are always preserved.
     """
+    try:
+        body = await request.json()
+        key: str | None = body.get("key") if isinstance(body, dict) else None
+    except Exception:
+        key = None
     async with _state._lock:
-        _state.reset()
+        if key is not None:
+            queue = _state.queues.get(key)
+            if queue is not None:
+                queue.reset()
+        else:
+            # Partial reset: clear gates and captured requests but leave
+            # keyed queues intact so concurrent xdist workers don't
+            # clobber each other's configured responses.
+            old_gates = _state.pending_gates
+            _state.pending_gates = []
+            for qr in old_gates:
+                qr._gate.set()
+            _state.captured_requests.clear()
+            _state.request_count = 0
     return {"reset": True}
 
 
