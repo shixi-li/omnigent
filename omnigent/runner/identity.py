@@ -17,6 +17,11 @@ RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Some platforms (notably native Windows) do not define SIGUSR1; keep
 # imports working there and let callers skip adopt signaling.
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
+# Signal the host sends to an already-running runner when a new session
+# arrives: the runner scans its pending-tokens directory and opens an
+# additional tunnel connection for each token file it finds.
+# SIGUSR2 is unused elsewhere in the runner.
+RUNNER_ADD_SESSION_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR2", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 # A host-launched runner uses this bearer for its initial server connection,
@@ -143,6 +148,20 @@ def load_or_create_runner_id(path: Path) -> str:
     runner_id = f"runner_{uuid.uuid4().hex}"
     path.write_text(runner_id)
     return runner_id
+
+
+def pending_tokens_dir(runner_id: str) -> Path:
+    """Return the directory where the host drops new binding tokens.
+
+    The host writes a file ``<token>`` into this directory and sends
+    :data:`RUNNER_ADD_SESSION_SIGNAL` to the runner. The runner reads
+    and deletes each file, then opens an additional tunnel connection
+    for ``token_bound_runner_id(token)``.
+
+    :param runner_id: Stable runner id, e.g. ``"runner_0123456789abcdef"``.
+    :returns: ``~/.omnigent/runners/<runner_id>/pending-tokens/``.
+    """
+    return Path.home() / ".omnigent" / "runners" / runner_id / "pending-tokens"
 
 
 def _default_runner_id_path() -> Path:

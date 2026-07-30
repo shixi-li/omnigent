@@ -95,12 +95,15 @@ from omnigent.process_logging import (
     process_log_dir,
 )
 from omnigent.runner.identity import (
+    RUNNER_ADD_SESSION_SIGNAL,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
+    get_stable_runner_id,
+    pending_tokens_dir,
     token_bound_runner_id,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -1123,6 +1126,44 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
+
+        # If a runner process is already alive for this host, signal it to
+        # adopt the new session's binding token instead of spawning a new
+        # subprocess. The runner opens an extra tunnel connection for the new
+        # token_bound_runner_id, so the server sees a normal runner connect.
+        # This is backward compatible: the server and runner protocol are
+        # unchanged; we just reuse one process for multiple tunnel connections.
+        stable_id = get_stable_runner_id()
+        existing_handle = self._runners.get(stable_id)
+        if (
+            existing_handle is not None
+            and existing_handle.proc.poll() is None
+            and RUNNER_ADD_SESSION_SIGNAL is not None
+        ):
+            try:
+                token_dir = pending_tokens_dir(stable_id)
+                token_dir.mkdir(parents=True, exist_ok=True)
+                (token_dir / frame.binding_token).write_text(frame.binding_token)
+                existing_handle.proc.send_signal(RUNNER_ADD_SESSION_SIGNAL)
+                _logger.info(
+                    "Reusing runner %s (pid=%d) for new session %s",
+                    stable_id,
+                    existing_handle.proc.pid,
+                    frame.session_id or runner_id,
+                )
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="launched",
+                    runner_id=runner_id,
+                )
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to signal existing runner %s; spawning new process: %s",
+                    stable_id,
+                    exc,
+                )
+                # Fall through to normal spawn path.
+
         initial_auth_token = await asyncio.to_thread(
             self._current_auth_token,
             initialize=False,
@@ -1188,7 +1229,11 @@ class HostProcess:
                 error=_runner_exit_error(proc.returncode, log_path),
             )
 
-        self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
+        handle = _RunnerHandle(proc=proc, log_path=log_path)
+        self._runners[runner_id] = handle
+        # Also register under the stable host runner_id so subsequent sessions
+        # find this process and reuse it via the add-session signal path.
+        self._runners[stable_id] = handle
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
