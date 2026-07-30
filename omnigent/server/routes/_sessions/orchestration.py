@@ -56,6 +56,8 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
+    auto_harness_session,
+    harness_family,
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -3803,6 +3805,16 @@ async def _forward_event_to_runner(
                 # sys_session_send.
                 from omnigent.server.smart_routing import route_session_harness
 
+                # A child may only leave its parent's harness family when the
+                # parent is in Smart Routing (auto) harness mode; otherwise the
+                # candidate set is the parent's family, so a codex session's
+                # children stay on codex. Same family rule the native-subagent
+                # hook path applies to in-harness spawns.
+                _child_family = (
+                    None
+                    if auto_harness_session(conv, _parent_conv)
+                    else harness_family(_resolve_harness(_parent_conv))
+                )
                 # Route against the PARENT's catalog: it enumerates the
                 # spawnable workers (claude_code/codex/pi) with full model
                 # lists, whereas this child's own leaf catalog is "self"-only
@@ -3812,6 +3824,7 @@ async def _forward_event_to_runner(
                     session_id=session_id,
                     catalog_session_id=conv.parent_conversation_id,
                     runner_client=runner_client,
+                    allowed_family=_child_family,
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -5486,12 +5499,18 @@ async def _create_session_from_existing_agent(
         body.subagent_routing_override
     )
 
-    # When the parent session has smart routing on, a sub-agent created via
-    # sys_session_send is routed regardless of the harness/model the
-    # orchestrator chose: force the "auto" sentinel so the first-message
-    # routing path picks both harness and model, ignoring the tool's
-    # ``agent``/``model`` args. Only applied to omnigent-executor agents
-    # (auto requires a swappable brain harness).
+    # A child of a Smart Routing (auto) parent with routing on is routed
+    # regardless of the harness/model the orchestrator chose: force the "auto"
+    # sentinel so the first-message routing path picks both harness and model,
+    # ignoring the tool's ``agent``/``model`` args. Only applied to
+    # omnigent-executor agents (auto requires a swappable brain harness).
+    #
+    # A child of a session pinned to one harness family (a plain codex or
+    # claude session) must NOT be forced to auto: the sentinel would hand the
+    # router the whole multi-harness catalog and stamp the auto marker on the
+    # child, so a codex session ends up with claude children. Those children
+    # keep the harness they were created with and are routed in-family (see
+    # the child-routing call in ``_forward_event_to_runner``).
     _force_auto_for_child = False
     if body.parent_session_id is not None:
         _parent_for_routing = await asyncio.to_thread(
@@ -5500,6 +5519,7 @@ async def _create_session_from_existing_agent(
         if (
             _parent_for_routing is not None
             and _parent_for_routing.cost_control_mode_override == "on"
+            and auto_harness_session(_parent_for_routing)
         ):
             try:
                 await asyncio.to_thread(_validated_harness_override_executor_type, agent)

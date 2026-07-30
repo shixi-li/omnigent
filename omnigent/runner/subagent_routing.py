@@ -412,6 +412,62 @@ def _harness_family(harness: str) -> str | None:
     return _HARNESS_FAMILY.get(harness)
 
 
+def harness_family(harness: str | None) -> str | None:
+    """Return the model family *harness* belongs to.
+
+    The single family lookup shared by the hook path (native subagent
+    spawns) and the omnigent child-session path, so "in-family" means the
+    same thing for both.
+
+    :param harness: Harness id, e.g. ``"codex-native"``. ``None`` or the
+        unresolved ``"auto"`` sentinel carry no family.
+    :returns: ``"claude"``, ``"gpt"``, ``"pi"``, or ``None`` when the
+        harness is unknown / multi-family.
+    """
+    if harness is None or harness == "auto":
+        return None
+    return _harness_family(harness)
+
+
+def auto_harness_session(conv: Any, parent: Any = None) -> bool:
+    """Report whether a session may cross harness families.
+
+    True only for a session started in Smart Routing (auto) harness mode,
+    or a child of one: those are the sessions whose harness the router
+    owns. Everyone else is pinned to the family they started on, so a
+    codex session never gets Claude children and vice versa.
+
+    :param conv: Conversation row for the session, or ``None``.
+    :param parent: Conversation row for its parent, when known. ``None``
+        for a top-level session or when the parent was not loaded.
+    :returns: ``True`` when cross-family picks are allowed.
+    """
+    for row in (conv, parent):
+        if row is None:
+            continue
+        if getattr(row, "labels", None) and row.labels.get(AUTO_HARNESS_LABEL_KEY) == "1":
+            return True
+        if getattr(row, "harness_override", None) == "auto":
+            return True
+    return False
+
+
+def model_in_family(family: str | None, model: str) -> bool:
+    """Report whether *model* can run on a harness in *family*.
+
+    :param family: Family from :func:`harness_family`. ``None`` (unknown
+        or multi-family harness) accepts every model.
+    :param model: Model id, e.g. ``"databricks-gpt-5-5"``.
+    :returns: ``True`` when the pairing is servable.
+    """
+    if family is None or family == "pi":
+        return True
+    from omnigent.model_catalog import model_family_token
+
+    token = model_family_token(model)
+    return token == "claude" if family == "claude" else token == "openai"
+
+
 def candidate_models(
     harness: str,
     *,

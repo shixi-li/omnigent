@@ -15,7 +15,11 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY, clear_cache
+from omnigent.runner.subagent_routing import (
+    AUTO_HARNESS_LABEL_KEY,
+    ROUTING_DECISION_LABEL_KEY,
+    clear_cache,
+)
 from omnigent.server.routes._sessions import orchestration as orchestration_module
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
@@ -570,6 +574,155 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
     # The child of an auto session inherits the cross-harness allowance.
     assert child_resp.status_code == 200, child_resp.text
     assert set(routing_client.offered[1]) == {"claude-native", "codex-native"}
+
+
+# ── 7. Omnigent child sessions stay in the parent's family ─────────
+
+
+async def _pinned_parent_and_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    *,
+    agent_name: str,
+    harness: str,
+) -> tuple[str, Any, SqlAlchemyConversationStore]:
+    """Create a routing-on parent pinned to *harness* plus one child session.
+
+    The child goes through the real ``POST /v1/sessions`` create path so the
+    forced-auto decision is exercised, not simulated.
+
+    :param client: Test HTTP client.
+    :param db_uri: Database URI for a direct store handle.
+    :param agent_name: Agent name to register.
+    :param harness: The parent agent's harness, e.g. ``"codex"``.
+    :returns: ``(parent_id, child_conversation, conversation_store)``.
+    """
+    agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent.status_code == 201, parent.text
+    parent_id = str(parent.json()["id"])
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "title": "audit routing",
+        },
+    )
+    assert child.status_code == 201, child.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    return parent_id, child_conv, conv_store
+
+
+@pytest.mark.parametrize(
+    ("harness", "picked", "expected_harnesses"),
+    [
+        ("codex", GPT_MODEL, {"codex"}),
+        ("claude-sdk", ROUTED_MODEL, {"claude-sdk"}),
+    ],
+)
+async def test_child_of_a_pinned_parent_is_routed_in_the_parents_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+    picked: str,
+    expected_harnesses: set[str],
+) -> None:
+    parent_id, child, conv_store = await _pinned_parent_and_child(
+        client,
+        db_uri,
+        agent_name=f"routing-child-family-{harness}",
+        harness=harness,
+    )
+    # The auto sentinel and its marker belong to Smart Routing sessions only —
+    # a child of a pinned parent must carry neither.
+    assert child.harness_override != "auto"
+    assert AUTO_HARNESS_LABEL_KEY not in child.labels
+
+    routing_client = _FakeRoutingClient(RoutingResult(model=picked, rationale="in-family pick"))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "audit routing"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        async with _echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id,
+                child,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    assert set(routing_client.offered[0]) == expected_harnesses
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    assert refreshed.model_override == picked
+    assert refreshed.harness_override != "auto"
+    decisions = _routing_decisions(conv_store, child.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.scope == "child_session"
+    assert decisions[0].data.harness in expected_harnesses
+    # The parent's mirrored copy names the same in-family harness.
+    parent_decisions = _routing_decisions(conv_store, parent_id)
+    assert [d.data.harness for d in parent_decisions] == [decisions[0].data.harness]
+
+
+async def test_child_of_an_auto_parent_keeps_cross_harness_candidates(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name="routing-child-family-auto",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    child = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent.json()["id"]},
+    )
+    assert child.status_code == 201, child.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    # A Smart Routing parent still hands its children the auto treatment.
+    assert child_conv.harness_override == "auto"
+    assert child_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+
+    routing_client = _FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="big task"))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "rewrite the router"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+        async with _echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id,
+                child_conv,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    assert set(routing_client.offered[0]) == {"claude-sdk", "codex", "pi"}
 
 
 # ── Session warnings channel ───────────────────────────────────────

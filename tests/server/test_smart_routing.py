@@ -65,11 +65,13 @@ class _FakeRoutingClient:
 
     def __init__(self, result: RoutingResult | None) -> None:
         self._result = result
+        self.offered: list[dict[str, list[str]]] = []
 
     async def route(
         self, message: str, available_models: dict[str, list[str]]
     ) -> RoutingResult | None:
-        del message, available_models
+        del message
+        self.offered.append(dict(available_models))
         return self._result
 
 
@@ -418,6 +420,42 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
     mock_client.get.assert_called_once()
     call_url = mock_client.get.call_args[0][0]
     assert "conv_123" in call_url and "models" in call_url
+
+
+@pytest.mark.asyncio
+async def test_route_turn_drops_out_of_family_catalog_models() -> None:
+    """A native terminal's catalog can list other families; they aren't offered."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "self": {
+                "source": "catalog",
+                "verified": True,
+                "models": [
+                    {"id": "databricks-gpt-5-5"},
+                    {"id": "databricks-claude-opus-4-8"},
+                    {"id": "databricks-gpt-5-4-mini"},
+                ],
+                "note": "",
+            }
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    client = _FakeRoutingClient(
+        RoutingResult(model="databricks-gpt-5-5", rationale="gpt task", harness="codex-native")
+    )
+    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=client)):
+        model, _v = await route_turn(
+            "codex-native",
+            "narrow fix",
+            session_id="conv_123",
+            runner_client=mock_client,
+        )
+    assert model == "databricks-gpt-5-5"
+    assert client.offered == [{"codex-native": ["databricks-gpt-5-5", "databricks-gpt-5-4-mini"]}]
 
 
 @pytest.mark.asyncio

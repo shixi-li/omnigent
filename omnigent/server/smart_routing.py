@@ -85,6 +85,23 @@ def infer_models(harness: str | None) -> list[str] | None:
     return MODEL_LISTS.get(family)
 
 
+def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
+    """Keep only the models *harness*'s family can actually run.
+
+    :param harness: Harness id, e.g. ``"codex-native"``. Unknown or
+        multi-model harnesses (and the unresolved ``"auto"`` sentinel)
+        impose no constraint.
+    :param models: Candidate model ids, cheapest first.
+    :returns: The servable subset, order preserved.
+    """
+    from omnigent.runner.subagent_routing import harness_family, model_in_family
+
+    family = harness_family(harness)
+    if family is None:
+        return list(models)
+    return [model for model in models if model_in_family(family, model)]
+
+
 def catalog_models_for_harness(
     catalog: Mapping[str, list[str]] | None,
     harness: str,
@@ -1217,6 +1234,7 @@ async def route_session_harness(
     session_id: str | None = None,
     catalog_session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
+    allowed_family: str | None = None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -1235,6 +1253,10 @@ async def route_session_harness(
         ``"self"`` row and would force the static fallback. Defaults to
         *session_id* when unset.
     :param runner_client: HTTP client pointed at the runner (optional).
+    :param allowed_family: Restrict candidates to this harness family
+        (:func:`omnigent.runner.subagent_routing.harness_family`), e.g.
+        ``"gpt"`` for a child of a codex session. ``None`` offers every
+        auto-routing harness — only sessions in auto-harness mode.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -1265,21 +1287,30 @@ async def route_session_harness(
     # gpt-5-6-luna would break the whole request. Instead we send the full set
     # and correct an incompatible verdict afterward via
     # _redirect_incompatible_pick.
+    # Only a session in auto-harness mode may leave its family; a child of a
+    # plain codex/claude parent is offered that parent's family only, so the
+    # router can pick the model but never the family.
+    candidate_harnesses = tuple(
+        h
+        for h in _AUTO_ROUTING_HARNESSES
+        if allowed_family is None or _HARNESS_FAMILY.get(h) == allowed_family
+    )
     harness_models: dict[str, list[str]] = {}
     if live_catalog:
         for worker_name, worker_models in live_catalog.items():
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
-            if harness is None or harness not in _AUTO_ROUTING_HARNESSES:
+            if harness is None or harness not in candidate_harnesses:
                 continue
-            if worker_models:
+            in_family = models_in_family(harness, worker_models)
+            if in_family:
                 # First worker wins for a given harness id (dedupe).
-                harness_models.setdefault(harness, worker_models)
+                harness_models.setdefault(harness, in_family)
 
     # Fall back to the static table when the live catalog produced no
     # routable candidates (e.g. a child session whose catalog only lists
     # "self" under an unrecognized worker name, or the runner was unreachable).
     if not harness_models:
-        for h in _AUTO_ROUTING_HARNESSES:
+        for h in candidate_harnesses:
             models = infer_models(h)
             if models:
                 harness_models[h] = models
@@ -1368,7 +1399,12 @@ async def route_turn(
     if session_id and runner_client is not None:
         catalog = await fetch_runner_models(session_id, runner_client)
         if catalog and "self" in catalog:
-            available = {harness or "self": catalog["self"]}
+            # A native terminal's own catalog can list models from other
+            # families (its gateway serves them all); offering those would
+            # route the session onto a model its harness cannot run.
+            in_family = models_in_family(harness, catalog["self"])
+            if in_family:
+                available = {harness or "self": in_family}
     if not available:
         models = infer_models(harness)
         if models is None:
