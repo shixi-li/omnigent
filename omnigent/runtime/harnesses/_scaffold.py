@@ -774,8 +774,11 @@ class HarnessApp:
         # (before async teardown). Used by sessions-native
         # injection: a message arriving while this is set is
         # steering, not a new turn.
-        self._active_turn_ctx: TurnContext | None = None
-        # Lock for ``_in_flight`` / ``_active_turn_ctx`` mutations —
+        # Per-conversation active turn pointer. Keyed by conversation_id so
+        # concurrent conversations in a shared runner don't overwrite each
+        # other's active turn. None-keyed entry covers legacy single-conv mode.
+        self._active_turn_ctxs: dict[str | None, TurnContext] = {}
+        # Lock for ``_in_flight`` / ``_active_turn_ctxs`` mutations —
         # route handlers run concurrently in FastAPI's event loop.
         self._lock = asyncio.Lock()
         # Set by graceful-shutdown signal handlers; checked by the
@@ -1196,10 +1199,10 @@ class HarnessApp:
             ctx.cancelled.set()
             ctx._cancel_pending()
         async with self._lock:
-            if self._active_turn_ctx is not None and (
-                conversation_id is None or self._active_turn_ctx.conversation_id == conversation_id
-            ):
-                self._active_turn_ctx = None
+            if conversation_id is None:
+                self._active_turn_ctxs.clear()
+            else:
+                self._active_turn_ctxs.pop(conversation_id, None)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _handle_tool_result_event(self, body: ToolResultEvent) -> Response:
@@ -1280,16 +1283,13 @@ class HarnessApp:
             # Sessions-native steering: no previous_response_id on
             # the wire, but a turn is actively streaming. Inject only
             # into the active turn for this conversation.
+            active_ctx = self._active_turn_ctxs.get(conversation_id)
             if (
                 request.previous_response_id is None
-                and self._active_turn_ctx is not None
-                and not self._active_turn_ctx.cancelled.is_set()
-                and (
-                    conversation_id is None
-                    or self._active_turn_ctx.conversation_id == conversation_id
-                )
+                and active_ctx is not None
+                and not active_ctx.cancelled.is_set()
             ):
-                self._active_turn_ctx._push_injection(request)
+                active_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
             if self._shutting_down.is_set():
@@ -1308,7 +1308,7 @@ class HarnessApp:
                 conversation_id=conversation_id,
             )
             self._in_flight[response_id] = ctx
-            self._active_turn_ctx = ctx
+            self._active_turn_ctxs[conversation_id] = ctx
 
         return StreamingResponse(
             self._stream_turn(request, ctx),
@@ -1388,12 +1388,11 @@ class HarnessApp:
                 ctx, model=request.model, run_task=run_task, sequence=sequence
             )
             # Clear before yielding the terminal event so the next
-            # request (continuation turn) sees _active_turn_ctx as
-            # None and starts a new turn instead of injecting into
-            # this completed one.
+            # request (continuation turn) sees no active ctx for this
+            # conversation and starts a new turn instead of injecting.
             async with self._lock:
-                if self._active_turn_ctx is ctx:
-                    self._active_turn_ctx = None
+                if self._active_turn_ctxs.get(ctx.conversation_id) is ctx:
+                    self._active_turn_ctxs.pop(ctx.conversation_id, None)
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
@@ -1480,8 +1479,8 @@ class HarnessApp:
                 await run_task
         async with self._lock:
             self._in_flight.pop(ctx.response_id, None)
-            if self._active_turn_ctx is ctx:
-                self._active_turn_ctx = None
+            if self._active_turn_ctxs.get(ctx.conversation_id) is ctx:
+                self._active_turn_ctxs.pop(ctx.conversation_id, None)
 
     async def _guarded_run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """

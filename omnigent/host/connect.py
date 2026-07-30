@@ -1143,7 +1143,14 @@ class HostProcess:
             try:
                 token_dir = pending_tokens_dir(stable_id)
                 token_dir.mkdir(parents=True, exist_ok=True)
-                token_file = token_dir / frame.binding_token
+                # Validate token is safe to use as a filename (secrets.token_urlsafe
+                # produces [A-Za-z0-9_-] only, but assert defensively).
+                safe_token = os.path.basename(frame.binding_token)
+                if not safe_token or safe_token != frame.binding_token:
+                    raise OSError(
+                        f"binding token contains path separators: {frame.binding_token!r}"
+                    )
+                token_file = token_dir / safe_token
                 token_file.write_text(frame.binding_token)
                 existing_handle.proc.send_signal(RUNNER_ADD_SESSION_SIGNAL)
                 # Wait for the runner to pick up the token (it deletes the

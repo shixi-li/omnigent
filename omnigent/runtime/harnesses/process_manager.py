@@ -229,13 +229,30 @@ def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
     return instance_dir / f"conv-{conversation_id}.sock"
 
 
-def _harness_key(harness: str, model: str | None = None) -> str:
-    """Return a stable entry key for a harness.
+def _harness_key(harness: str, env: dict[str, str] | None = None) -> str:
+    """Return a stable entry key for a harness + spawn-env combination.
 
-    Model is intentionally ignored — multiple models share one runner subprocess
-    per harness type; model selection is handled per-turn via ExecutorConfig.
+    Conversations that use the same harness AND the same spawn environment
+    share one subprocess. Different spawn envs (different workspaces, agent
+    bundles, permission modes, credentials) get separate subprocesses so
+    co-tenant isolation is preserved.
+
+    Model env keys are excluded from the fingerprint because model selection
+    is handled per-turn via ExecutorConfig.model, not at spawn time.
     """
-    return harness
+    if not env:
+        return harness
+    # Exclude model env keys — those are handled per-turn, not per-process.
+    excluded = {_model_env_key(harness)}
+    relevant = {k: v for k, v in sorted(env.items()) if k not in excluded}
+    if not relevant:
+        return harness
+    import hashlib
+
+    fingerprint = hashlib.sha256(
+        "|".join(f"{k}={v}" for k, v in relevant.items()).encode()
+    ).hexdigest()[:16]
+    return f"{harness}:{fingerprint}"
 
 
 def _resolve_module_path(harness: str) -> str:
@@ -717,7 +734,7 @@ class HarnessProcessManager:
                     )
                 entry.last_used_at = time.monotonic()
                 return entry.client
-        hkey = _harness_key(harness)
+        hkey = _harness_key(harness, env)
         async with self._registry_lock:
             start_generation = self._release_generations.get(hkey, 0)
         spawn_lock = await self._get_spawn_lock(hkey)

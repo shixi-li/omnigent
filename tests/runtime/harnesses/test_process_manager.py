@@ -975,16 +975,14 @@ async def test_get_client_env_override_propagates_to_subprocess(
         await manager.shutdown()
 
 
-async def test_get_client_env_override_is_per_harness(
+async def test_get_client_env_override_isolates_per_env_fingerprint(
     manager: HarnessProcessManager,
 ) -> None:
-    """Same harness + same non-model env → shared subprocess with first-spawn env.
+    """Different spawn envs → different subprocesses (spec isolation).
 
-    In shared-runner mode, conversations with the same harness key share a
-    subprocess. Non-model env overrides (e.g. HARNESS_TEST_CUSTOM) are fixed
-    at first-spawn time; a second conversation with a different custom env
-    value reuses the same subprocess (and sees the first spawn's env).
-    Per-conversation env isolation for non-model keys is no longer supported.
+    Conversations with the same harness but different spawn environments
+    (workspace, agent bundle, credentials, etc.) get isolated subprocesses.
+    Conversations with the same harness AND the same env share one subprocess.
     """
     await manager.start()
     try:
@@ -998,12 +996,20 @@ async def test_get_client_env_override_is_per_harness(
             _TEST_HARNESS_NAME,
             env={"HARNESS_TEST_CUSTOM": "beta"},
         )
-        # Both share the same subprocess (spawned with alpha's env).
-        assert client_a is client_b
+        # Different env → different subprocesses.
+        assert client_a is not client_b
         resp_a = await client_a.get("/env/HARNESS_TEST_CUSTOM")
         resp_b = await client_b.get("/env/HARNESS_TEST_CUSTOM")
-        # Both see the first-spawn value.
-        assert resp_a.json()["value"] == resp_b.json()["value"]
+        assert resp_a.json()["value"] == "alpha"
+        assert resp_b.json()["value"] == "beta"
+
+        # Same env → same subprocess.
+        client_a2 = await manager.get_client(
+            "conv_c",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_CUSTOM": "alpha"},
+        )
+        assert client_a2 is client_a
     finally:
         await manager.shutdown()
 

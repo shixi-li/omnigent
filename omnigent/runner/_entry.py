@@ -1296,7 +1296,12 @@ async def _run_tunnel_from_env() -> None:
             return
         for token_file in token_files:
             token = token_file.name.strip()
-            if not token:
+            # Skip empty or suspicious filenames (should only be token_urlsafe chars).
+            _SAFE_TOKEN_CHARS = frozenset(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+            )
+            if not token or not all(c in _SAFE_TOKEN_CHARS for c in token):
+                _logger.warning("skipping suspicious pending-token file: %r", token_file.name)
                 continue
             extra_runner_id = token_bound_runner_id(token)
             _logger.info("adopting new session tunnel: %s", extra_runner_id)
