@@ -1427,6 +1427,18 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
       hasCodeBlocks: false,
     };
   }
+  // claude-native applies a routed model by typing `/model <alias>` into its
+  // TUI; the injection round-trips back through the transcript and lands
+  // BETWEEN the decision and the user's own message.
+  function modelInjectBlock(itemId: string, responseId: string, alias: string): AnyBlock {
+    return {
+      type: "slash_command",
+      ctx: ctx({ itemId, responseId }),
+      kind: "command",
+      name: "model",
+      arguments: alias,
+    };
+  }
   const kinds = (bubbles: Bubble[]): string[] => bubbles.map((b) => b.kind);
   const chipIds = (bubbles: Bubble[]): string[] =>
     bubbles.filter((b) => b.kind === "routing_decision").map((b) => b.itemId);
@@ -1702,6 +1714,106 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
       "routing_decision",
       "assistant",
     ]);
+  });
+
+  it("claude-native: the injected /model echo between chip and message doesn't block the pairing", () => {
+    // Observed claude-native order (chat.db, sessions "claude sonnet" /
+    // "claude opus"): decision, then the `/model <alias>` the apply layer types
+    // into the TUI, then the user's own message. codex-native has no such
+    // injection, which is why only claude rendered the chip above the message.
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_1", "routing_1", "turn"),
+      modelInjectBlock("sc_1", "resp_inject", "sonnet"),
+      userBlock("u1", "resp_u"),
+      doneBlock("a1", "resp_u", "Hi!"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["assistant", "user", "routing_decision", "assistant"]);
+    expect(chipIds(bubbles)).toEqual(["rd_1"]);
+  });
+
+  it("claude-native static reload: the itemsToBlocks funnel defers past the /model echo", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "rd_reload",
+        type: "routing_decision",
+        response_id: "routing_1",
+        status: "completed",
+        model: "databricks-claude-sonnet-5",
+        applied: true,
+        rationale: "trivial task",
+        scope: "turn",
+      } as unknown as ConversationItem,
+      {
+        id: "sc_reload",
+        type: "slash_command",
+        response_id: "resp_inject",
+        status: "completed",
+        kind: "command",
+        name: "model",
+        arguments: "sonnet",
+      } as unknown as ConversationItem,
+      {
+        id: "u1",
+        type: "message",
+        role: "user",
+        response_id: "resp_u",
+        status: "completed",
+        content: [{ type: "input_text", text: "hi" }],
+      } as unknown as ConversationItem,
+    ];
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+    expect(kinds(bubbles)).toEqual(["assistant", "user", "routing_decision"]);
+    expect(chipIds(bubbles)).toEqual(["rd_reload"]);
+  });
+
+  it("claude-native live stream: the chip drops below the message once it arrives", () => {
+    const cache = createBubbleCache();
+    const all: AnyBlock[] = [
+      chipBlock("rd_1", "routing_1", "turn"),
+      modelInjectBlock("sc_1", "resp_inject", "sonnet"),
+      userBlock("u1", "resp_u"),
+      { type: "text_chunk", ctx: ctx({ responseId: "resp_u" }), text: "Hi" },
+      doneBlock("a1", "resp_u", "Hi!"),
+    ];
+    for (let n = 1; n <= all.length; n += 1) {
+      const frame = all.slice(0, n);
+      expect(buildBubbles(frame, null, cache)).toEqual(buildBubbles(frame, null));
+    }
+    expect(kinds(cache.bubbles)).toEqual(["assistant", "user", "routing_decision", "assistant"]);
+  });
+
+  it("keeps a chip that already follows its message put, across a /model echo", () => {
+    // Backwards adjacency skips the echo too, so the chip is not re-attributed
+    // to the NEXT turn's message.
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      modelInjectBlock("sc_1", "resp_inject", "opus"),
+      chipBlock("rd_1", "routing_1", "turn"),
+      userBlock("u2", "resp_2"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["user", "assistant", "routing_decision", "user"]);
+    expect((bubbles[3] as Extract<Bubble, { kind: "user" }>).itemId).toBe("u2");
+  });
+
+  it("streaming past an unpaired chip still reuses the finalized prefix by reference", () => {
+    // The chip-before-region rebuild must stay bounded: once real assistant
+    // output follows the chip it can never pair, so the cache resumes.
+    const cache = createBubbleCache();
+    const base: AnyBlock[] = [
+      chipBlock("rd_1", "routing_1", "turn"),
+      modelInjectBlock("sc_1", "resp_inject", "sonnet"),
+      doneBlock("a1", "resp_1", "one"),
+    ];
+    const f1 = [...base, { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "tw" }];
+    const first = buildBubbles(f1 as AnyBlock[], null, cache);
+    const f2 = [...f1, { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "o" }];
+    const second = buildBubbles(f2 as AnyBlock[], null, cache);
+    expect(kinds(second)).toEqual(["routing_decision", "assistant", "assistant", "assistant"]);
+    expect(second).toEqual(buildBubbles(f2 as AnyBlock[], null));
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).toBe(first[1]);
   });
 });
 

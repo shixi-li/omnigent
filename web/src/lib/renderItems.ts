@@ -319,6 +319,11 @@ function reusablePrefix(
     return null;
   }
   const startBlock = cache.lastBubbleStart;
+  // A chip separated from its message by skippable blocks (claude-native's
+  // injected `/model` echo) sits BEFORE the re-walk region, because the echo
+  // opened its own bubble in between. Rebuild in full so the arriving message
+  // can still pick the chip up.
+  if (chipPendingBeforeRegion(blocks, startBlock)) return null;
   // The new array must be at least as long, and the finalized prefix
   // region must be byte-for-byte (reference-for-reference) unchanged.
   if (blocks.length < startBlock) return null;
@@ -360,6 +365,27 @@ function reusablePrefix(
     }
   }
   return { prefix, startBlock };
+}
+
+/**
+ * Whether a still-pairable session/turn chip sits just before `startBlock`.
+ *
+ * The chip counts as pairable only while every block after it is skippable or
+ * a user message — once real assistant output follows, the chip is nobody's
+ * verdict-on-a-message and the region can be reused as usual (so a long
+ * streaming turn is not rebuilt frame after frame).
+ */
+function chipPendingBeforeRegion(blocks: AnyBlock[], startBlock: number): boolean {
+  let k = startBlock - 1;
+  while (k >= 0 && isChipPairingSkippable(blocks[k]!)) k -= 1;
+  if (k < 0) return false;
+  const chip = blocks[k]!;
+  if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.scope)) return false;
+  for (let j = k + 1; j < blocks.length; j += 1) {
+    const b = blocks[j]!;
+    if (!isChipPairingSkippable(b) && b.type !== "user_message") return false;
+  }
+  return true;
 }
 
 /**
@@ -579,9 +605,10 @@ function routingChipBubble(b: RoutingDecisionBlock, index: number): Bubble {
  * Pair each user message with the routing decision it triggered, for the chips
  * that need moving to land below their message.
  *
- * A session/turn decision is adjacent to the message it routes — lifecycle
- * markers may sit between, nothing else — but on which side depends on the
- * harness: native paths persist and stream the decision BEFORE the message,
+ * A session/turn decision is adjacent to the message it routes — only
+ * non-content blocks may sit between (see `isChipPairingSkippable`) — but on
+ * which side depends on the harness: native paths persist and stream the
+ * decision BEFORE the message,
  * every other path after. Only the before-case needs deferring; a chip already
  * following its message renders below it at its own position. Adjacency keeps
  * the pair inside the incremental re-walk region, since a user bubble stays the
@@ -615,7 +642,19 @@ function deferredRoutingChips(
   return { byMessage, indexes };
 }
 
-/** Nearest neighbour of `from` in `step` direction, skipping lifecycle markers. */
+/**
+ * Blocks that may sit between a routing chip and the message it routes.
+ *
+ * `response_start` / `response_end` are lifecycle markers that don't render.
+ * `slash_command` is harness plumbing: claude-native applies a routed model by
+ * typing `/model <alias>` into its TUI, and that injection round-trips back
+ * through the transcript between the decision and the user's own message.
+ */
+function isChipPairingSkippable(b: AnyBlock): boolean {
+  return b.type === "response_start" || b.type === "response_end" || b.type === "slash_command";
+}
+
+/** Nearest neighbour of `from` in `step` direction, skipping non-content blocks. */
 function adjacent(
   blocks: AnyBlock[],
   from: number,
@@ -623,7 +662,7 @@ function adjacent(
 ): { type: AnyBlock["type"]; index: number } | null {
   for (let k = from + step; k >= 0 && k < blocks.length; k += step) {
     const b = blocks[k]!;
-    if (b.type === "response_start" || b.type === "response_end") continue;
+    if (isChipPairingSkippable(b)) continue;
     return { type: b.type, index: k };
   }
   return null;
