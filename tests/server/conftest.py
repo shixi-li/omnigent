@@ -427,6 +427,22 @@ def _reset_elicitation_state() -> Iterator[None]:
     presence.reset_for_tests()
 
 
+@pytest.fixture()
+def clear_routing_cache() -> Iterator[None]:
+    """
+    Drop the per-session routing-decision cache around a routing test.
+
+    The cache is process-global and keyed by session id + task signal, so
+    a decision one test seeds is served to the next test that spawns the
+    same-looking child — silently skipping the router under test.
+    """
+    from omnigent.runner.subagent_routing import clear_cache
+
+    clear_cache()
+    yield
+    clear_cache()
+
+
 # Originals of the sessions-module globals that many tests monkeypatch.
 # Captured at conftest import (before any test runs), so the guard below
 # can detect a patch that outlived its test. ``_get_runner_client`` /

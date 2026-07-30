@@ -7,6 +7,31 @@ import pytest
 
 from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
 
+# One-shot stubs for the two discovery endpoints: ``(status, json_payload)``,
+# with a ``None`` payload meaning "no body" (a bare error response).
+_Stub = tuple[int, object | None]
+
+_UC_EMPTY: _Stub = (200, {"model_services": []})
+_UC_DOWN: _Stub = (503, None)
+_GATEWAY_EMPTY: _Stub = (200, {"data": []})
+_GATEWAY_GONE: _Stub = (404, None)
+
+
+def _discover(uc: _Stub, gateway: _Stub) -> object:
+    """Run discovery against canned UC / legacy-gateway responses."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        status, payload = uc if request.url.path.endswith("/model-services") else gateway
+        if payload is None:
+            return httpx.Response(status, request=request)
+        return httpx.Response(status, json=payload, request=request)
+
+    return discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
 
 def test_model_services_are_paginated_filtered_and_version_sorted() -> None:
     """The UC listing keeps system Claude services and chooses newest versions."""
@@ -97,74 +122,102 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     ]
 
 
-def test_successful_empty_discovery_is_authoritative() -> None:
-    """Two successful empty listings return empty instead of inventing models."""
+@pytest.mark.parametrize(
+    ("uc", "gateway", "expected_families", "expected_model_ids"),
+    [
+        # Two successful empty listings return empty instead of inventing models.
+        (_UC_EMPTY, _GATEWAY_EMPTY, {}, ()),
+        # A transient model-services failure does not hide the legacy catalog.
+        (
+            _UC_DOWN,
+            (200, {"data": [{"id": "databricks-claude-haiku-4-5"}]}),
+            {"haiku": "databricks-claude-haiku-4-5"},
+            ("databricks-claude-haiku-4-5",),
+        ),
+        # Removed UC services do not revive stale models when legacy 404s.
+        (_UC_EMPTY, _GATEWAY_GONE, {}, ()),
+        # The family picks drop older generations; the catalog keeps them.
+        (
+            (
+                200,
+                {
+                    "model_services": [
+                        {"name": "model-services/system.ai.claude-opus-5"},
+                        {"name": "model-services/system.ai.claude-opus-4-8"},
+                        {"name": "model-services/system.ai.claude-sonnet-5"},
+                        {"name": "model-services/system.ai.gpt-5-5"},
+                    ]
+                },
+            ),
+            _GATEWAY_EMPTY,
+            {"opus": "system.ai.claude-opus-5", "sonnet": "system.ai.claude-sonnet-5"},
+            (
+                "system.ai.claude-sonnet-5",
+                "system.ai.claude-opus-5",
+                "system.ai.claude-opus-4-8",
+            ),
+        ),
+        # The gateway fallback reports its whole Claude list too.
+        (
+            _UC_EMPTY,
+            (
+                200,
+                {
+                    "data": [
+                        {"id": "databricks-claude-opus-5"},
+                        {"id": "databricks-claude-opus-4-8"},
+                        {"id": "databricks-gpt-5-5"},
+                    ]
+                },
+            ),
+            {"opus": "databricks-claude-opus-5"},
+            ("databricks-claude-opus-5", "databricks-claude-opus-4-8"),
+        ),
+        # An authoritative listing with no Claude at all yields an empty
+        # catalog, not an error.
+        (_UC_EMPTY, (200, {"data": [{"id": "databricks-gpt-5-5"}]}), {}, ()),
+    ],
+)
+def test_discovered_catalog_from_the_two_endpoints(
+    uc: _Stub,
+    gateway: _Stub,
+    expected_families: dict[str, str],
+    expected_model_ids: tuple[str, ...],
+) -> None:
+    catalog = _discover(uc, gateway)
+    assert catalog.families == expected_families  # type: ignore[attr-defined]
+    assert catalog.model_ids == expected_model_ids  # type: ignore[attr-defined]
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(200, json={"model_services": []})
-        return httpx.Response(200, json={"data": []})
 
-    assert (
-        discover_databricks_claude_catalog(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        ).families
-        == {}
-    )
-
-
-def test_primary_failure_can_still_use_gateway_fallback() -> None:
-    """A transient model-services failure does not hide the legacy catalog."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(503)
-        return httpx.Response(200, json={"data": [{"id": "databricks-claude-haiku-4-5"}]})
-
-    assert discover_databricks_claude_catalog(
-        "https://workspace.example.com",
-        "token",
-        transport=httpx.MockTransport(_handler),
-    ).families == {"haiku": "databricks-claude-haiku-4-5"}
-
-
-def test_primary_failure_with_empty_gateway_raises_instead_of_empty() -> None:
-    """A transient UC outage plus a Claude-less gateway is NOT authoritative.
-
-    Returning ``{}`` here would make callers treat the workspace as having no
-    Claude models and hard-fail the launch; the primary failure must surface
-    so they fall back to cached models instead.
-    """
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(503, request=request)
-        return httpx.Response(200, json={"data": []})
-
-    with pytest.raises(httpx.HTTPStatusError):
-        discover_databricks_claude_catalog(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        )
-
-
-def test_primary_failure_with_non_claude_gateway_raises_instead_of_empty() -> None:
-    """Same contract when the gateway answers with only non-Claude routes."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(503, request=request)
-        return httpx.Response(200, json={"data": [{"id": "databricks-gpt-5-5"}]})
-
-    with pytest.raises(httpx.HTTPStatusError):
-        discover_databricks_claude_catalog(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        )
+@pytest.mark.parametrize(
+    ("uc", "gateway", "exc", "match"),
+    [
+        # A transient UC outage plus a Claude-less gateway is NOT authoritative.
+        # Returning ``{}`` here would make callers treat the workspace as having
+        # no Claude models and hard-fail the launch; the primary failure must
+        # surface so they fall back to cached models instead.
+        (_UC_DOWN, _GATEWAY_EMPTY, httpx.HTTPStatusError, None),
+        # Same contract when the gateway answers with only non-Claude routes.
+        (_UC_DOWN, (200, {"data": [{"id": "databricks-gpt-5-5"}]}), httpx.HTTPStatusError, None),
+        # A total discovery outage is distinct from an authoritative empty list.
+        (_UC_DOWN, (503, None), httpx.HTTPStatusError, None),
+        # Malformed success payloads cannot be mistaken for removed models.
+        (
+            (200, ["not", "an", "object"]),
+            (200, ["not", "an", "object"]),
+            ValueError,
+            "must be an object",
+        ),
+    ],
+)
+def test_discovery_failures_raise_instead_of_reporting_empty(
+    uc: _Stub,
+    gateway: _Stub,
+    exc: type[Exception],
+    match: str | None,
+) -> None:
+    with pytest.raises(exc, match=match):
+        _discover(uc, gateway)
 
 
 def test_truncated_pagination_warns(caplog: pytest.LogCaptureFixture) -> None:
@@ -189,130 +242,3 @@ def test_truncated_pagination_warns(caplog: pytest.LogCaptureFixture) -> None:
 
     assert families == {"opus": "system.ai.claude-opus-99"}
     assert any("truncated" in record.message for record in caplog.records)
-
-
-def test_successful_primary_empty_is_authoritative_when_legacy_is_unavailable() -> None:
-    """Removed UC services do not revive stale models when legacy returns 404."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(200, json={"model_services": []})
-        return httpx.Response(404)
-
-    assert (
-        discover_databricks_claude_catalog(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        ).families
-        == {}
-    )
-
-
-def test_both_discovery_endpoints_failing_raises() -> None:
-    """A total discovery outage is distinct from an authoritative empty list."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, request=request)
-
-    with pytest.raises(httpx.HTTPStatusError):
-        discover_databricks_claude_catalog(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        )
-
-
-def test_both_discovery_endpoints_malformed_raises() -> None:
-    """Malformed success payloads cannot be mistaken for removed models."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=["not", "an", "object"], request=request)
-
-    with pytest.raises(ValueError, match="must be an object"):
-        discover_databricks_claude_catalog(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        )
-
-
-def test_catalog_keeps_every_servable_claude_generation() -> None:
-    """The family picks drop older generations; the catalog keeps them."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "model_services": [
-                    {"name": "model-services/system.ai.claude-opus-5"},
-                    {"name": "model-services/system.ai.claude-opus-4-8"},
-                    {"name": "model-services/system.ai.claude-sonnet-5"},
-                    {"name": "model-services/system.ai.gpt-5-5"},
-                ]
-            },
-        )
-
-    catalog = discover_databricks_claude_catalog(
-        "https://workspace.example.com",
-        "token",
-        transport=httpx.MockTransport(_handler),
-    )
-
-    assert catalog.families == {
-        "opus": "system.ai.claude-opus-5",
-        "sonnet": "system.ai.claude-sonnet-5",
-    }
-    assert catalog.model_ids == (
-        "system.ai.claude-sonnet-5",
-        "system.ai.claude-opus-5",
-        "system.ai.claude-opus-4-8",
-    )
-
-
-def test_catalog_keeps_every_generation_on_the_legacy_gateway() -> None:
-    """The gateway fallback reports its whole Claude list too."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(200, json={"model_services": []})
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {"id": "databricks-claude-opus-5"},
-                    {"id": "databricks-claude-opus-4-8"},
-                    {"id": "databricks-gpt-5-5"},
-                ]
-            },
-        )
-
-    catalog = discover_databricks_claude_catalog(
-        "https://workspace.example.com",
-        "token",
-        transport=httpx.MockTransport(_handler),
-    )
-
-    assert catalog.families == {"opus": "databricks-claude-opus-5"}
-    assert catalog.model_ids == (
-        "databricks-claude-opus-5",
-        "databricks-claude-opus-4-8",
-    )
-
-
-def test_catalog_is_empty_when_no_claude_models_are_served() -> None:
-    """An authoritative empty listing yields an empty catalog, not an error."""
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/model-services"):
-            return httpx.Response(200, json={"model_services": []})
-        return httpx.Response(200, json={"data": [{"id": "databricks-gpt-5-5"}]})
-
-    catalog = discover_databricks_claude_catalog(
-        "https://workspace.example.com",
-        "token",
-        transport=httpx.MockTransport(_handler),
-    )
-
-    assert catalog.families == {}
-    assert catalog.model_ids == ()

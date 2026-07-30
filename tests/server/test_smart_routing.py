@@ -24,6 +24,7 @@ from omnigent.server.smart_routing import (
     route_session_harness,
     route_turn,
 )
+from tests.server.helpers import FakeCaps, FakeRoutingClient
 
 # ── Stubs ───────────────────────────────────────────────────────────
 
@@ -58,21 +59,6 @@ class _FakeLLMClient:
         return _FakeResponse(
             output=[_FakeMessageOutput(content=[_FakeOutputText(text=text)])],
         )
-
-
-class _FakeRoutingClient:
-    """Stub RoutingClient for route_turn integration tests."""
-
-    def __init__(self, result: RoutingResult | None) -> None:
-        self._result = result
-        self.offered: list[dict[str, list[str]]] = []
-
-    async def route(
-        self, message: str, available_models: dict[str, list[str]]
-    ) -> RoutingResult | None:
-        del message
-        self.offered.append(dict(available_models))
-        return self._result
 
 
 @dataclass
@@ -382,11 +368,6 @@ async def test_fetch_runner_models_returns_none_on_empty_workers() -> None:
 # ── route_turn (integration) ───────────────────────────────────────
 
 
-@dataclass
-class _FakeCaps:
-    routing_client: Any = None  # type: ignore[explicit-any]
-
-
 @pytest.mark.asyncio
 async def test_route_turn_uses_caps_routing_client() -> None:
     expected = RoutingResult(
@@ -394,7 +375,7 @@ async def test_route_turn_uses_caps_routing_client() -> None:
         rationale="trivial",
         harness="claude-sdk",
     )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch(
         "omnigent.runtime._globals._caps",
         new=caps,
@@ -407,7 +388,7 @@ async def test_route_turn_uses_caps_routing_client() -> None:
 
 @pytest.mark.asyncio
 async def test_route_turn_returns_none_when_no_client() -> None:
-    caps = _FakeCaps(routing_client=None)
+    caps = FakeCaps(routing_client=None)
     with patch(
         "omnigent.runtime._globals._caps",
         new=caps,
@@ -450,7 +431,7 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
 
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, _v = await route_turn(
             "claude-sdk",
@@ -487,9 +468,9 @@ async def test_route_turn_prefers_the_callers_session_vocabulary() -> None:
     mock_response.raise_for_status = MagicMock()
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
-    routing_client = _FakeRoutingClient(expected)
+    routing_client = FakeRoutingClient(expected)
 
-    caps = _FakeCaps(routing_client=routing_client)
+    caps = FakeCaps(routing_client=routing_client)
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, _v = await route_turn(
             "claude-native",
@@ -528,10 +509,10 @@ async def test_route_turn_drops_out_of_family_catalog_models() -> None:
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
 
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model="databricks-gpt-5-5", rationale="gpt task", harness="codex-native")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         model, _v = await route_turn(
             "codex-native",
             "narrow fix",
@@ -570,10 +551,10 @@ async def test_route_turn_offers_and_applies_a_glm_pick_on_codex() -> None:
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
 
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model="databricks-glm-5-2", rationale="delegate arm", harness="codex-native")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         model, _v = await route_turn(
             "codex-native",
             "refactor the parser",
@@ -605,7 +586,7 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
         rationale="simple",
         harness="claude-sdk",
     )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, _v = await route_turn(
             "claude-sdk",
@@ -1012,7 +993,7 @@ async def test_route_session_harness_surfaces_router_error_detail() -> None:
         ) -> RoutingResult | None:
             return None
 
-    caps = _FakeCaps(routing_client=_FailingClient())
+    caps = FakeCaps(routing_client=_FailingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness("hi")
     assert harness is None
@@ -1033,7 +1014,7 @@ async def test_route_session_harness_picks_harness_and_model() -> None:
         rationale="complex codebase task",
         harness="claude-sdk",
     )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, verdict, error = await route_session_harness("refactor the auth module")
     assert harness == "claude-sdk"
@@ -1055,7 +1036,7 @@ async def test_route_session_harness_passes_all_sdk_harnesses_static() -> None:
             received_harnesses.extend(available_models.keys())
             return RoutingResult(model="databricks-claude-haiku-4-5", rationale="x", harness="pi")
 
-    caps = _FakeCaps(routing_client=_CapturingClient())
+    caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         await route_session_harness("quick task")
     for h in _AUTO_ROUTING_HARNESSES:
@@ -1093,8 +1074,8 @@ async def test_route_session_harness_uses_catalog_session_id_for_fetch() -> None
     mock_client = MagicMock()
     mock_client.get = _get
 
-    caps = _FakeCaps(
-        routing_client=_FakeRoutingClient(
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
             RoutingResult(model="m1", rationale="x", harness="claude-sdk")
         )
     )
@@ -1151,7 +1132,7 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
                 model="databricks-claude-haiku-4-5", rationale="simple", harness="claude-sdk"
             )
 
-    caps = _FakeCaps(routing_client=_CapturingClient())
+    caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, _error = await route_session_harness(
             "hello",
@@ -1204,7 +1185,7 @@ async def test_route_session_harness_maps_worker_names_to_harnesses() -> None:
                 model="databricks-claude-opus-4-8", rationale="complex", harness="claude-sdk"
             )
 
-    caps = _FakeCaps(routing_client=_CapturingClient())
+    caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness(
             "refactor everything",
@@ -1252,7 +1233,7 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
                 model="databricks-claude-opus-4-8", rationale="x", harness="claude-sdk"
             )
 
-    caps = _FakeCaps(routing_client=_CapturingClient())
+    caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, _model, _verdict, error = await route_session_harness(
             "hello",
@@ -1269,7 +1250,7 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
 @pytest.mark.asyncio
 async def test_route_session_harness_returns_none_when_no_client() -> None:
     """route_session_harness returns (None, None, None, error) when no routing client."""
-    caps = _FakeCaps(routing_client=None)
+    caps = FakeCaps(routing_client=None)
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, verdict, error = await route_session_harness("hello")
     assert harness is None
@@ -1281,7 +1262,7 @@ async def test_route_session_harness_returns_none_when_no_client() -> None:
 @pytest.mark.asyncio
 async def test_route_session_harness_returns_none_for_empty_message() -> None:
     """route_session_harness returns (None, None, None) for empty user text."""
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(None))
+    caps = FakeCaps(routing_client=FakeRoutingClient(None))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, _error = await route_session_harness("")
     assert harness is None
@@ -1306,7 +1287,7 @@ async def test_route_session_harness_sends_full_candidate_set_unfiltered() -> No
             pi_models.extend(available_models.get("pi", []))
             return RoutingResult(model="databricks-gpt-5-4-nano", rationale="x", harness="codex")
 
-    caps = _FakeCaps(routing_client=_CapturingClient())
+    caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         await route_session_harness("hello")
     # The excluded-on-pi models are still SENT (router requires the full set);
@@ -1326,7 +1307,7 @@ async def test_route_session_harness_redirects_incompatible_router_pick() -> Non
     expected = RoutingResult(
         model="databricks-gpt-5-5", rationale="picked despite exclusion", harness="pi"
     )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness("do something")
     assert harness == "codex", f"gpt-5.5 on pi should redirect to codex, got {harness!r}"
@@ -1338,7 +1319,7 @@ async def test_route_session_harness_redirects_incompatible_router_pick() -> Non
 async def test_route_session_harness_redirects_claude_on_pi_to_claude_sdk() -> None:
     """A router pick of a Claude model on pi is redirected to claude-sdk."""
     expected = RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness="pi")
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness("quick q")
     assert harness == "claude-sdk", f"claude on pi should redirect to claude-sdk, got {harness!r}"
@@ -1379,84 +1360,84 @@ def _capturing_handler(captured: dict[str, Any], pick: dict[str, Any]) -> Any:
     return handler
 
 
+_CODEX_CATALOG_ONLY = {"codex": ["databricks-gpt-5-4"]}
+_CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
+
+
 @pytest.mark.asyncio
-async def test_task_v1_codex_only_offers_codex_menu() -> None:
+@pytest.mark.parametrize(
+    ("router_name", "catalog", "pick", "present", "absent", "exact_menu", "first_offered"),
+    [
+        # A codex-only session offers the codex menu and none of the claude
+        # arms — the router must not be able to pick an unspawnable harness.
+        (
+            "task_v1",
+            _CODEX_CATALOG_ONLY,
+            {"model": "glm-5-2", "harness": "codex"},
+            _CODEX_ARMS,
+            _CLAUDE_ARMS,
+            None,
+            # The caller's own catalog id leads; the router tolerates the extra.
+            "gpt-5-4",
+        ),
+        (
+            "task_v1",
+            _CLAUDE_CATALOG_ONLY,
+            {"model": "claude-sonnet-5", "harness": "claude-sdk"},
+            _CLAUDE_ARMS,
+            _CODEX_ARMS,
+            None,
+            None,
+        ),
+        # Both harnesses spawnable: every arm of both menus is on offer.
+        (
+            "task_v1",
+            {**_CLAUDE_CATALOG_ONLY, **_CODEX_CATALOG_ONLY},
+            {"model": "claude-opus-4-8", "harness": "claude-sdk"},
+            _CLAUDE_ARMS + _CODEX_ARMS,
+            (),
+            None,
+            None,
+        ),
+        # A router version with no menu entry gets exactly the caller's catalog.
+        (
+            "task_v0",
+            _CODEX_CATALOG_ONLY,
+            {"model": "gpt-5-4", "harness": "codex"},
+            (),
+            (),
+            ["gpt-5-4"],
+            None,
+        ),
+    ],
+)
+async def test_task_v1_menu_follows_the_session_vocabulary(
+    router_name: str,
+    catalog: dict[str, list[str]],
+    pick: dict[str, str],
+    present: Sequence[str],
+    absent: Sequence[str],
+    exact_menu: list[str] | None,
+    first_offered: str | None,
+) -> None:
     import httpx
 
     captured: dict[str, Any] = {}
-    client = _task_v1_client()
-    with _patch_httpx(
-        httpx.MockTransport(_capturing_handler(captured, {"model": "glm-5-2", "harness": "codex"}))
-    ):
-        result = await client.route("fix it", {"codex": ["databricks-gpt-5-4"]})
+    client = _task_v1_client(router_name=router_name)
+    with _patch_httpx(httpx.MockTransport(_capturing_handler(captured, pick))):
+        result = await client.route("refactor it", catalog)
 
     offered = [o["model"] for o in captured["body"]["route_options"]]
-    assert offered[0] == "gpt-5-4"  # catalog extra, tolerated by the router
-    for arm in _CODEX_ARMS:
+    if exact_menu is not None:
+        assert offered == exact_menu
+    if first_offered is not None:
+        assert offered[0] == first_offered
+    for arm in present:
         assert arm in offered
-    for arm in _CLAUDE_ARMS:
+    for arm in absent:
         assert arm not in offered
     assert result is not None
-    assert result.harness == "codex"
-
-
-@pytest.mark.asyncio
-async def test_task_v1_claude_only_offers_claude_menu() -> None:
-    import httpx
-
-    captured: dict[str, Any] = {}
-    client = _task_v1_client()
-    with _patch_httpx(
-        httpx.MockTransport(
-            _capturing_handler(captured, {"model": "claude-sonnet-5", "harness": "claude-sdk"})
-        )
-    ):
-        await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]})
-
-    offered = [o["model"] for o in captured["body"]["route_options"]]
-    for arm in _CLAUDE_ARMS:
-        assert arm in offered
-    for arm in _CODEX_ARMS:
-        assert arm not in offered
-
-
-@pytest.mark.asyncio
-async def test_task_v1_mixed_harnesses_offer_all_five_arms() -> None:
-    import httpx
-
-    captured: dict[str, Any] = {}
-    client = _task_v1_client()
-    with _patch_httpx(
-        httpx.MockTransport(
-            _capturing_handler(captured, {"model": "claude-opus-4-8", "harness": "claude-sdk"})
-        )
-    ):
-        await client.route(
-            "refactor",
-            {
-                "claude-sdk": ["databricks-claude-haiku-4-5"],
-                "codex": ["databricks-gpt-5-4"],
-            },
-        )
-
-    offered = [o["model"] for o in captured["body"]["route_options"]]
-    for arm in _CLAUDE_ARMS + _CODEX_ARMS:
-        assert arm in offered
-
-
-@pytest.mark.asyncio
-async def test_task_v0_router_offers_catalog_only() -> None:
-    """A router version with no menu entry gets exactly the caller's catalog."""
-    import httpx
-
-    captured: dict[str, Any] = {}
-    client = _task_v1_client(router_name="task_v0")
-    with _patch_httpx(
-        httpx.MockTransport(_capturing_handler(captured, {"model": "gpt-5-4", "harness": "codex"}))
-    ):
-        await client.route("hi", {"codex": ["databricks-gpt-5-4"]})
-
-    assert [o["model"] for o in captured["body"]["route_options"]] == ["gpt-5-4"]
+    assert result.harness == pick["harness"]
 
 
 @pytest.mark.asyncio
@@ -1478,8 +1459,7 @@ async def test_task_v1_partial_menu_error_surfaces_last_error() -> None:
         result = await client.route("hi", {"codex": ["databricks-gpt-5-4"]})
 
     assert result is None
-    assert client.last_error is not None
-    assert "requires its full menu" in client.last_error
+    assert "requires its full menu" in (client.last_error or "")
 
 
 @pytest.mark.asyncio
@@ -1581,7 +1561,7 @@ async def test_route_session_harness_keeps_raw_pick_in_verdict() -> None:
         harness="codex",
         raw_model="gpt-5-6-sol",
     )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, verdict, error = await route_session_harness("do it")
     assert harness == "codex"
@@ -1653,31 +1633,96 @@ def _substitute(arm: str, models: Sequence[str], harness: str = "codex") -> str:
     return resolved.model
 
 
-def test_capable_arm_substitutes_most_capable_not_last_in_catalog() -> None:
-    """sol is task_v1's anchor arm, so it must not land on a nano endpoint."""
-    assert _substitute("gpt-5-6-sol", _UCODE_CODEX_CATALOG) == "gpt-5-5"
+_CLAUDE_TIERS = (
+    "databricks-claude-haiku-4-5",
+    "databricks-claude-sonnet-4-6",
+    "databricks-claude-opus-4-8",
+)
 
 
-def test_cheap_arm_substitutes_cheapest_sensible_model() -> None:
-    """luna is the cheap arm: the mini class, not gpt-5-5 and not nano."""
-    assert _substitute("gpt-5-6-luna", _UCODE_CODEX_CATALOG) == "gpt-5-mini"
-
-
-def test_cheap_arm_falls_back_to_nano_when_nothing_bigger() -> None:
-    assert _substitute("gpt-5-6-luna", ("gpt-5-nano",)) == "gpt-5-nano"
-
-
-def test_delegate_arm_substitutes_same_family_capable_model() -> None:
-    """glm-5-2 has no local endpoint and no tier entry demoting it."""
-    assert _substitute("glm-5-2", _UCODE_CODEX_CATALOG) == "gpt-5-5"
-
-
-def test_delegate_arm_resolves_to_its_own_endpoint_when_served() -> None:
-    """A workspace that serves GLM resolves the glm arm to that endpoint."""
-    assert (
-        _substitute("glm-5-2", (*_UCODE_CODEX_CATALOG, "databricks-glm-5-2"))
-        == "databricks-glm-5-2"
-    )
+@pytest.mark.parametrize(
+    ("arm", "catalog", "harness", "expected"),
+    [
+        # sol is task_v1's anchor arm, so it must not land on a nano endpoint.
+        ("gpt-5-6-sol", _UCODE_CODEX_CATALOG, "codex", "gpt-5-5"),
+        # luna is the cheap arm: the mini class, not gpt-5-5 and not nano.
+        ("gpt-5-6-luna", _UCODE_CODEX_CATALOG, "codex", "gpt-5-mini"),
+        ("gpt-5-6-luna", ("gpt-5-nano",), "codex", "gpt-5-nano"),
+        # glm-5-2 has no local endpoint and no tier entry demoting it.
+        ("glm-5-2", _UCODE_CODEX_CATALOG, "codex", "gpt-5-5"),
+        # A workspace that serves GLM resolves the glm arm to that endpoint.
+        (
+            "glm-5-2",
+            (*_UCODE_CODEX_CATALOG, "databricks-glm-5-2"),
+            "codex",
+            "databricks-glm-5-2",
+        ),
+        # The prefix-restore path is untouched: a servable arm is applied as-is.
+        (
+            "gpt-5-5",
+            ("databricks-gpt-5-nano", "databricks-gpt-5-5", "databricks-gpt-5-mini"),
+            "codex",
+            "databricks-gpt-5-5",
+        ),
+        # Claude arms are unaffected when the workspace serves them exactly.
+        (
+            "claude-sonnet-5",
+            ("databricks-claude-sonnet-5", "databricks-claude-opus-4-8"),
+            "claude-sdk",
+            "databricks-claude-sonnet-5",
+        ),
+        (
+            "claude-opus-4-8",
+            ("databricks-claude-sonnet-5", "databricks-claude-opus-4-8"),
+            "claude-sdk",
+            "databricks-claude-opus-4-8",
+        ),
+        # An unservable opus takes the most capable Claude on offer.
+        (
+            "claude-opus-4-8",
+            (
+                "databricks-claude-haiku-4-5",
+                "databricks-claude-sonnet-4-6",
+                "databricks-claude-opus-4-7",
+            ),
+            "claude-sdk",
+            "databricks-claude-opus-4-7",
+        ),
+        # An unservable cheap Claude arm avoids the flagship.
+        (
+            "claude-sonnet-5",
+            ("databricks-claude-opus-4-7", "databricks-claude-sonnet-4-6"),
+            "claude-sdk",
+            "databricks-claude-sonnet-4-6",
+        ),
+        # A sonnet-class arm takes the older sonnet, not the cheapest real model.
+        ("claude-sonnet-5", _CLAUDE_TIERS, "claude-sdk", "databricks-claude-sonnet-4-6"),
+        # Nothing at or below its class: fall back to the cheapest on offer.
+        (
+            "claude-sonnet-5",
+            ("databricks-claude-opus-4-7", "databricks-claude-opus-4-8"),
+            "claude-sdk",
+            "databricks-claude-opus-4-7",
+        ),
+        # The live-catalog case: exact prefix restore, no substitution at all.
+        (
+            "claude-sonnet-5",
+            (
+                "databricks-claude-haiku-4-5",
+                "databricks-claude-sonnet-4-6",
+                "databricks-claude-sonnet-5",
+                "databricks-claude-opus-4-8",
+            ),
+            "claude-sdk",
+            "databricks-claude-sonnet-5",
+        ),
+    ],
+)
+def test_unservable_arm_substitutes_within_its_tier(
+    arm: str, catalog: Sequence[str], harness: str, expected: str
+) -> None:
+    """An arm the workspace can't serve resolves to its nearest servable tier."""
+    assert _substitute(arm, catalog, harness) == expected
 
 
 def test_substitution_is_independent_of_catalog_order() -> None:
@@ -1791,7 +1836,7 @@ def test_routing_settings_falls_back_to_the_process_globals() -> None:
     ("client", "expected"),
     [
         (object(), None),  # a custom client predating the protocol field
-        (_FakeRoutingClient(None), None),
+        (FakeRoutingClient(None), None),
         (_LastError(None), None),
         (_LastError(""), None),
         (_LastError(123), None),
@@ -1870,135 +1915,173 @@ def test_explicit_model_prefixes_win_over_the_settings() -> None:
 # ── RoutingSettings parsing (cli) ─────────────────────────────────────────
 
 
-def test_parse_routing_settings_defaults() -> None:
+# Sentinel: this field must be the module's own default table by identity,
+# not an equal copy (a copy means the parser rebuilt it per call).
+_MENUS_DEFAULT = "<TASK_V1_MENUS>"
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    [
+        # No routing block at all: every knob takes its documented default.
+        (
+            None,
+            {
+                "router_name": "task_v1",
+                "selection_model": None,
+                "scenario_menus": _MENUS_DEFAULT,
+                "subagent_fail_mode": "open",
+                "subagent_cache_ttl_s": 300.0,
+            },
+        ),
+        # Every key set: each one is read (and ttl coerced to float).
+        (
+            {
+                "provider": "external",
+                "router_name": "task_v2",
+                "selection_model": "gpt-5-4-mini",
+                "subagent_fail_mode": "closed",
+                "subagent_cache_ttl_s": 30,
+                "model_prefix": ["databricks-", "system.ai."],
+                "scenario_menus": {"task_v2": {"codex": ["arm-a", "arm-b"]}},
+            },
+            {
+                "router_name": "task_v2",
+                "selection_model": "gpt-5-4-mini",
+                "subagent_fail_mode": "closed",
+                "subagent_cache_ttl_s": 30.0,
+                "model_prefixes": ("databricks-", "system.ai."),
+                "scenario_menus": {"task_v2": {"codex": ("arm-a", "arm-b")}},
+            },
+        ),
+        # A flat (un-nested) menu block is not a router->menus mapping, so it
+        # is ignored rather than silently replacing the default menus.
+        (
+            {"scenario_menus": {"codex": ["arm-a"]}},
+            {"scenario_menus": _MENUS_DEFAULT},
+        ),
+        # Nested menus are adopted, with each arm list frozen to a tuple.
+        (
+            {"scenario_menus": {"task_v1": {"cc": ["claude-opus-4-8"], "both": []}}},
+            {"scenario_menus": {"task_v1": {"cc": ("claude-opus-4-8",), "both": ()}}},
+        ),
+    ],
+)
+def test_parse_routing_settings(
+    cfg: dict[str, Any] | None,  # type: ignore[explicit-any]
+    expected: dict[str, Any],  # type: ignore[explicit-any]
+) -> None:
     from omnigent.cli import parse_routing_settings
     from omnigent.server.smart_routing import TASK_V1_MENUS
 
-    settings = parse_routing_settings(None)
-    assert settings.router_name == "task_v1"
-    assert settings.selection_model is None
-    assert settings.scenario_menus is TASK_V1_MENUS
-    assert settings.subagent_fail_mode == "open"
-    assert settings.subagent_cache_ttl_s == 300.0
-
-
-def test_parse_routing_settings_reads_every_key() -> None:
-    from omnigent.cli import parse_routing_settings
-
-    settings = parse_routing_settings(
-        {
-            "provider": "external",
-            "router_name": "task_v2",
-            "selection_model": "gpt-5-4-mini",
-            "subagent_fail_mode": "closed",
-            "subagent_cache_ttl_s": 30,
-            "model_prefix": ["databricks-", "system.ai."],
-            "scenario_menus": {"task_v2": {"codex": ["arm-a", "arm-b"]}},
-        }
-    )
-    assert settings.router_name == "task_v2"
-    assert settings.selection_model == "gpt-5-4-mini"
-    assert settings.subagent_fail_mode == "closed"
-    assert settings.subagent_cache_ttl_s == 30.0
-    assert settings.model_prefixes == ("databricks-", "system.ai.")
-    assert settings.scenario_menus == {"task_v2": {"codex": ("arm-a", "arm-b")}}
-
-
-def test_parse_routing_settings_ignores_a_flat_scenario_menu_block() -> None:
-    from omnigent.cli import parse_routing_settings
-    from omnigent.server.smart_routing import TASK_V1_MENUS
-
-    settings = parse_routing_settings({"scenario_menus": {"codex": ["arm-a"]}})
-    assert settings.scenario_menus is TASK_V1_MENUS
-
-
-def test_parse_routing_settings_nested_scenario_menus() -> None:
-    from omnigent.cli import parse_routing_settings
-
-    settings = parse_routing_settings(
-        {"scenario_menus": {"task_v1": {"cc": ["claude-opus-4-8"], "both": []}}}
-    )
-    assert settings.scenario_menus == {"task_v1": {"cc": ("claude-opus-4-8",), "both": ()}}
+    settings = parse_routing_settings(cfg)
+    for field, want in expected.items():
+        got = getattr(settings, field)
+        if want is _MENUS_DEFAULT:
+            assert got is TASK_V1_MENUS, field
+        else:
+            assert got == want, field
 
 
 # ── Default-on AIGW routing ───────────────────────────────────────────────
 
 
-def test_default_on_synthesizes_client_for_databricks_provider() -> None:
+@pytest.mark.parametrize(
+    ("cfg", "global_providers", "expected_profile"),
+    [
+        # The default databricks provider in the server's own config.
+        (
+            {
+                "providers": {
+                    "other": {"kind": "key"},
+                    "ws": {
+                        "kind": "databricks",
+                        "profile": "eng-ml-inference",
+                        "default": True,
+                    },
+                }
+            },
+            None,
+            "eng-ml-inference",
+        ),
+        # No providers in the server config: the global block is consulted.
+        (
+            {},
+            {"ws": {"kind": "databricks", "profile": "oss"}},
+            "oss",
+        ),
+    ],
+)
+def test_default_on_synthesizes_client_for_databricks_provider(
+    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    global_providers: dict[str, Any] | None,  # type: ignore[explicit-any]
+    expected_profile: str,
+) -> None:
     from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
     from omnigent.server.smart_routing import ExternalRoutingClient
 
-    cfg = {
-        "providers": {
-            "other": {"kind": "key"},
-            "ws": {"kind": "databricks", "profile": "eng-ml-inference", "default": True},
-        }
-    }
+    host = f"https://{expected_profile}.cloud.databricks.com"
     creds = MagicMock()
-    creds.host = "https://eng-ml-inference.staging.cloud.databricks.com"
-    with patch(
-        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
-        return_value=creds,
-    ):
-        client = _build_default_databricks_routing_client(cfg, parse_routing_settings(None))
-
-    assert isinstance(client, ExternalRoutingClient)
-    assert client._url == (
-        "https://eng-ml-inference.staging.cloud.databricks.com/ai-gateway/routing/v1/routes:select"
-    )
-    assert client._router_name == "task_v1"
-    assert client._databricks_profile == "eng-ml-inference"
-    assert client._model_prefixes == ["databricks-", "system.ai."]
-
-
-def test_default_on_skips_without_databricks_provider() -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
-
-    settings = parse_routing_settings(None)
-    assert (
-        _build_default_databricks_routing_client(
-            {"providers": {"openrouter": {"kind": "gateway"}}}, settings
-        )
-        is None
-    )
-    # No providers in the server config: the global block is consulted next.
-    with patch(
-        "omnigent.onboarding.provider_config.load_config",
-        return_value={"providers": {"openrouter": {"kind": "gateway"}}},
-    ):
-        assert _build_default_databricks_routing_client({}, settings) is None
-
-
-def test_default_on_reads_global_providers_block() -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
-    from omnigent.server.smart_routing import ExternalRoutingClient
-
-    creds = MagicMock()
-    creds.host = "https://ws.cloud.databricks.com"
+    creds.host = host
     with (
         patch(
             "omnigent.onboarding.provider_config.load_config",
-            return_value={"providers": {"ws": {"kind": "databricks", "profile": "oss"}}},
+            return_value={"providers": global_providers or {}},
         ),
         patch(
             "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
             return_value=creds,
         ),
     ):
-        client = _build_default_databricks_routing_client({}, parse_routing_settings(None))
+        client = _build_default_databricks_routing_client(cfg, parse_routing_settings(None))
+
     assert isinstance(client, ExternalRoutingClient)
-    assert client._databricks_profile == "oss"
+    # The two things the synthesis decides: which workspace to POST to and
+    # which profile mints its token. The router name and model prefixes come
+    # straight from the settings, pinned in test_parse_routing_settings.
+    assert client._url == f"{host}/ai-gateway/routing/v1/routes:select"
+    assert client._databricks_profile == expected_profile
 
 
-def test_default_on_skips_when_workspace_host_unresolvable() -> None:
+@pytest.mark.parametrize(
+    ("cfg", "global_providers", "resolve_error"),
+    [
+        # The server config names providers, none of kind "databricks".
+        ({"providers": {"openrouter": {"kind": "gateway"}}}, {}, None),
+        # No providers in the server config either, and the global block has
+        # no databricks provider to fall back to.
+        ({}, {"openrouter": {"kind": "gateway"}}, None),
+        # A databricks provider whose workspace host can't be resolved: no
+        # url to POST to, so no client rather than a broken one.
+        (
+            {"providers": {"ws": {"kind": "databricks", "profile": "gone"}}},
+            {},
+            OSError("no such profile"),
+        ),
+    ],
+)
+def test_default_on_skips_without_a_routable_databricks_workspace(
+    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    global_providers: dict[str, Any],  # type: ignore[explicit-any]
+    resolve_error: Exception | None,
+) -> None:
     from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
 
-    cfg = {"providers": {"ws": {"kind": "databricks", "profile": "gone"}}}
-    with patch(
-        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
-        side_effect=OSError("no such profile"),
+    creds = MagicMock()
+    creds.host = "https://ws.cloud.databricks.com"
+    with (
+        patch(
+            "omnigent.onboarding.provider_config.load_config",
+            return_value={"providers": global_providers},
+        ),
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            side_effect=resolve_error,
+            return_value=creds,
+        ),
     ):
-        assert _build_default_databricks_routing_client(cfg, parse_routing_settings(None)) is None
+        client = _build_default_databricks_routing_client(cfg, parse_routing_settings(None))
+    assert client is None
 
 
 @pytest.mark.asyncio
@@ -2009,7 +2092,7 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
         rationale="cheap task",
         harness=None,
     )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, _error = await route_session_harness("what time is it?")
     # codex precedes pi in _AUTO_ROUTING_HARNESSES, so a GPT model owned by both

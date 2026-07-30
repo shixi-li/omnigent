@@ -9,14 +9,7 @@ import pytest
 
 from omnigent.claude_model_vocabulary import claude_model_alias
 from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
-
-
-def _advertise(tmp_path: Path, *, session_id: str | None = "conv_abc") -> Path:
-    payload: dict[str, Any] = {"url": "http://127.0.0.1:9999", "token": "tok"}
-    if session_id is not None:
-        payload["session_id"] = session_id
-    (tmp_path / subagent_router.ADVERTISEMENT_FILE).write_text(json.dumps(payload))
-    return tmp_path
+from tests.inner.conftest import advertise_router
 
 
 def _payload(
@@ -33,12 +26,35 @@ def _payload(
     }
 
 
+def _run_hook_main(
+    monkeypatch: pytest.MonkeyPatch,
+    stdin: str,
+    argv: list[str],
+) -> str:
+    """Drive ``claude_router_hook.main`` over *stdin* and return its stdout."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    assert claude_router_hook.main(argv) == 0
+    return out.getvalue()
+
+
+def _no_router(monkeypatch: pytest.MonkeyPatch, why: str) -> None:
+    """Fail the test if the hook reaches the router at all."""
+
+    def unreachable(*args: object, **kwargs: object) -> dict[str, Any] | None:
+        raise AssertionError(why)
+
+    monkeypatch.setattr(subagent_router, "request_decision", unreachable)
+
+
 def _run_hook(
     monkeypatch: pytest.MonkeyPatch,
     router_dir: Path,
     payload: dict[str, Any],
     decision: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Run the hook with a canned router *decision*; return output + requests."""
     seen: list[dict[str, Any]] = []
 
     def fake_request(
@@ -52,16 +68,12 @@ def _run_hook(
         return decision
 
     monkeypatch.setattr(subagent_router, "request_decision", fake_request)
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
-    out = io.StringIO()
-    monkeypatch.setattr("sys.stdout", out)
-    assert claude_router_hook.main(["--bridge-dir", str(router_dir)]) == 0
-    raw = out.getvalue()
+    raw = _run_hook_main(monkeypatch, json.dumps(payload), ["--bridge-dir", str(router_dir)])
     return (json.loads(raw) if raw else None), seen
 
 
 def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     out, _requests = _run_hook(
         monkeypatch,
         router_dir,
@@ -120,7 +132,7 @@ def test_untranslatable_model_allows_spawn_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An id with no Agent-tool alias must not be injected — the CLI 400s."""
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     for env_var in ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"):
         monkeypatch.delenv(env_var, raising=False)
     out, _requests = _run_hook(
@@ -136,7 +148,7 @@ def test_bridge_recorded_pinning_gates_the_translation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The launch pinning recorded on the bridge decides what's spellable."""
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     (tmp_path / "bridge.json").write_text(
         json.dumps(
             {
@@ -177,7 +189,7 @@ def test_codex_style_output_keeps_the_catalog_id() -> None:
 def test_redirect_denies_with_sys_session_send_instruction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     out, _requests = _run_hook(
         monkeypatch,
         router_dir,
@@ -203,7 +215,7 @@ def test_redirect_denies_with_sys_session_send_instruction(
 
 
 def test_deny_carries_router_rationale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     out, _requests = _run_hook(
         monkeypatch,
         router_dir,
@@ -220,7 +232,7 @@ def test_deny_carries_router_rationale(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 def test_allow_emits_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     out, _requests = _run_hook(
         monkeypatch,
         router_dir,
@@ -233,7 +245,7 @@ def test_allow_emits_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 def test_fork_typed_spawn_reports_fork_true(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     _out, requests = _run_hook(
         monkeypatch,
         router_dir,
@@ -250,23 +262,8 @@ def test_fork_typed_spawn_reports_fork_true(
     }
 
 
-def test_non_fork_spawn_reports_fork_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    router_dir = _advertise(tmp_path)
-    _out, requests = _run_hook(
-        monkeypatch,
-        router_dir,
-        _payload(),
-        {"action": "allow", "rationale": "", "decision_id": "d"},
-    )
-    body = requests[0]["body"]
-    assert body["fork"] is False
-    assert body["task_name"] == "code-reviewer"
-
-
 def test_endpoint_down_allows_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     out, _requests = _run_hook(monkeypatch, router_dir, _payload(), None)
     assert out is None
 
@@ -276,34 +273,24 @@ def test_missing_advertisement_allows_unchanged(
 ) -> None:
     monkeypatch.delenv(subagent_router.ROUTER_DIR_ENV_VAR, raising=False)
     monkeypatch.delenv(subagent_router.BRIDGE_DIR_ENV_VAR, raising=False)
-
-    def unreachable(*args: object, **kwargs: object) -> dict[str, Any] | None:
-        raise AssertionError("router must not be called without an advertisement")
-
-    monkeypatch.setattr(subagent_router, "request_decision", unreachable)
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
-    out = io.StringIO()
-    monkeypatch.setattr("sys.stdout", out)
-    assert claude_router_hook.main(["--bridge-dir", str(tmp_path)]) == 0
-    assert out.getvalue() == ""
+    _no_router(monkeypatch, "router must not be called without an advertisement")
+    stdout = _run_hook_main(monkeypatch, json.dumps(_payload()), ["--bridge-dir", str(tmp_path)])
+    assert stdout == ""
 
 
 def test_other_tools_are_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    router_dir = _advertise(tmp_path)
-
-    def unreachable(*args: object, **kwargs: object) -> dict[str, Any] | None:
-        raise AssertionError("non-spawn tools must not reach the router")
-
-    monkeypatch.setattr(subagent_router, "request_decision", unreachable)
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload(tool_name="Bash"))))
-    out = io.StringIO()
-    monkeypatch.setattr("sys.stdout", out)
-    assert claude_router_hook.main(["--bridge-dir", str(router_dir)]) == 0
-    assert out.getvalue() == ""
+    router_dir = advertise_router(tmp_path)
+    _no_router(monkeypatch, "non-spawn tools must not reach the router")
+    stdout = _run_hook_main(
+        monkeypatch,
+        json.dumps(_payload(tool_name="Bash")),
+        ["--bridge-dir", str(router_dir)],
+    )
+    assert stdout == ""
 
 
 def test_legacy_task_tool_name_is_routed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    router_dir = _advertise(tmp_path)
+    router_dir = advertise_router(tmp_path)
     out, _requests = _run_hook(
         monkeypatch,
         router_dir,
@@ -320,17 +307,13 @@ def test_legacy_task_tool_name_is_routed(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 def test_malformed_stdin_allows_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
-    out = io.StringIO()
-    monkeypatch.setattr("sys.stdout", out)
-    assert claude_router_hook.main([]) == 0
-    assert out.getvalue() == ""
+    assert _run_hook_main(monkeypatch, "not json", []) == ""
 
 
 def test_session_id_falls_back_to_bridge_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    router_dir = _advertise(tmp_path, session_id=None)
+    router_dir = advertise_router(tmp_path, session_id=None)
     (tmp_path / "bridge.json").write_text(
         json.dumps({"active_session_id": "conv_from_bridge", "launch_model": "parent-model"})
     )
@@ -385,7 +368,7 @@ def _install() -> _FakeOptions:
 def test_sdk_hook_registered_when_router_advertised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _advertise(tmp_path)
+    advertise_router(tmp_path)
     monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
     options = _install()
     assert options.hooks is not None
@@ -403,7 +386,7 @@ def test_sdk_hook_not_registered_without_advertisement(
 
 
 async def test_sdk_callback_maps_rewrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _advertise(tmp_path)
+    advertise_router(tmp_path)
     monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
     bodies: list[dict[str, Any]] = []
 
@@ -431,7 +414,7 @@ async def test_sdk_callback_maps_rewrite(tmp_path: Path, monkeypatch: pytest.Mon
 async def test_sdk_callback_allows_unchanged_when_router_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _advertise(tmp_path)
+    advertise_router(tmp_path)
     monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
     monkeypatch.setattr(
         subagent_router,

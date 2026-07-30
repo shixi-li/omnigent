@@ -21,7 +21,6 @@ from omnigent.runner.subagent_routing import (
     SubagentRouteDecision,
     SubagentRouteRequest,
     candidate_models,
-    clear_cache,
     decision_record,
     ensure_session_router,
     ensure_session_router_quietly,
@@ -41,6 +40,7 @@ from omnigent.runner.subagent_routing import (
     write_advertisement,
 )
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
+from tests.server.helpers import FakeCaps, FakeRoutingClient
 
 CLAUDE_MODEL = "databricks-claude-opus-4-8"
 GPT_MODEL = "databricks-gpt-5-5"
@@ -48,38 +48,10 @@ GLM_MODEL = "databricks-glm-5-2"
 KIMI_MODEL = "databricks-kimi-k2-6"
 PARENT_MODEL = "databricks-claude-sonnet-4-6"
 
+pytestmark = pytest.mark.usefixtures("clear_routing_cache")
+
 
 # ── Stubs ───────────────────────────────────────────────────────────
-
-
-class _FakeRoutingClient:
-    """Records calls and returns a canned verdict (or raises)."""
-
-    def __init__(
-        self,
-        result: RoutingResult | None = None,
-        *,
-        error: Exception | None = None,
-        last_error: str | None = None,
-    ) -> None:
-        self._result = result
-        self._error = error
-        self.last_error = last_error
-        self.calls: list[tuple[str, dict[str, list[str]]]] = []
-
-    async def route(
-        self, message: str, available_models: dict[str, list[str]]
-    ) -> RoutingResult | None:
-        self.calls.append((message, available_models))
-        if self._error is not None:
-            raise self._error
-        return self._result
-
-
-@dataclass
-class _FakeCaps:
-    routing_client: Any = None  # type: ignore[explicit-any]
-    routing_settings: Any = None  # type: ignore[explicit-any]
 
 
 @dataclass
@@ -106,13 +78,6 @@ def _request(**overrides: Any) -> SubagentRouteRequest:
     }
     kwargs.update(overrides)
     return SubagentRouteRequest(**kwargs)
-
-
-@pytest.fixture(autouse=True)
-def _clean_cache() -> Any:
-    clear_cache()
-    yield
-    clear_cache()
 
 
 # ── Candidate set ───────────────────────────────────────────────────
@@ -176,13 +141,12 @@ def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
 # ── Policy ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
 async def test_same_family_pick_rewrites() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=FakeCaps(routing_client=client)
     )
     assert decision.action == "rewrite"
     assert decision.model == CLAUDE_MODEL
@@ -192,41 +156,38 @@ async def test_same_family_pick_rewrites() -> None:
     assert len(decision.decision_id) == 36
 
 
-@pytest.mark.asyncio
 async def test_raw_model_is_omitted_when_it_matches_the_resolved_model() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="r", raw_model=CLAUDE_MODEL)
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=FakeCaps(routing_client=client)
     )
     assert decision.model == CLAUDE_MODEL
     assert decision.raw_model is None
 
 
-@pytest.mark.asyncio
 async def test_raw_model_is_preserved_when_the_router_named_another_arm() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="r", raw_model="claude-opus-4-8-thinking")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=FakeCaps(routing_client=client)
     )
     assert decision.model == CLAUDE_MODEL
     assert decision.raw_model == "claude-opus-4-8-thinking"
     assert decision_record(_request(), decision).raw_model == "claude-opus-4-8-thinking"
 
 
-@pytest.mark.asyncio
 async def test_live_catalog_pick_is_applied_exactly() -> None:
     """A live-catalog model is offered and applied verbatim — no substitution."""
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model="databricks-claude-sonnet-5", rationale="r", harness="claude-sdk")
     )
     decision = await resolve_subagent_route(
         "conv_1",
         _request(),
-        caps=_FakeCaps(routing_client=client),
+        caps=FakeCaps(routing_client=client),
         catalog={"self": ["databricks-claude-sonnet-5", "databricks-claude-opus-4-8"]},
     )
     assert client.calls[0][1] == {
@@ -236,26 +197,24 @@ async def test_live_catalog_pick_is_applied_exactly() -> None:
     assert decision.model == "databricks-claude-sonnet-5"
 
 
-@pytest.mark.asyncio
 async def test_cross_family_pick_redirects_to_counterpart_harness() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client), cross_harness=True
+        "conv_1", _request(), caps=FakeCaps(routing_client=client), cross_harness=True
     )
     assert decision.action == "redirect"
     assert decision.model == GPT_MODEL
     assert decision.harness == "codex-native"
 
 
-@pytest.mark.asyncio
 async def test_in_family_session_only_offers_its_own_harness() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=FakeCaps(routing_client=client)
     )
     # Only Claude arms were offered, so a Codex pick is unrunnable — a
     # constrained session can never redirect.
@@ -263,13 +222,12 @@ async def test_in_family_session_only_offers_its_own_harness() -> None:
     assert decision.action == "deny"
 
 
-@pytest.mark.asyncio
 async def test_pick_outside_candidate_set_denies() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model="databricks-kimi-k2", rationale="unavailable", harness="claude-sdk")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=FakeCaps(routing_client=client)
     )
     assert decision.action == "deny"
     assert decision.model is None
@@ -278,30 +236,27 @@ async def test_pick_outside_candidate_set_denies() -> None:
     assert decision.raw_model == "databricks-kimi-k2"
 
 
-@pytest.mark.asyncio
 async def test_parent_model_pick_allows_unchanged() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=PARENT_MODEL, rationale="parent model fits", harness="claude-sdk")
     )
     decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(), caps=FakeCaps(routing_client=client)
     )
     assert decision.action == "allow"
     assert decision.model == PARENT_MODEL
 
 
-@pytest.mark.asyncio
 async def test_fork_is_exempt_and_never_calls_router() -> None:
-    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="x"))
+    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="x"))
     decision = await resolve_subagent_route(
-        "conv_1", _request(fork=True), caps=_FakeCaps(routing_client=client)
+        "conv_1", _request(fork=True), caps=FakeCaps(routing_client=client)
     )
     assert decision.action == "allow"
     assert decision.model == PARENT_MODEL
     assert client.calls == []
 
 
-@pytest.mark.asyncio
 async def test_no_routable_signal_routes_on_the_placeholder_task() -> None:
     """A spawn with no prompt and no task name is still routed.
 
@@ -311,11 +266,11 @@ async def test_no_routable_signal_routes_on_the_placeholder_task() -> None:
     placeholder instead lands them deterministically on the task router's
     cheap arm.
     """
-    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
+    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
     decision = await resolve_subagent_route(
         "conv_1",
         _request(prompt=None, task_name=""),
-        caps=_FakeCaps(routing_client=client),
+        caps=FakeCaps(routing_client=client),
     )
     # The router is asked, and asked about the placeholder — not an empty
     # string, which earns "HTTP 400: task.prompt is required".
@@ -325,14 +280,13 @@ async def test_no_routable_signal_routes_on_the_placeholder_task() -> None:
     assert decision.model != PARENT_MODEL
 
 
-@pytest.mark.asyncio
 async def test_placeholder_rationale_discloses_what_was_scored() -> None:
     """The chip says the pick came from the placeholder, not the caller."""
-    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
+    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
     decision = await resolve_subagent_route(
         "conv_1",
         _request(prompt=None, task_name=""),
-        caps=_FakeCaps(routing_client=client),
+        caps=FakeCaps(routing_client=client),
     )
     assert decision.rationale == f"{NO_SIGNAL_RATIONALE_PREFIX}: cheap arm fits"
     # The router's own words survive the prefix.
@@ -343,11 +297,10 @@ async def test_placeholder_rationale_discloses_what_was_scored() -> None:
     assert record.model == CLAUDE_MODEL
 
 
-@pytest.mark.asyncio
 async def test_placeholder_spawns_share_one_router_call() -> None:
     """Identical no-signal spawns are the same input, so they cache together."""
-    client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
-    caps = _FakeCaps(routing_client=client)
+    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
+    caps = FakeCaps(routing_client=client)
     first = await resolve_subagent_route("conv_1", _request(prompt=None, task_name=""), caps=caps)
     second = await resolve_subagent_route("conv_1", _request(prompt=None, task_name=""), caps=caps)
     assert len(client.calls) == 1
@@ -358,99 +311,115 @@ async def test_placeholder_spawns_share_one_router_call() -> None:
     assert client.calls[1][0] == "review the diff"
 
 
-@pytest.mark.asyncio
-async def test_router_outage_fails_open_by_default() -> None:
-    client = _FakeRoutingClient(error=RuntimeError("router down"))
-    decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
-    )
-    assert decision.action == "allow"
-    assert "Routing unavailable" in decision.rationale
-
-
-@pytest.mark.asyncio
-async def test_router_outage_fails_closed_when_configured() -> None:
-    client = _FakeRoutingClient(error=RuntimeError("router down"))
-    caps = _FakeCaps(
+@pytest.mark.parametrize(
+    ("client", "fail_mode", "expected_action", "reason_fragment"),
+    [
+        # Router outage with the default fail mode: allow the spawn unchanged.
+        (
+            FakeRoutingClient(error=RuntimeError("router down")),
+            None,
+            "allow",
+            "Routing unavailable",
+        ),
+        # Same outage, fail-closed deployment: the spawn is denied.
+        (FakeRoutingClient(error=RuntimeError("router down")), "closed", "deny", None),
+        # A no-verdict (not an outage) still fails open, carrying the router's
+        # own reason so the user sees why nothing was routed.
+        (FakeRoutingClient(None, last_error="menu mismatch"), None, "allow", "menu mismatch"),
+        # No routing client configured at all takes the same fail mode.
+        (None, "closed", "deny", None),
+    ],
+)
+async def test_router_failure_follows_the_fail_mode(
+    client: FakeRoutingClient | None,
+    fail_mode: str | None,
+    expected_action: str,
+    reason_fragment: str | None,
+) -> None:
+    caps = FakeCaps(
         routing_client=client,
-        routing_settings=RoutingSettings(subagent_fail_mode="closed"),
+        routing_settings=(
+            RoutingSettings(subagent_fail_mode=fail_mode)  # type: ignore[arg-type]
+            if fail_mode is not None
+            else RoutingSettings()
+        ),
     )
     decision = await resolve_subagent_route("conv_1", _request(), caps=caps)
-    assert decision.action == "deny"
-
-
-@pytest.mark.asyncio
-async def test_no_verdict_surfaces_last_error() -> None:
-    client = _FakeRoutingClient(None, last_error="menu mismatch")
-    decision = await resolve_subagent_route(
-        "conv_1", _request(), caps=_FakeCaps(routing_client=client)
-    )
-    assert decision.action == "allow"
-    assert "menu mismatch" in decision.rationale
-
-
-@pytest.mark.asyncio
-async def test_missing_routing_client_uses_fail_mode() -> None:
-    caps = _FakeCaps(routing_settings=RoutingSettings(subagent_fail_mode="closed"))
-    decision = await resolve_subagent_route("conv_1", _request(), caps=caps)
-    assert decision.action == "deny"
+    assert decision.action == expected_action
+    if reason_fragment is not None:
+        assert reason_fragment in decision.rationale
 
 
 # ── Cache ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
+def _cache_caps(client: FakeRoutingClient, *, ttl_s: float | None = None) -> FakeCaps:
+    settings = RoutingSettings() if ttl_s is None else RoutingSettings(subagent_cache_ttl_s=ttl_s)
+    return FakeCaps(routing_client=client, routing_settings=settings)
+
+
 async def test_identical_spawns_hit_cache_once() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
-    caps = _FakeCaps(routing_client=client)
+    caps = _cache_caps(client)
     first = await resolve_subagent_route("conv_1", _request(), caps=caps)
     second = await resolve_subagent_route("conv_1", _request(), caps=caps)
     assert len(client.calls) == 1
+    # Same decision row, not a second identical one.
     assert second.decision_id == first.decision_id
 
 
-@pytest.mark.asyncio
-async def test_cache_expires_after_ttl() -> None:
-    client = _FakeRoutingClient(
-        RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
+@pytest.mark.parametrize(
+    ("verdict", "ttl_s", "spawns", "expected_calls"),
+    [
+        # Past the ttl the entry is stale, so the second spawn re-routes.
+        (
+            RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk"),
+            5.0,
+            (("conv_1", {}, 1000.0), ("conv_1", {}, 1006.0)),
+            2,
+        ),
+        # The key is (session, task): neither a different session nor a
+        # different task name may be served another spawn's decision.
+        (
+            RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk"),
+            None,
+            (
+                ("conv_1", {}, None),
+                ("conv_2", {}, None),
+                ("conv_1", {"task_name": "tester"}, None),
+            ),
+            3,
+        ),
+        # A fail-open decision is not a verdict, so it is never cached — the
+        # next spawn must get a real router attempt.
+        (None, None, (("conv_1", {}, None), ("conv_1", {}, None)), 2),
+    ],
+)
+async def test_cache_key_and_lifetime(
+    verdict: RoutingResult | None,
+    ttl_s: float | None,
+    spawns: tuple[tuple[str, dict[str, Any], float | None], ...],
+    expected_calls: int,
+) -> None:
+    client = (
+        FakeRoutingClient(verdict)
+        if verdict is not None
+        else FakeRoutingClient(error=RuntimeError("router down"))
     )
-    caps = _FakeCaps(
-        routing_client=client, routing_settings=RoutingSettings(subagent_cache_ttl_s=5.0)
-    )
-    await resolve_subagent_route("conv_1", _request(), caps=caps, now=1000.0)
-    await resolve_subagent_route("conv_1", _request(), caps=caps, now=1006.0)
-    assert len(client.calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_cache_is_per_session_and_per_task() -> None:
-    client = _FakeRoutingClient(
-        RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
-    )
-    caps = _FakeCaps(routing_client=client)
-    await resolve_subagent_route("conv_1", _request(), caps=caps)
-    await resolve_subagent_route("conv_2", _request(), caps=caps)
-    await resolve_subagent_route("conv_1", _request(task_name="tester"), caps=caps)
-    assert len(client.calls) == 3
-
-
-@pytest.mark.asyncio
-async def test_outage_decisions_are_not_cached() -> None:
-    client = _FakeRoutingClient(error=RuntimeError("router down"))
-    caps = _FakeCaps(routing_client=client)
-    await resolve_subagent_route("conv_1", _request(), caps=caps)
-    await resolve_subagent_route("conv_1", _request(), caps=caps)
-    assert len(client.calls) == 2
+    caps = _cache_caps(client, ttl_s=ttl_s)
+    for session_id, overrides, now in spawns:
+        kwargs: dict[str, Any] = {} if now is None else {"now": now}
+        await resolve_subagent_route(session_id, _request(**overrides), caps=caps, **kwargs)
+    assert len(client.calls) == expected_calls
 
 
 # ── Decision persistence ────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
 async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
     records: list[RoutingDecisionData] = []
@@ -461,7 +430,7 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
     decision = await resolve_subagent_route(
         "conv_1",
         _request(),
-        caps=_FakeCaps(routing_client=client),
+        caps=FakeCaps(routing_client=client),
         persist=_persist,
     )
     assert len(records) == 1
@@ -477,15 +446,14 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
     assert data["rationale"] == "deep reasoning"
 
 
-@pytest.mark.asyncio
 async def test_deny_is_persisted_unapplied() -> None:
-    client = _FakeRoutingClient(error=RuntimeError("router down"))
+    client = FakeRoutingClient(error=RuntimeError("router down"))
     records: list[RoutingDecisionData] = []
 
     async def _persist(record: RoutingDecisionData) -> None:
         records.append(record)
 
-    caps = _FakeCaps(
+    caps = FakeCaps(
         routing_client=client,
         routing_settings=RoutingSettings(subagent_fail_mode="closed"),
     )
@@ -494,7 +462,6 @@ async def test_deny_is_persisted_unapplied() -> None:
     assert records[0].model == PARENT_MODEL
 
 
-@pytest.mark.asyncio
 async def test_persist_appends_routing_decision_item() -> None:
     store = _FakeStore()
     record = RoutingDecisionData(
@@ -520,13 +487,12 @@ async def test_persist_appends_routing_decision_item() -> None:
         assert item.data.harness == "claude-native"
 
 
-@pytest.mark.asyncio
 async def test_persist_failure_does_not_break_the_decision() -> None:
     class _BoomStore:
         def append(self, session_id: str, items: list[Any]) -> list[_PersistedItem]:
             raise RuntimeError("db down")
 
-    client = _FakeRoutingClient(
+    client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
     )
 
@@ -536,7 +502,7 @@ async def test_persist_failure_does_not_break_the_decision() -> None:
     decision = await resolve_subagent_route(
         "conv_1",
         _request(),
-        caps=_FakeCaps(routing_client=client),
+        caps=FakeCaps(routing_client=client),
         persist=_persist,
     )
     assert decision.action == "rewrite"
@@ -569,7 +535,6 @@ def _post(url: str, body: dict[str, Any], token: str | None) -> tuple[int, dict[
         return exc.code, json.loads(exc.read() or b"{}")
 
 
-@pytest.mark.asyncio
 async def test_loopback_endpoint_serves_decisions_and_checks_token(tmp_path: Path) -> None:
     canned = SubagentRouteDecision(
         action="rewrite", rationale="deep reasoning", model=CLAUDE_MODEL, raw_model=CLAUDE_MODEL
@@ -625,7 +590,6 @@ async def test_loopback_endpoint_serves_decisions_and_checks_token(tmp_path: Pat
     assert not (tmp_path / ADVERTISEMENT_FILE).exists()
 
 
-@pytest.mark.asyncio
 async def test_server_relay_resolver_forwards_and_parses() -> None:
     posted: list[tuple[str, dict[str, Any]]] = []
 
@@ -660,7 +624,6 @@ async def test_server_relay_resolver_forwards_and_parses() -> None:
     assert decision.decision_id == "dec_9"
 
 
-@pytest.mark.asyncio
 async def test_server_relay_resolver_applies_fail_mode_on_hop_failure() -> None:
     class _DeadClient:
         async def post(self, path: str, *, json: dict[str, Any], timeout: float) -> Any:
@@ -674,7 +637,6 @@ async def test_server_relay_resolver_applies_fail_mode_on_hop_failure() -> None:
     assert closed_decision.action == "deny"
 
 
-@pytest.mark.asyncio
 async def test_loopback_endpoint_applies_fail_mode_when_resolver_errors(tmp_path: Path) -> None:
     async def _resolver(session_id: str, req: SubagentRouteRequest) -> SubagentRouteDecision:
         raise RuntimeError("boom")
@@ -704,42 +666,64 @@ async def test_loopback_endpoint_applies_fail_mode_when_resolver_errors(tmp_path
 # ── Enablement gate + session router lifecycle (P7) ─────────────────
 
 
-def test_routing_enabled_reads_the_session_toggle() -> None:
-    assert routing_enabled("on") is True
-    assert routing_enabled("off") is False
-    assert routing_enabled(None) is False
-    assert routing_enabled(None, parent_cost_control_mode="on") is True
+@pytest.mark.parametrize(
+    ("mode", "parent_mode", "expected"),
+    [
+        ("on", None, True),
+        ("off", None, False),
+        (None, None, False),
+        # An unset session inherits the parent's mode.
+        (None, "on", True),
+    ],
+)
+def test_routing_enabled_reads_the_session_toggle(
+    mode: str | None, parent_mode: str | None, expected: bool
+) -> None:
+    assert routing_enabled(mode, parent_cost_control_mode=parent_mode) is expected
 
 
-def test_routing_enabled_requires_a_client_when_caps_are_given() -> None:
-    assert routing_enabled("on", caps=_FakeCaps(routing_client=None)) is False
-    assert routing_enabled("on", caps=_FakeCaps(routing_client=object())) is True
+@pytest.mark.parametrize(
+    ("routing_client", "expected"),
+    [
+        # Toggle on but nothing to route with: still off.
+        (None, False),
+        (object(), True),
+    ],
+)
+def test_routing_enabled_requires_a_client_when_caps_are_given(
+    routing_client: object | None, expected: bool
+) -> None:
+    assert routing_enabled("on", caps=FakeCaps(routing_client=routing_client)) is expected
 
 
-def test_subagent_routing_inherits_the_session_routing_state() -> None:
-    assert subagent_routing_enabled(None, cost_control_mode="on") is True
-    assert subagent_routing_enabled(None, cost_control_mode="off") is False
-    assert subagent_routing_enabled(None, cost_control_mode=None) is False
+@pytest.mark.parametrize(
+    ("override", "cost_control_mode", "parent_mode", "expected"),
+    [
+        # No override: subagent routing follows the session's routing state,
+        # falling back to the parent's when the session's is unset.
+        (None, "on", None, True),
+        (None, "off", None, False),
+        (None, None, None, False),
+        (None, None, "on", True),
+        # An explicit override wins over whatever was inherited.
+        ("off", "on", None, False),
+        ("on", None, None, True),
+        ("off", None, "on", False),
+    ],
+)
+def test_subagent_routing_enabled_override_beats_the_inherited_state(
+    override: str | None,
+    cost_control_mode: str | None,
+    parent_mode: str | None,
+    expected: bool,
+) -> None:
     assert (
         subagent_routing_enabled(
-            None,
-            cost_control_mode=None,
-            parent_cost_control_mode="on",
+            override,
+            cost_control_mode=cost_control_mode,
+            parent_cost_control_mode=parent_mode,
         )
-        is True
-    )
-
-
-def test_subagent_routing_override_beats_the_inherited_state() -> None:
-    assert subagent_routing_enabled("off", cost_control_mode="on") is False
-    assert subagent_routing_enabled("on", cost_control_mode=None) is True
-    assert (
-        subagent_routing_enabled(
-            "off",
-            cost_control_mode=None,
-            parent_cost_control_mode="on",
-        )
-        is False
+        is expected
     )
 
 
@@ -810,7 +794,7 @@ def test_ensure_session_router_quietly_passes_the_configured_fail_mode(
         "conv_fail_closed",
         bridge_dir=tmp_path,
         server_client=object(),  # type: ignore[arg-type]
-        caps=_FakeCaps(routing_settings=RoutingSettings(subagent_fail_mode="closed")),
+        caps=FakeCaps(routing_settings=RoutingSettings(subagent_fail_mode="closed")),
     )
     assert seen == ["closed"]
 
@@ -831,7 +815,7 @@ def test_ensure_session_router_quietly_swallows_a_bind_failure(
             bridge_dir=tmp_path,
             server_client=object(),  # type: ignore[arg-type]
             harness="codex-native",
-            caps=_FakeCaps(),
+            caps=FakeCaps(),
         )
         is None
     )

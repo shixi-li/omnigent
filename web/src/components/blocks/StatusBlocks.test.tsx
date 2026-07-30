@@ -127,60 +127,52 @@ describe("RoutingDecisionCard — session-level auto-routing", () => {
 });
 
 describe("routing decision — harness / scope / raw pick", () => {
-  it("chip: renders harness and the sub-agent scope badge", () => {
+  // Harness + which sub-agent the decision covers: without the badge a
+  // native-subagent decision is indistinguishable from a session one, and a
+  // badge on a session/turn decision would invent a sub-agent that has none.
+  it.each([
+    ["native_subagent", "subagent: researcher"],
+    ["turn", null],
+    ["session", null],
+  ] as const)("chip: %s scope renders the sub-agent badge as %s", (scope, badge) => {
     render(
       <RoutingDecisionChip
         model="databricks-claude-sonnet-5"
         applied
         rationale="short task"
         agent="researcher"
-        routing={{ harness: "claude-native", scope: "native_subagent" }}
+        routing={{ harness: "claude-native", scope }}
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // Harness + which sub-agent the decision covers: without them a
-    // native-subagent decision is indistinguishable from a session one.
-    expect(chip).toHaveTextContent("claude-native");
-    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent("subagent: researcher");
+    expect(screen.getByTestId("routing-decision-chip")).toHaveTextContent("claude-native");
+    if (badge === null) {
+      expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    } else {
+      expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(badge);
+    }
   });
 
-  it("chip: session/turn scopes get no sub-agent badge", () => {
+  // The router's vocabulary pick may have had no endpoint and been mapped to a
+  // servable id — that must be visible. When it resolves to the same short
+  // name there is nothing to disclose, so the row stays off.
+  it.each([
+    ["gpt-5-6-sol", "gpt-5-6-sol"],
+    ["claude-sonnet-5", null],
+  ] as const)("chip: raw pick %s is disclosed as %s", (rawModel, shown) => {
     render(
       <RoutingDecisionChip
         model="databricks-claude-sonnet-5"
         applied
         rationale="x"
-        routing={{ harness: "codex", scope: "turn" }}
+        routing={{ rawModel }}
       />,
     );
-    expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
-  });
-
-  it("chip: shows the raw router pick when it differs from the applied model", () => {
-    render(
-      <RoutingDecisionChip
-        model="databricks-claude-sonnet-5"
-        applied
-        rationale="x"
-        routing={{ rawModel: "gpt-5-6-sol" }}
-      />,
-    );
-    // The router's vocabulary pick had no endpoint and was mapped to a
-    // servable id — both must be visible or the mapping is invisible.
-    expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
     expect(screen.getByTestId("routing-decision-chip")).toHaveTextContent("sonnet");
-  });
-
-  it("chip: hides the raw pick when it resolves to the same short name", () => {
-    render(
-      <RoutingDecisionChip
-        model="databricks-claude-sonnet-5"
-        applied
-        rationale="x"
-        routing={{ rawModel: "claude-sonnet-5" }}
-      />,
-    );
-    expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    if (shown === null) {
+      expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    } else {
+      expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent(shown);
+    }
   });
 
   it("chip: renders exactly as before when no new field is set", () => {
@@ -210,7 +202,8 @@ describe("routing decision — harness / scope / raw pick", () => {
       />,
     );
     expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex-native");
-    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent("subagent: researcher");
+    // The badge's exact wording is pinned once, on subagentScopeLabel.
+    expect(screen.getByTestId("routing-decision-scope")).toBeTruthy();
     expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
     // Identity + attempted override are audit data — they belong in the
     // expandable verdict, not the glance row.

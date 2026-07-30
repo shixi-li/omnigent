@@ -71,74 +71,136 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     return events
 
 
-def test_record_routing_decision_fields(captured: list[Any]) -> None:
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        # A routed spawn: every identity field lands on the event, and the
+        # model id is reduced to family + tier before it leaves the process.
+        (
+            {
+                "scope": "native_subagent",
+                "harness": "codex",
+                "action": "rewrite",
+                "applied": True,
+                "model": "databricks-claude-opus-4-8",
+                "raw_model": "opus",
+                "overrode_agent_model": False,
+                "decision_id": "dec-1",
+            },
+            {
+                "session_id": "conv_1",
+                "installation_id": "inst-1",
+                "scope": "native_subagent",
+                "harness": "codex",
+                "action": "rewrite",
+                "applied": True,
+                "model_family": "claude",
+                "model_tier": "opus",
+                "raw_model_resolved": True,
+                "overrode_agent_model": False,
+                "decision_id": "dec-1",
+            },
+        ),
+        # No model was picked: the derived labels stay null rather than
+        # inventing a family, and no raw model was resolved.
+        (
+            {
+                "scope": "native_subagent",
+                "harness": "claude-native",
+                "action": "allow",
+                "applied": False,
+                "model": None,
+                "raw_model": None,
+                "overrode_agent_model": False,
+                "decision_id": "dec-3",
+            },
+            {
+                "model_family": None,
+                "model_tier": None,
+                "raw_model_resolved": False,
+            },
+        ),
+    ],
+)
+def test_record_routing_decision_fields(
+    captured: list[Any],
+    kwargs: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
     from omnigent.telemetry.routing import record_routing_decision
 
-    record_routing_decision(
-        "conv_1",
-        scope="native_subagent",
-        harness="codex",
-        action="rewrite",
-        applied=True,
-        model="databricks-claude-opus-4-8",
-        raw_model="opus",
-        overrode_agent_model=False,
-        decision_id="dec-1",
-    )
+    record_routing_decision("conv_1", **kwargs)
     (event,) = captured
     assert type(event).__name__ == "RoutingDecisionEvent"
-    assert event.installation_id == "inst-1"
-    assert event.session_id == "conv_1"
-    assert event.scope == "native_subagent"
-    assert event.harness == "codex"
-    assert event.action == "rewrite"
-    assert event.applied is True
-    assert event.model_family == "claude"
-    assert event.model_tier == "opus"
-    assert event.raw_model_resolved is True
-    assert event.overrode_agent_model is False
-    assert event.decision_id == "dec-1"
+    for field, want in expected.items():
+        assert getattr(event, field) == want, field
 
 
-def test_record_routing_decision_carries_no_model_id_or_rationale(captured: list[Any]) -> None:
+@pytest.mark.parametrize(
+    ("kwargs", "expected_params", "absent_from_wire"),
+    [
+        # A private endpoint name must never reach the wire, and neither the
+        # rationale nor the prompt is ever carried.
+        (
+            {
+                "scope": "turn",
+                "harness": "claude-native",
+                "action": "allow",
+                "applied": False,
+                "model": "acme-project-zephyr-endpoint",
+                "raw_model": None,
+                "overrode_agent_model": False,
+                "decision_id": "dec-2",
+            },
+            {"scope": "turn", "action": "allow"},
+            ("acme-project-zephyr-endpoint", "rationale", "prompt"),
+        ),
+        # Routing fields land in ``params``; ids are promoted to top level.
+        (
+            {
+                "scope": "child_session",
+                "harness": "codex",
+                "action": "redirect",
+                "applied": True,
+                "model": "gpt-5.4-mini",
+                "raw_model": None,
+                "overrode_agent_model": True,
+                "decision_id": "dec-5",
+            },
+            {
+                "scope": "child_session",
+                "action": "redirect",
+                "model_family": "gpt",
+                "model_tier": "mini",
+                "overrode_agent_model": True,
+            },
+            ("gpt-5.4-mini", "rationale", "prompt"),
+        ),
+    ],
+)
+def test_routing_decision_wire_format(
+    captured: list[Any],
+    kwargs: dict[str, Any],
+    expected_params: dict[str, Any],
+    absent_from_wire: tuple[str, ...],
+) -> None:
     from omnigent.telemetry.client import _build_record
     from omnigent.telemetry.routing import record_routing_decision
 
-    record_routing_decision(
-        "conv_1",
-        scope="turn",
-        harness="claude-native",
-        action="allow",
-        applied=False,
-        model="acme-project-zephyr-endpoint",
-        raw_model=None,
-        overrode_agent_model=False,
-        decision_id="dec-2",
-    )
-    wire = json.dumps(_build_record(captured[0]))
-    assert "acme-project-zephyr-endpoint" not in wire
-    assert "rationale" not in wire
-    assert "prompt" not in wire
-
-
-def test_record_routing_decision_no_model(captured: list[Any]) -> None:
-    from omnigent.telemetry.routing import record_routing_decision
-
-    record_routing_decision(
-        "conv_1",
-        scope="native_subagent",
-        harness="claude-native",
-        action="allow",
-        applied=False,
-        model=None,
-        raw_model=None,
-        overrode_agent_model=False,
-        decision_id="dec-3",
-    )
-    event = captured[0]
-    assert event.model_family is None
-    assert event.model_tier is None
-    assert event.raw_model_resolved is False
+    record_routing_decision("conv_1", **kwargs)
+    record = _build_record(captured[0])
+    wire = json.dumps(record)
+    for needle in absent_from_wire:
+        assert needle not in wire
+    data = record["data"]
+    assert data["event_name"] == "RoutingDecisionEvent"
+    assert data["installation_id"] == "inst-1"
+    assert data["session_id"] == "conv_1"
+    params = json.loads(data["params"])
+    for key, want in expected_params.items():
+        assert params[key] == want, key
+    # The session id is promoted, never duplicated into params.
+    assert "session_id" not in params
 
 
 def test_record_routing_decision_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,8 +226,20 @@ def test_record_routing_decision_never_raises(monkeypatch: pytest.MonkeyPatch) -
 # ── record_routing_setting_changed ──────────────────────────────────────────
 
 
-@pytest.mark.parametrize("value", ["on", "off", "default"])
-def test_record_routing_setting_changed(captured: list[Any], value: str) -> None:
+@pytest.mark.parametrize(
+    ("value", "user_id"),
+    [
+        ("on", "alice@example.com"),
+        ("off", "alice@example.com"),
+        ("default", "alice@example.com"),
+        # No user attached: the anon id stays absent rather than being a
+        # hash of the empty string.
+        ("on", None),
+    ],
+)
+def test_record_routing_setting_changed(
+    captured: list[Any], value: str, user_id: str | None
+) -> None:
     from omnigent.telemetry.routing import (
         SETTING_SUBAGENT_ROUTING,
         record_routing_setting_changed,
@@ -175,59 +249,18 @@ def test_record_routing_setting_changed(captured: list[Any], value: str) -> None
         "conv_1",
         setting=SETTING_SUBAGENT_ROUTING,
         value=value,
-        user_id="alice@example.com",
+        user_id=user_id,
     )
     (event,) = captured
     assert type(event).__name__ == "RoutingSettingChangedEvent"
     assert event.setting == "subagent_routing"
     assert event.value == value
-    assert event.anon_user_id is not None
-    assert len(event.anon_user_id) == 16
-    assert "alice" not in event.anon_user_id
-
-
-def test_record_routing_setting_changed_without_user(captured: list[Any]) -> None:
-    from omnigent.telemetry.routing import (
-        SETTING_SUBAGENT_ROUTING,
-        record_routing_setting_changed,
-    )
-
-    record_routing_setting_changed(
-        "conv_1", setting=SETTING_SUBAGENT_ROUTING, value="on", user_id=None
-    )
-    assert captured[0].anon_user_id is None
-
-
-# ── wire format ─────────────────────────────────────────────────────────────
-
-
-def test_routing_decision_wire_format(captured: list[Any]) -> None:
-    """Routing fields land in ``params``; ids are promoted to top-level."""
-    from omnigent.telemetry.client import _build_record
-    from omnigent.telemetry.routing import record_routing_decision
-
-    record_routing_decision(
-        "conv_1",
-        scope="child_session",
-        harness="codex",
-        action="redirect",
-        applied=True,
-        model="gpt-5.4-mini",
-        raw_model=None,
-        overrode_agent_model=True,
-        decision_id="dec-5",
-    )
-    data = _build_record(captured[0])["data"]
-    assert data["event_name"] == "RoutingDecisionEvent"
-    assert data["installation_id"] == "inst-1"
-    assert data["session_id"] == "conv_1"
-    params = json.loads(data["params"])
-    assert params["scope"] == "child_session"
-    assert params["action"] == "redirect"
-    assert params["model_family"] == "gpt"
-    assert params["model_tier"] == "mini"
-    assert params["overrode_agent_model"] is True
-    assert "session_id" not in params
+    if user_id is None:
+        assert event.anon_user_id is None
+    else:
+        assert event.anon_user_id is not None
+        assert len(event.anon_user_id) == 16
+        assert "alice" not in event.anon_user_id
 
 
 # ── call sites ──────────────────────────────────────────────────────────────

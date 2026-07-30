@@ -137,17 +137,13 @@ class TestModelFamilyMismatch:
             ("codex-native", "databricks-gpt-5-4"),
             ("codex", "gpt-5.1-codex"),
             # GLM and Kimi serve on the same OpenResponses wire codex speaks,
-            # so every spelling of those ids is codex-runnable.
+            # so those ids are codex-runnable. One row per distinct thing the
+            # segment matcher has to get right: bare id, dot-separated gateway
+            # namespace, the databricks- prefix, and a non-generational tail.
             ("codex", "glm-5-2"),
-            ("codex", "databricks-glm-5-2"),
-            ("codex", "system.ai.glm-5-2"),
-            ("codex-native", "databricks-glm-5-2"),
             ("native-codex", "system.ai.glm-5-2"),
-            ("codex", "kimi-k2"),
-            ("codex", "kimi-k2-instruct"),
+            ("codex-native", "databricks-kimi-k2-6"),
             ("codex", "kimi-for-coding"),
-            ("codex", "databricks-kimi-k2-6"),
-            ("codex-native", "system.ai.kimi-k2-instruct"),
             ("openai-agents", "gpt-5.4-mini"),
             # openai-agents is multi-model like pi (a live SDK probe completed a
             # Claude tool-calling turn over the chat wire), so it accepts the

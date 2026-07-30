@@ -10,7 +10,6 @@ rebound to the wrapper the router picked.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -19,7 +18,7 @@ import httpx
 import pytest
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, clear_cache
+from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import (
     _installed_native_harnesses,
     _pre_session_model_catalog,
@@ -28,7 +27,6 @@ from omnigent.server.smart_routing import (
     AUTO_NATIVE_ROUTING_HARNESSES,
     RoutePick,
     RoutingResult,
-    RoutingSettings,
     TaskV1RouteOptionSource,
     infer_models,
     route_session_harness,
@@ -36,11 +34,13 @@ from omnigent.server.smart_routing import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import Host
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import FakeCaps, FakeRoutingClient, create_test_agent
 
 CLAUDE_MODEL = "databricks-claude-opus-4-8"
 GPT_MODEL = "databricks-gpt-5-5"
 ROUTING_MESSAGE = "refactor the auth module and add tests"
+
+pytestmark = pytest.mark.usefixtures("clear_routing_cache")
 
 SPAWN_PAYLOAD = {
     "harness": "claude-native",
@@ -48,36 +48,6 @@ SPAWN_PAYLOAD = {
     "prompt": "review the auth module",
     "parent_model": CLAUDE_MODEL,
 }
-
-
-class _FakeRoutingClient:
-    """Returns a canned verdict and records what it was offered."""
-
-    def __init__(self, result: RoutingResult | None) -> None:
-        self._result = result
-        self.last_error: str | None = None
-        self.offered: list[dict[str, list[str]]] = []
-
-    async def route(
-        self,
-        message: str,
-        available_models: dict[str, list[str]],
-    ) -> RoutingResult | None:
-        self.offered.append(dict(available_models))
-        return self._result
-
-
-@dataclass
-class _FakeCaps:
-    routing_client: Any = None  # type: ignore[explicit-any]
-    routing_settings: RoutingSettings = field(default_factory=RoutingSettings)
-
-
-@pytest.fixture(autouse=True)
-def _clear_decision_cache() -> Any:  # type: ignore[explicit-any]
-    clear_cache()
-    yield
-    clear_cache()
 
 
 async def _native_wrappers(client: httpx.AsyncClient, db_uri: str) -> dict[str, str]:
@@ -110,7 +80,7 @@ async def _native_wrappers(client: httpx.AsyncClient, db_uri: str) -> dict[str, 
 async def _create_smart_routing_session(
     client: httpx.AsyncClient,
     wrappers: dict[str, str],
-    routing_client: _FakeRoutingClient | None,
+    routing_client: FakeRoutingClient | None,
 ) -> httpx.Response:
     """POST the landing screen's Smart Routing create payload.
 
@@ -126,7 +96,7 @@ async def _create_smart_routing_session(
         "cost_control_mode_override": "on",
         "smart_routing_message": ROUTING_MESSAGE,
     }
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         return await client.post("/v1/sessions", json=body)
 
 
@@ -137,7 +107,6 @@ async def _create_smart_routing_session(
         (GPT_MODEL, "codex-native"),
     ],
 )
-@pytest.mark.asyncio
 async def test_create_binds_the_wrapper_the_router_picked(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -145,7 +114,7 @@ async def test_create_binds_the_wrapper_the_router_picked(
     expected_harness: str,
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
-    routing_client = _FakeRoutingClient(RoutingResult(model=picked_model, rationale="sized task"))
+    routing_client = FakeRoutingClient(RoutingResult(model=picked_model, rationale="sized task"))
     created = await _create_smart_routing_session(client, wrappers, routing_client)
     assert created.status_code == 201, created.text
 
@@ -161,25 +130,23 @@ async def test_create_binds_the_wrapper_the_router_picked(
     assert conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
 
 
-@pytest.mark.asyncio
 async def test_router_is_offered_both_native_families(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
-    routing_client = _FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
     created = await _create_smart_routing_session(client, wrappers, routing_client)
     assert created.status_code == 201, created.text
     assert set(routing_client.offered[0]) == {"claude-native", "codex-native"}
 
 
-@pytest.mark.asyncio
 async def test_routed_wrapper_gets_terminal_first_labels(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
-    routing_client = _FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
     created = await _create_smart_routing_session(client, wrappers, routing_client)
     assert created.status_code == 201, created.text
 
@@ -190,7 +157,6 @@ async def test_routed_wrapper_gets_terminal_first_labels(
     assert conv.labels.get("omnigent.wrapper") == "codex-native-ui"
 
 
-@pytest.mark.asyncio
 async def test_create_falls_back_to_a_native_cli_when_routing_is_unavailable(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -208,21 +174,20 @@ async def test_create_falls_back_to_a_native_cli_when_routing_is_unavailable(
     assert conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
 
 
-@pytest.mark.asyncio
 async def test_smart_routing_session_keeps_cross_harness_subagents(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
-    routing_client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
     created = await _create_smart_routing_session(client, wrappers, routing_client)
     assert created.status_code == 201, created.text
     session_id = created.json()["id"]
 
-    spawn_router = _FakeRoutingClient(
+    spawn_router = FakeRoutingClient(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=spawn_router)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=spawn_router)):
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -234,14 +199,13 @@ async def test_smart_routing_session_keeps_cross_harness_subagents(
     assert resp.json()["harness"] == "codex-native"
 
 
-@pytest.mark.asyncio
 async def test_bundle_agent_auto_path_is_unchanged(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     agent = await create_test_agent(client, name="smart-routing-bundle-agent")
-    routing_client = _FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         created = await client.post(
             "/v1/sessions",
             json={
@@ -264,13 +228,12 @@ async def test_bundle_agent_auto_path_is_unchanged(
     assert routing_client.offered == []
 
 
-@pytest.mark.asyncio
 async def test_native_candidates_impose_no_family_constraint() -> None:
     # The candidate override and the parent-family filter are orthogonal: an
     # auto session passes no allowed_family, so both native families reach the
     # router even though the family filter is applied to the same tuple.
-    routing_client = _FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         harness, model, _verdict, error = await route_session_harness(
             ROUTING_MESSAGE,
             harness_candidates=AUTO_NATIVE_ROUTING_HARNESSES,
@@ -281,14 +244,13 @@ async def test_native_candidates_impose_no_family_constraint() -> None:
     assert model == GPT_MODEL
 
 
-@pytest.mark.asyncio
 async def test_native_candidates_still_honor_an_explicit_family() -> None:
     # A family constraint (a child of a pinned parent) narrows the same tuple,
     # so the two knobs compose rather than fight.
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         harness, _model, _verdict, error = await route_session_harness(
             ROUTING_MESSAGE,
             harness_candidates=AUTO_NATIVE_ROUTING_HARNESSES,
@@ -299,10 +261,9 @@ async def test_native_candidates_still_honor_an_explicit_family() -> None:
     assert harness == "claude-native"
 
 
-@pytest.mark.asyncio
 async def test_no_installed_native_candidates_reports_the_standard_error() -> None:
-    routing_client = _FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         harness, model, verdict, error = await route_session_harness(
             ROUTING_MESSAGE,
             harness_candidates=(),
@@ -325,27 +286,24 @@ def _host(readiness: dict[str, Any] | None) -> Host:  # type: ignore[explicit-an
 
 
 @pytest.mark.parametrize(
-    ("readiness", "expected"),
+    ("host", "expected"),
     [
-        ({"claude-native": True, "codex-native": True}, ["claude-native", "codex-native"]),
-        ({"claude-native": True, "codex-native": "binary-missing"}, ["claude-native"]),
-        ({"claude-native": "needs-auth", "codex-native": True}, ["codex-native"]),
-        ({"claude-native": "version-too-low", "codex-native": False}, []),
+        (_host({"claude-native": True, "codex-native": True}), ["claude-native", "codex-native"]),
+        (_host({"claude-native": True, "codex-native": "binary-missing"}), ["claude-native"]),
+        (_host({"claude-native": "needs-auth", "codex-native": True}), ["codex-native"]),
+        (_host({"claude-native": "version-too-low", "codex-native": False}), []),
         # An unreported harness can't be assumed installed.
-        ({"claude-native": True}, ["claude-native"]),
+        (_host({"claude-native": True}), ["claude-native"]),
         # Fails open: a host with no readiness map doesn't disable routing.
+        (_host(None), ["claude-native", "codex-native"]),
+        # No host at all fails open the same way.
         (None, ["claude-native", "codex-native"]),
     ],
 )
 def test_installed_native_harnesses_follows_host_readiness(
-    readiness: dict[str, Any] | None,  # type: ignore[explicit-any]
-    expected: list[str],
+    host: Host | None, expected: list[str]
 ) -> None:
-    assert _installed_native_harnesses(_host(readiness)) == expected
-
-
-def test_installed_native_harnesses_without_a_host() -> None:
-    assert _installed_native_harnesses(None) == ["claude-native", "codex-native"]
+    assert _installed_native_harnesses(host) == expected
 
 
 # ── Pre-session candidate catalog ───────────────────────────────────────────
@@ -361,69 +319,76 @@ LUNA = "databricks-gpt-5-6-luna"
 HOST_GPT_CATALOG = [LUNA, SOL]
 
 
-@pytest.mark.asyncio
-async def test_pre_session_catalog_is_offered_instead_of_the_static_table() -> None:
-    routing_client = _FakeRoutingClient(RoutingResult(model=SOL, rationale="deep reasoning"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+@pytest.mark.parametrize(
+    ("verdict_model", "harness_candidates", "catalog", "expected_offer", "expected_pick"),
+    [
+        # The host's catalog is offered verbatim instead of the static table,
+        # and a servable pick applies exactly (no substitution, no raw pick).
+        (
+            SOL,
+            ("codex-native",),
+            {"codex-native": HOST_GPT_CATALOG},
+            {"codex-native": HOST_GPT_CATALOG},
+            ("codex-native", SOL),
+        ),
+        # Out-of-family rows in the host's answer are filtered out before the
+        # offer, so the router can never pick an unspawnable model.
+        (
+            SOL,
+            ("codex-native",),
+            {"codex-native": [*HOST_GPT_CATALOG, CLAUDE_MODEL]},
+            {"codex-native": HOST_GPT_CATALOG},
+            ("codex-native", SOL),
+        ),
+        # Hosts only resolve a pre-launch catalog for the CLIs that can report
+        # one without running; the static table tops up the rest.
+        (
+            SOL,
+            AUTO_NATIVE_ROUTING_HARNESSES,
+            {"codex-native": HOST_GPT_CATALOG},
+            {
+                "codex-native": HOST_GPT_CATALOG,
+                "claude-native": None,  # filled from infer_models below
+            },
+            ("codex-native", SOL),
+        ),
+        # No host answer at all: the static table is the whole offer.
+        (
+            GPT_MODEL,
+            AUTO_NATIVE_ROUTING_HARNESSES,
+            {},
+            {"claude-native": None, "codex-native": None},
+            ("codex-native", GPT_MODEL),
+        ),
+    ],
+)
+async def test_pre_session_catalog_is_offered_instead_of_the_static_table(
+    verdict_model: str,
+    harness_candidates: tuple[str, ...],
+    catalog: dict[str, list[str]],
+    expected_offer: dict[str, list[str] | None],
+    expected_pick: tuple[str, str],
+) -> None:
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=verdict_model, rationale="deep reasoning")
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         harness, model, verdict, error = await route_session_harness(
             ROUTING_MESSAGE,
-            harness_candidates=("codex-native",),
-            catalog={"codex-native": HOST_GPT_CATALOG},
+            harness_candidates=harness_candidates,
+            catalog=catalog,
         )
     assert error is None
-    assert routing_client.offered[0] == {"codex-native": HOST_GPT_CATALOG}
-    # The pick is servable, so it applies exactly — no substitution, and the
-    # card shows no divergent raw pick.
-    assert (harness, model) == ("codex-native", SOL)
+    # ``None`` in the expectation means "whatever the static table serves".
+    want = {
+        name: rows if rows is not None else infer_models(name)
+        for name, rows in expected_offer.items()
+    }
+    assert routing_client.offered[0] == want
+    assert (harness, model) == expected_pick
+    # A servable pick applies exactly, so the card shows no divergent raw pick.
     assert verdict is not None
     assert "raw_model" not in verdict
-
-
-@pytest.mark.asyncio
-async def test_pre_session_catalog_is_family_filtered() -> None:
-    routing_client = _FakeRoutingClient(RoutingResult(model=SOL, rationale="deep reasoning"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
-        _harness, _model, _verdict, error = await route_session_harness(
-            ROUTING_MESSAGE,
-            harness_candidates=("codex-native",),
-            catalog={"codex-native": [*HOST_GPT_CATALOG, CLAUDE_MODEL]},
-        )
-    assert error is None
-    assert routing_client.offered[0] == {"codex-native": HOST_GPT_CATALOG}
-
-
-@pytest.mark.asyncio
-async def test_static_table_tops_up_harnesses_the_host_cannot_answer_for() -> None:
-    routing_client = _FakeRoutingClient(RoutingResult(model=SOL, rationale="deep reasoning"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
-        _harness, _model, _verdict, error = await route_session_harness(
-            ROUTING_MESSAGE,
-            harness_candidates=AUTO_NATIVE_ROUTING_HARNESSES,
-            # Hosts only resolve a pre-launch catalog for the CLIs that can
-            # report one without running; the rest fall back.
-            catalog={"codex-native": HOST_GPT_CATALOG},
-        )
-    assert error is None
-    offered = routing_client.offered[0]
-    assert offered["codex-native"] == HOST_GPT_CATALOG
-    assert offered["claude-native"] == infer_models("claude-native")
-
-
-@pytest.mark.asyncio
-async def test_no_host_catalog_falls_back_to_the_static_table() -> None:
-    routing_client = _FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
-        harness, model, _verdict, error = await route_session_harness(
-            ROUTING_MESSAGE,
-            harness_candidates=AUTO_NATIVE_ROUTING_HARNESSES,
-            catalog={},
-        )
-    assert error is None
-    assert (harness, model) == ("codex-native", GPT_MODEL)
-    assert routing_client.offered[0] == {
-        "claude-native": infer_models("claude-native"),
-        "codex-native": infer_models("codex-native"),
-    }
 
 
 def test_static_candidates_serve_the_routers_current_codex_arms() -> None:
@@ -445,89 +410,72 @@ def test_static_candidates_serve_the_routers_current_codex_arms() -> None:
         assert resolved.raw_model == arm
 
 
-@pytest.mark.asyncio
-async def test_pre_session_catalog_reads_the_hosts_model_options() -> None:
+@pytest.mark.parametrize(
+    ("has_registry", "answers", "expected"),
+    [
+        # The row's launchable ``model`` id, not its picker key; a harness the
+        # host cannot answer for is simply absent.
+        (
+            True,
+            {"claude-native": {"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}},
+            {"claude-native": ["databricks-claude-opus-4-8"]},
+        ),
+        # ``routable_models`` widens the catalog past the picker rows (which
+        # name the newest of each family only), so a frozen arm the workspace
+        # still serves stays routable.
+        (
+            True,
+            {
+                "claude-native": {
+                    "models": [{"id": "opus", "model": "databricks-claude-opus-5"}],
+                    "routable_models": [
+                        "databricks-claude-opus-5",
+                        "databricks-claude-opus-4-8",
+                    ],
+                }
+            },
+            {
+                "claude-native": [
+                    "databricks-claude-opus-5",
+                    "databricks-claude-opus-4-8",
+                ]
+            },
+        ),
+        # No live host: nothing to ask, so no catalog.
+        (False, {}, {}),
+    ],
+)
+async def test_pre_session_catalog_reads_the_hosts_model_options(
+    has_registry: bool,
+    answers: dict[str, dict[str, Any]],  # type: ignore[explicit-any]
+    expected: dict[str, list[str]],
+) -> None:
     from omnigent.host.frames import decode_host_frame
 
     conn = SimpleNamespace(host_id="host_1", pending_model_options={})
-    answers = {"claude-native": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
 
     def send_text(host_conn: Any, frame: str) -> None:  # type: ignore[explicit-any]
         decoded = decode_host_frame(frame)
-        models = answers.get(decoded.harness)
+        answer = answers.get(decoded.harness)
         future = host_conn.pending_model_options[decoded.request_id]
         future.set_result(
-            {"status": "ok", "models": models}
-            if models is not None
+            {"status": "ok", **answer}
+            if answer is not None
             else {"status": "failed", "error": "unsupported"}
         )
 
-    registry = SimpleNamespace(get=lambda host_id: conn, send_text=send_text)
+    registry = (
+        SimpleNamespace(get=lambda host_id: conn, send_text=send_text) if has_registry else None
+    )
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=registry)))
     catalog = await _pre_session_model_catalog(
         cast("Any", request),
         _host(None),
         AUTO_NATIVE_ROUTING_HARNESSES,
     )
-    # The row's launchable ``model`` id, not its picker key; a harness the host
-    # cannot answer for is simply absent.
-    assert catalog == {"claude-native": ["databricks-claude-opus-4-8"]}
+    assert catalog == expected
+    # No in-flight request is left behind on any path.
     assert conn.pending_model_options == {}
-
-
-@pytest.mark.asyncio
-async def test_pre_session_catalog_includes_servable_models_no_row_names() -> None:
-    """The frozen arm the workspace still serves must stay routable."""
-    from omnigent.host.frames import decode_host_frame
-
-    conn = SimpleNamespace(host_id="host_1", pending_model_options={})
-
-    def send_text(host_conn: Any, frame: str) -> None:  # type: ignore[explicit-any]
-        decoded = decode_host_frame(frame)
-        future = host_conn.pending_model_options[decoded.request_id]
-        if decoded.harness != "claude-native":
-            future.set_result({"status": "failed", "error": "unsupported"})
-            return
-        future.set_result(
-            {
-                "status": "ok",
-                # The picker names the newest of each family only.
-                "models": [{"id": "opus", "model": "databricks-claude-opus-5"}],
-                "routable_models": [
-                    "databricks-claude-opus-5",
-                    "databricks-claude-opus-4-8",
-                ],
-            }
-        )
-
-    registry = SimpleNamespace(get=lambda host_id: conn, send_text=send_text)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=registry)))
-
-    catalog = await _pre_session_model_catalog(
-        cast("Any", request),
-        _host(None),
-        AUTO_NATIVE_ROUTING_HARNESSES,
-    )
-
-    assert catalog == {
-        "claude-native": [
-            "databricks-claude-opus-5",
-            "databricks-claude-opus-4-8",
-        ]
-    }
-
-
-@pytest.mark.asyncio
-async def test_pre_session_catalog_is_empty_without_a_live_host() -> None:
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=None)))
-    assert (
-        await _pre_session_model_catalog(
-            cast("Any", request),
-            _host(None),
-            AUTO_NATIVE_ROUTING_HARNESSES,
-        )
-        == {}
-    )
 
 
 def _native_conv(session_id: str) -> Any:  # type: ignore[explicit-any]

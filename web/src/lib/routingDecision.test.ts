@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { routingExtras, routingExtrasFromWire, subagentScopeLabel } from "./routingDecision";
+import {
+  isSessionScopedDecision,
+  routingExtras,
+  routingExtrasFromWire,
+  subagentScopeLabel,
+} from "./routingDecision";
 
 describe("routingExtrasFromWire", () => {
   it("maps the snake_case wire fields to camelCase", () => {
@@ -44,19 +49,35 @@ describe("routingExtras", () => {
 });
 
 describe("subagentScopeLabel", () => {
-  it("labels sub-agent scopes with the agent name", () => {
-    expect(subagentScopeLabel("native_subagent", "researcher")).toBe("subagent: researcher");
-    expect(subagentScopeLabel("child_session", "coder")).toBe("subagent: coder");
+  // Only the two sub-agent scopes get a badge, named after the agent when
+  // there is one; session/turn (and a legacy absent scope) get none, or the
+  // badge would invent a sub-agent the decision never covered.
+  it.each([
+    ["native_subagent", "researcher", "subagent: researcher"],
+    ["child_session", "coder", "subagent: coder"],
+    ["native_subagent", null, "subagent"],
+    ["child_session", "  ", "subagent"],
+    ["session", "x", null],
+    ["turn", "x", null],
+    [undefined, "x", null],
+  ] as const)("scope %s + agent %s labels as %s", (scope, agent, expected) => {
+    expect(subagentScopeLabel(scope, agent)).toBe(expected);
   });
+});
 
-  it("falls back to a bare label when the agent name is missing", () => {
-    expect(subagentScopeLabel("native_subagent", null)).toBe("subagent");
-    expect(subagentScopeLabel("child_session", "  ")).toBe("subagent");
-  });
-
-  it("returns null for session/turn scopes and for an absent scope", () => {
-    expect(subagentScopeLabel("session", "x")).toBeNull();
-    expect(subagentScopeLabel("turn", "x")).toBeNull();
-    expect(subagentScopeLabel(undefined, "x")).toBeNull();
+describe("isSessionScopedDecision", () => {
+  // The chip walker uses this to decide whether a decision belongs to the
+  // session's own turn (and so pairs with a user message) or to a sub-agent it
+  // spawned (which renders standalone). Legacy rows carry no scope and count
+  // as the session's, or every pre-scope transcript would stop pairing.
+  it.each([
+    ["session", true],
+    ["turn", true],
+    [null, true],
+    [undefined, true],
+    ["native_subagent", false],
+    ["child_session", false],
+  ] as const)("scope %s is session-scoped: %s", (scope, expected) => {
+    expect(isSessionScopedDecision(scope)).toBe(expected);
   });
 });

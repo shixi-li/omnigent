@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.inner.hook_scripts import codex_router_hook as hook
 from omnigent.inner.hook_scripts import subagent_router
+from tests.inner.conftest import advertise_router
 
 _ENCRYPTED_MESSAGE = "enc:AAAABBBBCCCC=="
 
@@ -24,13 +25,6 @@ def _payload(**tool_input: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
             **tool_input,
         },
     }
-
-
-def _advertise(tmp_path: Path, **extra: Any) -> Path:  # type: ignore[explicit-any]
-    (tmp_path / "subagent_router.json").write_text(
-        json.dumps({"url": "http://127.0.0.1:1/", "token": "t0k", **extra})
-    )
-    return tmp_path
 
 
 def _route(
@@ -105,41 +99,39 @@ def test_build_route_request_never_sends_the_encrypted_prompt() -> None:
     assert _ENCRYPTED_MESSAGE not in json.dumps(body)
 
 
-def test_build_route_request_falls_back_to_agent_name() -> None:
-    """Codex names the spawn ``agent_name`` on some paths, ``task_name`` on others."""
-    body = _build({"agent_name": "doc-writer", "message": _ENCRYPTED_MESSAGE})
+@pytest.mark.parametrize(
+    ("tool_input", "expected_task_name", "expected_fork"),
+    [
+        # Codex names the spawn ``agent_name`` on some paths, ``task_name`` on
+        # others; the explicit ``task_name`` wins when both are present.
+        ({"agent_name": "doc-writer", "message": _ENCRYPTED_MESSAGE}, "doc-writer", False),
+        ({"task_name": "refactor-tests", "agent_name": "doc-writer"}, "refactor-tests", False),
+        # The server supplies the placeholder task; the hook does not invent one.
+        ({"message": _ENCRYPTED_MESSAGE}, "", False),
+        # Fork is detected from the task name, never from a field codex does
+        # not send — a stray boolean must not be trusted.
+        ({"task_name": "planner-fork"}, "planner-fork", True),
+        ({"fork": True, "task_name": "refactor-tests"}, "refactor-tests", False),
+    ],
+)
+def test_build_route_request_derives_task_name_and_fork(
+    tool_input: dict[str, Any],  # type: ignore[explicit-any]
+    expected_task_name: str,
+    expected_fork: bool,
+) -> None:
+    body = _build(tool_input)
 
-    assert body["task_name"] == "doc-writer"
-
-
-def test_build_route_request_prefers_task_name_over_agent_name() -> None:
-    body = _build({"task_name": "refactor-tests", "agent_name": "doc-writer"})
-
-    assert body["task_name"] == "refactor-tests"
-
-
-def test_build_route_request_leaves_task_name_empty_when_unnamed() -> None:
-    """The server supplies the placeholder task; the hook does not invent one."""
-    body = _build({"message": _ENCRYPTED_MESSAGE})
-
-    assert body["task_name"] == ""
+    assert body["task_name"] == expected_task_name
+    assert body["fork"] is expected_fork
+    # The encrypted message is never forwarded on any of these paths.
     assert body["prompt"] is None
-
-
-def test_fork_detected_from_the_codex_task_name() -> None:
-    assert _build({"task_name": "planner-fork"})["fork"] is True
-
-
-def test_bogus_fork_boolean_does_not_mark_a_normal_spawn_as_a_fork() -> None:
-    # Codex sends no ``fork`` field; a stray boolean must not be trusted.
-    assert _build({"fork": True, "task_name": "refactor-tests"})["fork"] is False
 
 
 def test_rewrite_injects_model_and_passes_message_verbatim(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {
         "action": "rewrite",
         "model": "claude-sonnet-5",
@@ -166,31 +158,37 @@ def test_rewrite_injects_model_and_passes_message_verbatim(
     assert router.calls[0]["body"]["prompt"] is None
 
 
-def test_rewrite_surfaces_the_routed_model_in_the_codex_tui(
+@pytest.mark.parametrize(
+    ("response", "expected_notice"),
+    [
+        # A rewrite is otherwise invisible — codex reports no model change — so
+        # the routed model is announced in the TUI.
+        (
+            {"action": "rewrite", "model": "gpt-5-6-luna", "rationale": "cheap"},
+            "Using Smart Routing. Routing to gpt-5-6-luna.",
+        ),
+        # A deny routed to nothing, so there is no model to announce.
+        ({"action": "deny", "rationale": "over budget"}, None),
+    ],
+)
+def test_routing_notice_announces_only_a_routed_model(
     tmp_path: Path,
     router: _Router,
+    response: dict[str, Any],  # type: ignore[explicit-any]
+    expected_notice: str | None,
 ) -> None:
-    """A rewrite is otherwise invisible — codex reports no model change."""
-    _advertise(tmp_path, session_id="conv_abc")
-    router.response = {"action": "rewrite", "model": "gpt-5-6-luna", "rationale": "cheap"}
+    advertise_router(tmp_path)
+    router.response = response
 
     out = _route(_payload(), router_dir=tmp_path)
 
     assert out is not None
-    # Top level, alongside hookSpecificOutput — codex reads it there.
-    assert out["systemMessage"] == "Using Smart Routing. Routing to gpt-5-6-luna."
-    assert "systemMessage" not in out["hookSpecificOutput"]
-
-
-def test_deny_carries_no_routing_notice(tmp_path: Path, router: _Router) -> None:
-    """Nothing was routed to, so there is no model to announce."""
-    _advertise(tmp_path, session_id="conv_abc")
-    router.response = {"action": "deny", "rationale": "over budget"}
-
-    out = _route(_payload(), router_dir=tmp_path)
-
-    assert out is not None
-    assert "systemMessage" not in out
+    if expected_notice is None:
+        assert "systemMessage" not in out
+    else:
+        # Top level, alongside hookSpecificOutput — codex reads it there.
+        assert out["systemMessage"] == expected_notice
+        assert "systemMessage" not in out["hookSpecificOutput"]
 
 
 def test_with_system_message_passes_no_opinion_through() -> None:
@@ -201,7 +199,7 @@ def test_redirect_denies_with_sys_session_send_instruction(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {
         "action": "redirect",
         "harness": "claude-native",
@@ -226,7 +224,7 @@ def test_deny_uses_router_rationale(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {"action": "deny", "rationale": "router unavailable"}
 
     out = _route(_payload(), router_dir=tmp_path)
@@ -240,7 +238,7 @@ def test_allow_emits_no_opinion(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {"action": "allow", "rationale": "fork exempt"}
 
     assert _route(_payload(), router_dir=tmp_path) is None
@@ -250,7 +248,7 @@ def test_router_unreachable_allows_unchanged(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = None
 
     assert _route(_payload(), router_dir=tmp_path) is None
@@ -268,7 +266,7 @@ def test_malformed_advertisement_allows_unchanged(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    (tmp_path / "subagent_router.json").write_text("{not json")
+    (tmp_path / subagent_router.ADVERTISEMENT_FILE).write_text("{not json")
 
     assert _route(_payload(), router_dir=tmp_path) is None
     assert router.calls == []
@@ -281,7 +279,7 @@ def test_unknown_session_allows_unchanged(
 ) -> None:
     monkeypatch.delenv(subagent_router.SESSION_ID_ENV_VAR, raising=False)
     monkeypatch.delenv(subagent_router.NATIVE_SESSION_ID_ENV_VAR, raising=False)
-    _advertise(tmp_path)
+    advertise_router(tmp_path, session_id=None)
 
     assert _route(_payload(), router_dir=tmp_path) is None
     assert router.calls == []
@@ -291,7 +289,7 @@ def test_baked_session_id_used_when_advertisement_has_none(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path)
+    advertise_router(tmp_path, session_id=None)
     router.response = {"action": "allow"}
 
     _route(_payload(), router_dir=tmp_path, session_id="conv_baked")
@@ -303,7 +301,7 @@ def test_non_spawn_tool_is_ignored(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     payload = _payload()
     payload["tool_name"] = "shell"
 
@@ -315,7 +313,7 @@ def test_fork_spawn_reported(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {"action": "allow"}
 
     _route(_payload(task_name="planner-fork"), router_dir=tmp_path)
@@ -327,7 +325,7 @@ def test_parent_model_falls_back_to_payload_model(
     tmp_path: Path,
     router: _Router,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {"action": "allow"}
 
     _route(_payload(), router_dir=tmp_path)
@@ -353,7 +351,7 @@ def test_route_subagent_tolerates_unknown_flags(
     router: _Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _advertise(tmp_path, session_id="conv_abc")
+    advertise_router(tmp_path)
     router.response = {"action": "allow"}
     monkeypatch.setattr(hook.sys, "stdin", _Stdin(json.dumps(_payload())))
     out = io.StringIO()

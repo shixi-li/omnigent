@@ -8,7 +8,6 @@ fail-mode knob, and the decision cache.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
 
@@ -24,59 +23,19 @@ from omnigent.server.routes._sessions import orchestration as orchestration_modu
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
-from tests.server.helpers import create_test_agent
-
-pytestmark = pytest.mark.asyncio
+from tests.server.helpers import (
+    FakeCaps,
+    FakeRoutingClient,
+    create_test_agent,
+    echo_runner_client,
+)
 
 ROUTED_MODEL = "databricks-claude-opus-4-8"
 LLM_PICKED_MODEL = "databricks-claude-sonnet-4-6"
 GPT_MODEL = "databricks-gpt-5-5"
 GLM_MODEL = "databricks-glm-5-2"
 
-
-class _FakeRoutingClient:
-    """Returns a canned verdict and counts calls."""
-
-    def __init__(self, result: RoutingResult | None, *, error: Exception | None = None) -> None:
-        self._result = result
-        self._error = error
-        self.last_error: str | None = None
-        self.calls: list[str] = []
-        self.offered: list[dict[str, list[str]]] = []
-
-    async def route(
-        self,
-        message: str,
-        available_models: dict[str, list[str]],
-    ) -> RoutingResult | None:
-        self.calls.append(message)
-        self.offered.append(dict(available_models))
-        if self._error is not None:
-            raise self._error
-        return self._result
-
-
-@dataclass
-class _FakeCaps:
-    routing_client: Any = None  # type: ignore[explicit-any]
-    routing_settings: RoutingSettings = field(default_factory=RoutingSettings)
-
-
-@pytest.fixture(autouse=True)
-def _clear_decision_cache() -> Any:
-    clear_cache()
-    yield
-    clear_cache()
-
-
-def _echo_runner_client() -> httpx.AsyncClient:
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(202, json={"queued": True})
-
-    return httpx.AsyncClient(
-        base_url="http://runner.test",
-        transport=httpx.MockTransport(_handler),
-    )
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("clear_routing_cache")]
 
 
 async def _parent_and_child(
@@ -126,8 +85,8 @@ async def test_router_overrides_llm_supplied_child_model(
         agent_name="routing-precedence",
         child_model_override=LLM_PICKED_MODEL,
     )
-    caps = _FakeCaps(
-        routing_client=_FakeRoutingClient(
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
             RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
         )
     )
@@ -136,7 +95,7 @@ async def test_router_overrides_llm_supplied_child_model(
         data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
     )
     with patch("omnigent.runtime._globals._caps", new=caps):
-        async with _echo_runner_client() as runner_client:
+        async with echo_runner_client() as runner_client:
             await orchestration_module._forward_event_to_runner(
                 child.id,
                 child,
@@ -176,8 +135,8 @@ async def test_routed_model_publishes_session_model_event(
         agent_name="routing-sse",
         child_model_override=LLM_PICKED_MODEL,
     )
-    caps = _FakeCaps(
-        routing_client=_FakeRoutingClient(
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
             RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
         )
     )
@@ -194,7 +153,7 @@ async def test_routed_model_publishes_session_model_event(
             side_effect=lambda sid, payload: published.append((sid, payload)),
         ),
     ):
-        async with _echo_runner_client() as runner_client:
+        async with echo_runner_client() as runner_client:
             await orchestration_module._forward_event_to_runner(
                 child.id,
                 child,
@@ -222,8 +181,8 @@ async def test_native_subagent_relay_persists_decision_and_joins_child_row(
     parent, child, conv_store = await _parent_and_child(
         client, db_uri, agent_name="routing-native-subagent"
     )
-    caps = _FakeCaps(
-        routing_client=_FakeRoutingClient(
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
             RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
         )
     )
@@ -279,8 +238,8 @@ async def test_dead_router_honours_subagent_fail_mode(
     )
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["id"]
-    caps = _FakeCaps(
-        routing_client=_FakeRoutingClient(None, error=RuntimeError("router down")),
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(None, error=RuntimeError("router down")),
         routing_settings=RoutingSettings(subagent_fail_mode=fail_mode),  # type: ignore[arg-type]
     )
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -294,38 +253,6 @@ async def test_dead_router_honours_subagent_fail_mode(
     # Both fail modes still leave a decision item behind.
     conv_store = SqlAlchemyConversationStore(db_uri)
     assert len(_routing_decisions(conv_store, session_id)) == 1
-
-
-# ── 4. Decision cache ──────────────────────────────────────────────
-
-
-async def test_identical_spawns_hit_the_router_once(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    agent = await create_test_agent(client, name="routing-cache")
-    resp = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
-    )
-    assert resp.status_code == 201, resp.text
-    session_id = resp.json()["id"]
-    routing_client = _FakeRoutingClient(
-        RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
-    )
-    payload = {
-        "harness": "claude-native",
-        "task_name": "code-reviewer",
-        "prompt": "review the auth module",
-        "parent_model": LLM_PICKED_MODEL,
-    }
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
-        first = await client.post(f"/v1/sessions/{session_id}/hooks/route-subagent", json=payload)
-        second = await client.post(f"/v1/sessions/{session_id}/hooks/route-subagent", json=payload)
-
-    assert first.status_code == 200 and second.status_code == 200
-    assert first.json()["decision_id"] == second.json()["decision_id"]
-    assert len(routing_client.calls) == 1
 
 
 # ── 5. Per-session subagent-routing gate ───────────────────────────
@@ -381,10 +308,10 @@ async def test_subagent_gate_follows_the_session_setting(
         cost_control=cost_control,
         subagent_routing=subagent_routing,
     )
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -413,10 +340,10 @@ async def test_child_inherits_the_parents_routing_state(
     _parent, child, conv_store = await _parent_and_child(
         client, db_uri, agent_name="routing-gate-child-inherit"
     )
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         resp = await client.post(
             f"/v1/sessions/{child.id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -428,7 +355,7 @@ async def test_child_inherits_the_parents_routing_state(
     # The child's own "off" wins over the parent's routed state.
     conv_store.update_conversation(child.id, subagent_routing_override="off")
     clear_cache(child.id)
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         second = await client.post(
             f"/v1/sessions/{child.id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -476,10 +403,10 @@ async def test_toggling_the_setting_on_mid_session_routes_the_next_spawn(
     db_uri: str,
 ) -> None:
     session_id = await _session_with_routing_flags(client, agent_name="routing-gate-midsession")
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         before = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -520,8 +447,8 @@ async def test_pinned_session_is_offered_only_its_own_family(
         agent_name=f"routing-family-{harness}",
         subagent_routing="on",
     )
-    routing_client = _FakeRoutingClient(RoutingResult(model=picked, rationale="deep reasoning"))
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    routing_client = FakeRoutingClient(RoutingResult(model=picked, rationale="deep reasoning"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json={**SPAWN_PAYLOAD, "harness": harness},
@@ -551,7 +478,7 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
         agent_name="routing-codex-glm",
         subagent_routing="on",
     )
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=GLM_MODEL, rationale="delegate arm", harness="codex")
     )
     live_catalog = {"self": [GPT_MODEL, GLM_MODEL]}
@@ -563,7 +490,7 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
         return live_catalog
 
     with (
-        patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)),
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
         patch.object(sessions_facade, "_get_runner_client", _fake_runner_client),
         patch.object(smart_routing_module, "fetch_runner_models", _fake_fetch),
     ):
@@ -605,10 +532,10 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
         agent_id=agent["id"],
     )
 
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -648,10 +575,10 @@ async def test_unlabelled_auto_sentinel_still_allows_cross_harness_picks(
     assert conv.harness_override == "auto"
     assert AUTO_HARNESS_LABEL_KEY not in (conv.labels or {})
 
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -733,13 +660,13 @@ async def test_child_of_a_pinned_parent_is_routed_in_the_parents_family(
     assert child.harness_override != "auto"
     assert AUTO_HARNESS_LABEL_KEY not in child.labels
 
-    routing_client = _FakeRoutingClient(RoutingResult(model=picked, rationale="in-family pick"))
+    routing_client = FakeRoutingClient(RoutingResult(model=picked, rationale="in-family pick"))
     body = SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": "audit routing"}]},
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
-        async with _echo_runner_client() as runner_client:
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
             await orchestration_module._forward_event_to_runner(
                 child.id,
                 child,
@@ -792,13 +719,13 @@ async def test_child_of_an_auto_parent_keeps_cross_harness_candidates(
     assert child_conv.harness_override == "auto"
     assert child_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
 
-    routing_client = _FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="big task"))
+    routing_client = FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="big task"))
     body = SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": "rewrite the router"}]},
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeCaps(routing_client=routing_client)):
-        async with _echo_runner_client() as runner_client:
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
             await orchestration_module._forward_event_to_runner(
                 child_conv.id,
                 child_conv,
@@ -849,79 +776,37 @@ async def _snapshot_warning_codes(client: httpx.AsyncClient, session_id: str) ->
     return [w["code"] for w in snapshot.json()["warnings"]]
 
 
-async def test_session_warning_event_lands_on_the_snapshot(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    agent = await create_test_agent(client, name="routing-warning")
-    resp = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "subagent_routing_override": "on"},
-    )
-    assert resp.status_code == 201, resp.text
-    session_id = resp.json()["id"]
-
-    posted = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_session_warning",
-            "data": {
-                "warnings": [
-                    {
-                        "code": "subagent_routing_unenforced",
-                        "harness": "codex-native",
-                        "reason": "SessionStart canary did not fire",
-                    }
-                ]
-            },
-        },
-    )
-    assert posted.status_code in (200, 201, 202), posted.text
-
-    snapshot = await client.get(f"/v1/sessions/{session_id}")
-    assert snapshot.status_code == 200
-    warnings = snapshot.json()["warnings"]
-    assert warnings == [
-        {
-            "code": "subagent_routing_unenforced",
-            "harness": "codex-native",
-            "reason": "SessionStart canary did not fire",
-        }
-    ]
-
-
-async def test_routing_unenforced_warning_is_hidden_when_routing_is_off(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """Routing off ⇒ no banner, even though the canary never fired.
-
-    Hooks and the router advertisement are installed on every native
-    session (so the setting can be toggled mid-session), so the runner-side
-    watcher posts this warning regardless. A session that never asked for
-    subagent routing must not be told routing is unenforced.
-    """
-    session_id = await _session_with_routing_flags(client, agent_name="routing-warn-off")
-    await _post_routing_unenforced_warning(client, session_id)
-    assert await _snapshot_warning_codes(client, session_id) == []
+_UNENFORCED_WARNING = {
+    "code": "subagent_routing_unenforced",
+    "harness": "codex-native",
+    "reason": "SessionStart canary did not fire",
+}
 
 
 @pytest.mark.parametrize(
-    ("case", "cost_control", "subagent_routing"),
+    ("case", "cost_control", "subagent_routing", "expected"),
     [
-        ("explicit-on", None, "on"),
-        ("inherit-on", "on", None),
-        ("explicit-on-beats-cost-off", "off", "on"),
+        # Routing on, explicitly or inherited from the cost-control switch ⇒
+        # the banner is published with every field the watcher sent intact.
+        ("explicit-on", None, "on", [_UNENFORCED_WARNING]),
+        ("inherit-on", "on", None, [_UNENFORCED_WARNING]),
+        ("explicit-on-beats-cost-off", "off", "on", [_UNENFORCED_WARNING]),
+        # Routing off ⇒ no banner, even though the canary never fired. Hooks
+        # and the router advertisement are installed on every native session
+        # (so the setting can be toggled mid-session), so the runner-side
+        # watcher posts this warning regardless. A session that never asked
+        # for subagent routing must not be told routing is unenforced.
+        ("routing-off", None, None, []),
     ],
 )
-async def test_routing_unenforced_warning_shows_when_routing_is_on(
+async def test_routing_unenforced_warning_visibility_follows_the_setting(
     client: httpx.AsyncClient,
     db_uri: str,
     case: str,
     cost_control: str | None,
     subagent_routing: str | None,
+    expected: list[dict[str, str]],
 ) -> None:
-    """Routing on (explicitly or inherited) ⇒ the banner is published."""
     session_id = await _session_with_routing_flags(
         client,
         agent_name=f"routing-warn-{case}",
@@ -929,7 +814,9 @@ async def test_routing_unenforced_warning_shows_when_routing_is_on(
         subagent_routing=subagent_routing,
     )
     await _post_routing_unenforced_warning(client, session_id)
-    assert await _snapshot_warning_codes(client, session_id) == ["subagent_routing_unenforced"]
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["warnings"] == expected
 
 
 async def test_routing_unenforced_warning_follows_a_mid_session_toggle(
@@ -1032,8 +919,8 @@ async def _claude_native_session(
 
 
 async def _route_one_turn(conv: Any, conv_store: SqlAlchemyConversationStore) -> Any:
-    caps = _FakeCaps(
-        routing_client=_FakeRoutingClient(
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
             RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
         )
     )
@@ -1042,7 +929,7 @@ async def _route_one_turn(conv: Any, conv_store: SqlAlchemyConversationStore) ->
         data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
     )
     with patch("omnigent.runtime._globals._caps", new=caps):
-        async with _echo_runner_client() as runner_client:
+        async with echo_runner_client() as runner_client:
             await orchestration_module._forward_event_to_runner(
                 conv.id,
                 conv,
@@ -1130,7 +1017,7 @@ async def test_turn_candidates_come_from_the_panes_own_vocabulary(
         {"id": "sonnet_5", "model": ROUTED_MODEL},
         {"id": "haiku"},
     ]
-    routing_client = _FakeRoutingClient(
+    routing_client = FakeRoutingClient(
         RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
     )
     body = SessionEventInput(
@@ -1140,9 +1027,9 @@ async def test_turn_candidates_come_from_the_panes_own_vocabulary(
     try:
         with patch(
             "omnigent.runtime._globals._caps",
-            new=_FakeCaps(routing_client=routing_client),
+            new=FakeCaps(routing_client=routing_client),
         ):
-            async with _echo_runner_client() as runner_client:
+            async with echo_runner_client() as runner_client:
                 await orchestration_module._forward_event_to_runner(
                     conv.id,
                     conv,
