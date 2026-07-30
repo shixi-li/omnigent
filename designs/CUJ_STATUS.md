@@ -30,8 +30,8 @@ Last updated: 2026-07-29 late night — child constraint, chip pairing, rename, 
 | IR selectable in Configure Codex | ✅ user | |
 | Router decision + chip | ✅ evidence | headless battery: "hi"→luna, complex refactor→sol, both exact servable matches |
 | **Process runs the routed model** | ✅ evidence | live re-run post push+mirror+hardening (51801530): model_override holds databricks-gpt-5-6-luna across the turn and the session config.toml reads model = databricks-gpt-5-6-luna |
-| Codex TUI `/model` reflects the live model | ❌ | shows thread default (`databricks-gpt-5-5`), not the routed per-turn model. Design in flight (`live-model-state`) |
-| Post-launch model push (re-route / lost launch race) | ❌ by design gap | no omnigent→codex push exists; claude-style injection equivalent needed. Design in flight (`live-model-state`) |
+| Codex TUI reflects the live model | ✅ evidence | thread-level push (thread/settings/update) live-updates the TUI status bar (probed); /model picker highlight is upstream codex behavior — noted in designs/LIVE_MODEL_STATE.md |
+| Post-launch model push (re-route / lost launch race) | ✅ evidence | first-turn push + config mirror + forwarder hardening (51801530); live re-run held luna in model_override and config.toml |
 
 ## 3. Auto harness CUJ
 
@@ -61,8 +61,8 @@ Last updated: 2026-07-29 late night — child constraint, chip pairing, rename, 
 |---|---|---|
 | Decision chips show raw→applied divergence | ✅ user | this is how two real bugs were caught — keep it |
 | Chip below the user message | 🟡 | render rule (8fa280ea) + claude fix: the injected /model echo broke pairing on claude only, now skipped (25b75c62) — awaiting user visual confirm on a fresh claude session |
-| Per-subagent routed model in sub-agents panel | 🟡 ui-only | displays child model_override, which for claude ≠ actual spawned model until apply fix lands |
-| Session warning banner renders when server publishes | ⬜ | component shipped; never seen live (see canary ❌) |
+| Per-subagent routed model in sub-agents panel | 🟡 | apply fixes landed on both harnesses, so the displayed override now matches reality on fresh sessions; not re-eyeballed since |
+| Session warning banner renders when server publishes | ✅ user | Bryan screenshotted the live banner during the shadowing incident; over-warning on routing-off sessions fixed same day |
 | Routing analytics (OSS telemetry pipeline) | 🟡 | reworked per PR review (c7f78f26): RoutingDecisionEvent/RoutingSettingChangedEvent with family/tier-only model labels; OTel helper deleted; not yet observed against a live ingestion endpoint |
 | Switch-off / fork telemetry triggers | ⬜ | browser-side spans only (routingTelemetry.ts); server-side toggle event ships in RoutingSettingChangedEvent |
 
@@ -86,7 +86,8 @@ Last updated: 2026-07-29 late night — child constraint, chip pairing, rename, 
 
 ## The one-line summary
 
-Decision layer solid everywhere; apply layer verified real only on codex
-main sessions; claude apply (main + subagents) and codex subagent
-enforcement are the open holes, all with fixes in flight. UI currently
-reports intent, not reality — the `live-model-state` workstream closes that.
+Decision and apply layers evidence-verified on both harnesses, main and
+subagents, with mid-session toggles live. Open: user visual confirms
+(chip placement, fresh-session panel), the top-level Smart Routing
+harness (in flight), fork routing policy, and the external GLM/codex
+model-list gap.
