@@ -92,6 +92,18 @@ function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T): T 
 export const AUTO_HARNESS_ID = "auto";
 
 /**
+ * Picker sentinel for Smart Routing as a top-level harness — the landing
+ * dropdown's "Harnesses" row, with no bundle agent behind it. Client-side only:
+ * the create request sends {@link AUTO_HARNESS_ID} as ``harness_override`` with
+ * a native wrapper ``agent_id`` as a placeholder, and the server rebinds the
+ * session to whichever native wrapper (Claude Code / Codex) the router picks
+ * from the first message. Kept distinct from {@link AUTO_HARNESS_ID} so the
+ * bundle-agent auto path (a brain-harness override on Polly / Debby) and this
+ * one can't be confused in picker state.
+ */
+export const AUTO_NATIVE_HARNESS_ID = "auto-native";
+
+/**
  * User-facing name for the per-harness Model option where the router picks the
  * model per turn (the ``__smart__`` sentinel). One constant so the composer
  * label, the Model dropdown and the gear tooltip can't drift.

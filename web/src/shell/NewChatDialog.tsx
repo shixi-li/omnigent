@@ -115,6 +115,7 @@ import {
   AUTO_HARNESS_DESCRIPTION,
   AUTO_HARNESS_ID,
   AUTO_HARNESS_LABEL,
+  AUTO_NATIVE_HARNESS_ID,
   INTELLIGENT_ROUTING_LABEL,
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
@@ -846,6 +847,9 @@ export function AgentHarnessPicker({
   triggerClassName,
   triggerLabelClassName,
   triggerTooltip,
+  autoHarnessAvailable = false,
+  autoHarnessActive = false,
+  onSelectAutoHarness,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -887,6 +891,15 @@ export function AgentHarnessPicker({
   /** Hover text explaining the current pick, when the label alone doesn't say
    *  what runs (e.g. "Auto"). Omitted → no tooltip, as before. */
   triggerTooltip?: string;
+  /** Whether the top-level Smart Routing row is offered (routing enabled and
+   *  both native CLIs ready). Defaults off, so an embedder that doesn't wire
+   *  routing never shows it. */
+  autoHarnessAvailable?: boolean;
+  /** Whether Smart Routing is the current pick. It rides a placeholder agent,
+   *  so this also suppresses that agent's row highlight — otherwise two rows
+   *  would look selected at once. */
+  autoHarnessActive?: boolean;
+  onSelectAutoHarness?: () => void;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -940,7 +953,9 @@ export function AgentHarnessPicker({
   // Each entry is a plain selectable row — selecting commits the pick and
   // closes the menu. Run-config knobs moved to the gear-icon config modal.
   const renderEntry = (agent: AvailableAgent): ReactNode => {
-    const active = agent.id === effectiveAgentId;
+    // Smart Routing binds a placeholder agent for the create call, so its own
+    // row owns the active state while it's picked.
+    const active = !autoHarnessActive && agent.id === effectiveAgentId;
     return (
       <DropdownMenuItem
         key={agent.id}
@@ -1140,9 +1155,31 @@ export function AgentHarnessPicker({
             {/* Harnesses group first — the native terminal CLIs (Claude Code is
             the default), so the most-used picks lead. Ready-to-use harnesses
             list inline; "needs setup" ones fold into a "More" group. */}
-            {(readyHarnessEntries.length > 0 || moreHarnessEntries.length > 0) && (
+            {(readyHarnessEntries.length > 0 ||
+              moreHarnessEntries.length > 0 ||
+              autoHarnessAvailable) && (
               <>
                 <PickerSectionHeader>Harnesses</PickerSectionHeader>
+                {/* Smart Routing leads the group: it's a harness pick like the
+                others, except the router chooses which CLI runs per task. */}
+                {autoHarnessAvailable && (
+                  <DropdownMenuItem
+                    data-testid="new-chat-landing-harness-smart-routing"
+                    data-active={autoHarnessActive ? "true" : undefined}
+                    onSelect={() => {
+                      onSelectAutoHarness?.();
+                      setOpen(false);
+                    }}
+                    className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+                  >
+                    <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+                      <span className="truncate">{AUTO_HARNESS_LABEL}</span>
+                      <span className="truncate text-[11px] text-muted-foreground/70">
+                        {AUTO_HARNESS_DESCRIPTION}
+                      </span>
+                    </div>
+                  </DropdownMenuItem>
+                )}
                 {readyHarnessEntries.map(renderEntry)}
                 {moreHarnessEntries.length > 0 &&
                   (isMobile ? (
@@ -1330,7 +1367,11 @@ function HarnessConfigModal({
   // Fully-auto: the router picks the harness AND the model, so the only knob
   // left is what the picked harness may do without asking. Everything else is
   // harness-specific and can't be decided before the pick.
-  const autoRouting = brainDefault != null && draftHarness === AUTO_HARNESS_ID;
+  // Both auto flavors land here: the brain-harness override on a bundle agent,
+  // and top-level Smart Routing (which rides a placeholder native wrapper, so
+  // it has no brainDefault of its own).
+  const autoNative = draftHarness === AUTO_NATIVE_HARNESS_ID;
+  const autoRouting = autoNative || (brainDefault != null && draftHarness === AUTO_HARNESS_ID);
   const configTitleName = autoRouting ? AUTO_HARNESS_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const onModelChange = (value: string) => {
@@ -1353,6 +1394,14 @@ function HarnessConfigModal({
   };
 
   const save = () => {
+    // Top-level Smart Routing has nothing to commit — the router owns the
+    // harness and model, and Permissions is locked to Default. Committing the
+    // placeholder wrapper's model/mode drafts would leak its knobs into the
+    // create call.
+    if (autoNative) {
+      onOpenChange(false);
+      return;
+    }
     if (hasPermission) {
       // Order matters: commit model first (its setter clears routing when a
       // model is set), then routing (its setter clears the model when "on") —
@@ -1383,8 +1432,20 @@ function HarnessConfigModal({
     // this harness starts on it again.
     if (smartRoutingEligible) {
       setCostControlMode(draftRouting);
+      if (draftRouting === "on") {
+        // Routing owns the model and its effort, so clear both — live state AND
+        // the harness's remembered pick. A harness whose modal has no model
+        // picker (Codex) never touches them in its own branch above, so a model
+        // remembered from an earlier build would otherwise survive and ride
+        // along with routing, which the server reads as an already-pinned model.
+        setPickedModel("");
+        setPickedEffort("");
+      }
       if (entryHarness)
-        writeHarnessOption(entryHarness, { routing: draftRouting === "on" ? "on" : "off" });
+        writeHarnessOption(entryHarness, {
+          routing: draftRouting === "on" ? "on" : "off",
+          ...(draftRouting === "on" ? { model: "", effort: "" } : {}),
+        });
     }
     onOpenChange(false);
   };
@@ -1510,7 +1571,7 @@ function HarnessConfigModal({
             </>
           )}
 
-          {hasApproval && (
+          {!autoRouting && hasApproval && (
             <>
               {/* Codex resolves its model catalog inside the running CLI, so the
               pre-launch Model row offers only the two choices the create call
@@ -1581,7 +1642,7 @@ function HarnessConfigModal({
             </>
           )}
 
-          {hasCursor && (
+          {!autoRouting && hasCursor && (
             <ConfigRow label="Mode" description="How Cursor runs commands">
               <DescribedSelect
                 value={draftCursor}
@@ -2246,6 +2307,10 @@ export function NewChatLandingScreen() {
   const smartRoutingEligible =
     smartRoutingEnabled &&
     (selectedNativeHarness === "claude-native" || selectedNativeHarness === "codex-native");
+  // Top-level Smart Routing (the "Harnesses" row, no bundle agent): the router
+  // picks native Claude Code or Codex per task. It rides a placeholder wrapper
+  // agent for the create call, so the pick lives in pickedHarness alone.
+  const smartRoutingHarnessSelected = pickedHarness === AUTO_NATIVE_HARNESS_ID;
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Intelligent
@@ -2267,9 +2332,10 @@ export function NewChatLandingScreen() {
   // Fully-auto: the router owns harness + model, so the tooltip mirrors the
   // modal and reports only the permission value.
   const autoRoutingSelected =
-    pickedHarness === AUTO_HARNESS_ID &&
-    selectedAgent?.harness != null &&
-    selectedAgent.harness in brainHarnessLabels;
+    smartRoutingHarnessSelected ||
+    (pickedHarness === AUTO_HARNESS_ID &&
+      selectedAgent?.harness != null &&
+      selectedAgent.harness in brainHarnessLabels);
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (autoRoutingSelected) {
       // Locked to Default in the modal, so report the constant — never a mode
@@ -2379,6 +2445,12 @@ export function NewChatLandingScreen() {
     // the current list resolves to the default for the same reason.
     const resolve = (modes: readonly { value: string }[], dflt: string) =>
       stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
+    // A remembered "route every turn" outranks a remembered concrete model: the
+    // two are mutually exclusive, and sending both makes the server treat the
+    // session as model-pinned and never route. Read from storage (not state) so
+    // this holds on every run of this effect — including the re-run when the
+    // model catalog resolves, which lands after the routing seed below.
+    const storedRoutingOn = stored.routing === "on";
     if (supportsPermissionMode) {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
@@ -2388,17 +2460,28 @@ export function NewChatLandingScreen() {
       // nothing stored (or a retired id) it resolves to "" — unselected, so the
       // create omits the override and Claude Code uses its own configured model.
       setPickedModel(
-        stored.model != null && claudeModelOptions.some((m) => m.id === stored.model)
+        !storedRoutingOn &&
+          stored.model != null &&
+          claudeModelOptions.some((m) => m.id === stored.model)
           ? stored.model
           : "",
       );
       setPickedEffort(
-        stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+        !storedRoutingOn &&
+          stored.effort != null &&
+          CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
           ? stored.effort
           : "",
       );
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
+      // Codex has no model row of its own, so its branch must still drop any
+      // model/effort left in the shared state (e.g. seeded for Claude Code
+      // before the harness switch) when routing is what's remembered.
+      if (storedRoutingOn) {
+        setPickedModel("");
+        setPickedEffort("");
+      }
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     }
@@ -2417,7 +2500,7 @@ export function NewChatLandingScreen() {
   // including one between two agents on the same harness. Fully-auto owns the
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
-    if (!selectedNativeHarness || pickedHarness === AUTO_HARNESS_ID) return;
+    if (!selectedNativeHarness || autoRoutingSelected) return;
     const storedRouting = readHarnessOptions(selectedNativeHarness).routing;
     if (storedRouting === undefined) return;
     setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
@@ -2425,7 +2508,7 @@ export function NewChatLandingScreen() {
     selectedNativeHarness,
     smartRoutingEligible,
     effectiveAgentId,
-    pickedHarness,
+    autoRoutingSelected,
     setCostControlMode,
   ]);
   // The Auto Harness pins permissions to Default (no override sent), so entering
@@ -2433,7 +2516,7 @@ export function NewChatLandingScreen() {
   // for the sentinel, and a value left over from a previously selected native
   // harness must not ride along into the router's pick.
   useEffect(() => {
-    if (pickedHarness !== AUTO_HARNESS_ID) return;
+    if (pickedHarness !== AUTO_HARNESS_ID && pickedHarness !== AUTO_NATIVE_HARNESS_ID) return;
     setPermissionMode(CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE);
   }, [pickedHarness]);
   // Native-terminal agents interpret slash commands inside their own CLI
@@ -2450,6 +2533,24 @@ export function NewChatLandingScreen() {
     selectedAgent?.harness,
     harnessWarningHost,
   );
+  // Smart Routing routes between native Claude Code and Codex, so both wrapper
+  // agents must be registered and both CLIs ready on the target host — a router
+  // with one arm is just that arm. The Claude wrapper is the placeholder the
+  // create binds; the server rebinds to whichever the router picks.
+  const smartRoutingWrappers = useMemo(() => {
+    const byHarness = (harness: string) =>
+      harnessEntries.find((a) => nativeCodingAgentForAvailableAgent(a)?.harness === harness);
+    return {
+      claude: byHarness("claude-native"),
+      codex: byHarness("codex-native"),
+    };
+  }, [harnessEntries]);
+  const smartRoutingHarnessAvailable =
+    smartRoutingEnabled &&
+    smartRoutingWrappers.claude != null &&
+    smartRoutingWrappers.codex != null &&
+    !harnessUnconfiguredOnHost("claude-native", harnessWarningHost) &&
+    !harnessUnconfiguredOnHost("codex-native", harnessWarningHost);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -2842,11 +2943,30 @@ export function NewChatLandingScreen() {
     (harness: string | null, agentId?: string) => {
       setPickedHarness(harness);
       writeLastHarness(agentId ?? effectiveAgentId, harness);
-      // Light up routing when the Auto Harness is picked; off otherwise.
-      _setCostControlMode(harness === AUTO_HARNESS_ID ? "on" : null);
+      // Light up routing when either Auto Harness flavor is picked (both route
+      // harness + model); off otherwise.
+      _setCostControlMode(
+        harness === AUTO_HARNESS_ID || harness === AUTO_NATIVE_HARNESS_ID ? "on" : null,
+      );
     },
     [effectiveAgentId],
   );
+
+  // Pick top-level Smart Routing. The create call needs a concrete agent_id, so
+  // bind the Claude wrapper as a placeholder — the server routes from the first
+  // message and rebinds to the wrapper it picked, which is why the picker
+  // suppresses that row's highlight while this sentinel is active.
+  // Not persisted as the placeholder's last harness: the sentinel is only valid
+  // while both CLIs are ready, and a restored one would show a "Smart Routing"
+  // chip with no matching row to switch away from.
+  const handleSelectSmartRoutingHarness = () => {
+    const placeholder = smartRoutingWrappers.claude;
+    if (placeholder == null) return;
+    setPickedAgentId(placeholder.id);
+    writeLastAgentId(placeholder.id);
+    setPickedHarness(AUTO_NATIVE_HARNESS_ID);
+    _setCostControlMode("on");
+  };
 
   // Select an agent/harness from the picker. Switching agents seeds the
   // harness override from the user's last pick for that agent (so a
@@ -2854,10 +2974,11 @@ export function NewChatLandingScreen() {
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
     if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
-    // Re-picking the agent that is currently on the Auto Harness drops back to
+    // Re-picking the agent that is currently on an Auto Harness drops back to
     // its own harness — the Auto Harness modal shows only Permissions, so the
     // picker is the way out of fully-auto.
-    else if (pickedHarness === AUTO_HARNESS_ID) handleSetPickedHarness(null, agent.id);
+    else if (pickedHarness === AUTO_HARNESS_ID || pickedHarness === AUTO_NATIVE_HARNESS_ID)
+      handleSetPickedHarness(null, agent.id);
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -2938,6 +3059,22 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
+      // Intelligent Routing — server-side. The fully-auto harness always routes
+      // (harness + model), so send "on" to keep the persisted state consistent
+      // with the lit routing icon. Otherwise only send it when routing is
+      // eligible for the effective harness, so a stale "on" can't ride along
+      // invisibly with no control to clear it.
+      const costControlOverride =
+        pickedHarness === AUTO_HARNESS_ID || smartRoutingHarnessSelected
+          ? "on"
+          : smartRoutingEligible
+            ? (costControlMode ?? undefined)
+            : undefined;
+      // Belt and braces: the server routes a turn only while the session has no
+      // pinned model ("on" plus no `model_override` is what makes it route), so
+      // sending both would silently disable routing for the whole session. Never
+      // pin a model or an effort alongside routing, whatever the UI state says.
+      const routingOwnsModel = costControlOverride === "on";
 
       let data: { id: string };
 
@@ -3002,15 +3139,21 @@ export function NewChatLandingScreen() {
             // label (only when the toggle is armed for a codex-native agent)
             // so the runner launches with --dangerously-bypass-approvals-and-
             // sandbox and the choice survives reload.
-            labels:
-              agentSupportsApprovalMode && bypassSandbox
+            // Smart Routing sends none of these: the bound agent is only a
+            // placeholder, so the placeholder's wrapper labels, launch args and
+            // model would all describe a CLI the router may not pick. The
+            // server stamps the routed wrapper's labels once it has rebound.
+            labels: smartRoutingHarnessSelected
+              ? undefined
+              : agentSupportsApprovalMode && bypassSandbox
                 ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
                 : nativeLabels,
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
-            terminal_launch_args:
-              agentSupportsPermissionMode &&
-              permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+            terminal_launch_args: smartRoutingHarnessSelected
+              ? undefined
+              : agentSupportsPermissionMode &&
+                  permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
                 ? ["--permission-mode", permissionMode]
                 : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
@@ -3022,22 +3165,31 @@ export function NewChatLandingScreen() {
             // only its agents carry the choice; the runner reads them as
             // `--model` / `--effort` at terminal launch. An unselected ("")
             // knob is omitted so Claude Code keeps its own configured model.
-            model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
+            model_override:
+              !smartRoutingHarnessSelected &&
+              !routingOwnsModel &&
+              agentSupportsPermissionMode &&
+              pickedModel
+                ? pickedModel
+                : undefined,
             reasoning_effort:
-              agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Intelligent Routing — server-side. The fully-auto harness always
-            // routes (harness + model), so send "on" to keep the persisted state
-            // consistent with the lit routing icon. Otherwise only send it when
-            // routing is eligible for the effective harness, so a stale "on"
-            // can't ride along invisibly with no control to clear it. "on" plus
-            // no `model_override` is what makes the server route each turn.
-            cost_control_mode_override:
-              pickedHarness === AUTO_HARNESS_ID
-                ? "on"
-                : smartRoutingEligible
-                  ? (costControlMode ?? undefined)
-                  : undefined,
-            harness_override: pickedHarness ?? undefined,
+              !smartRoutingHarnessSelected &&
+              !routingOwnsModel &&
+              agentSupportsPermissionMode &&
+              pickedEffort
+                ? pickedEffort
+                : undefined,
+            cost_control_mode_override: costControlOverride,
+            // Top-level Smart Routing sends the same "auto" sentinel the bundle
+            // path does; the server tells them apart by the bound agent being a
+            // native wrapper, and routes at create time (the terminal launches
+            // with the row, so there is no first message to wait for). The
+            // message text rides along for routing only — the client still
+            // delivers the real message after navigation.
+            harness_override: smartRoutingHarnessSelected
+              ? AUTO_HARNESS_ID
+              : (pickedHarness ?? undefined),
+            smart_routing_message: smartRoutingHarnessSelected ? message : undefined,
           }),
         });
         if (!res.ok) {
@@ -3448,6 +3600,9 @@ export function NewChatLandingScreen() {
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}
                   sandboxSelected={sandboxSelected}
+                  autoHarnessAvailable={smartRoutingHarnessAvailable}
+                  autoHarnessActive={smartRoutingHarnessSelected}
+                  onSelectAutoHarness={handleSelectSmartRoutingHarness}
                 />
                 {/* Gear — opens the selected agent's run-config modal. Hidden
                   when the selected agent has no knobs to configure. Hovering
