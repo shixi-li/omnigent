@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from omnigent.entities.conversation import RoutingDecisionData
 
 from omnigent._platform import stable_user_id
-from omnigent.runtime.telemetry import ROUTING_EVENT_DECISION, emit_routing_event
+from omnigent.telemetry import record_routing_decision
 
 _logger = logging.getLogger(__name__)
 
@@ -579,18 +579,20 @@ async def resolve_subagent_route(
     decision = await _decide(
         session_id, req, caps, settings, available_models, catalog, cross_harness, clock
     )
-    emit_routing_event(
-        ROUTING_EVENT_DECISION,
-        {
-            "routing.scope": _SCOPE,
-            "routing.session_id": session_id,
-            "routing.harness": decision.harness or req.harness,
-            "routing.model": decision.model,
-            "routing.raw_model": decision.raw_model,
-            "routing.action": decision.action,
-            "routing.decision_id": decision.decision_id,
-            "routing.task_name": req.task_name or None,
-        },
+    # ``task_name`` is deliberately not reported: it is free-form text the
+    # calling agent wrote, so it stays in the transcript only.
+    record_routing_decision(
+        session_id,
+        scope=_SCOPE,
+        harness=decision.harness or req.harness,
+        action=decision.action,
+        applied=decision.action in ("rewrite", "redirect"),
+        model=decision.model,
+        raw_model=decision.raw_model,
+        # The spawn hook does not report the model the calling agent asked
+        # for, so an override cannot be detected on this path.
+        overrode_agent_model=False,
+        decision_id=decision.decision_id,
     )
     if persist is not None:
         try:

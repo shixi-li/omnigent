@@ -339,21 +339,26 @@ Owns: `omnigent/inner/codex_executor.py`, `omnigent/inner/codex_native_app_serve
 **P5 — Decision data model + child-sessions API + telemetry** *(reqs 3+4 backbone)*
 Owns: `omnigent/entities/conversation.py` (`RoutingDecisionData` only), the
 `GET /v1/sessions/{id}/child_sessions` handler (routed-model field addition),
-a new `emit_routing_event` helper in `omnigent/runtime/telemetry.py`, matching
-tests.
+routing events in the `omnigent/telemetry` OSS usage-telemetry package,
+matching tests.
 - Extend `RoutingDecisionData` per §5.2 — additive, defaulted (current fields
   are exactly `model/applied/rationale/agent`; legacy rows must deserialize).
 - Add `routed_model` (+ `routing_decision_id`) to the child-sessions API
   payload so the sidebar can render per-subagent models — **this is the
   server half of G4; P6 must not need server edits.**
-- Telemetry: `telemetry.py` has span helpers but **no event API** (verified)
-  — add one `emit_routing_event(name, attrs)` helper (span-event or log-record
-  based, matching `tests/runtime/test_telemetry_logs.py` conventions) and
-  emit `omnigent.routing.decision` / `.enabled` / `.disabled_mid_session` /
-  `.fork_from_routed_session`.
+- Telemetry: product analytics go through the OSS usage-telemetry pipeline
+  (`omnigent/telemetry`), **not** `omnigent/runtime/telemetry.py` (which is the
+  OTel tracing module). Add `RoutingDecisionEvent` and
+  `RoutingSettingChangedEvent` to `omnigent/telemetry/events.py`, a
+  `routing_enabled` flag on `SessionCreatedEvent`, and the recorders in
+  `omnigent/telemetry/routing.py`. No free-form strings ship: the judge's
+  rationale, routed prompt and subagent task name stay in the transcript, and
+  model ids are reduced to allowlisted family/tier tokens by
+  `omnigent/telemetry/model_labels.py` because a servable id can be a
+  user-named workspace endpoint.
 - Tests: serialization round-trip incl. legacy rows; child-sessions payload;
-  event emission asserted via `InMemorySpanExporter`
-  (pattern: `tests/inner/test_tracing_genai_semconv.py`).
+  event recording + wire format asserted in `tests/test_telemetry_routing.py`
+  (pattern: `tests/test_telemetry.py`).
 
 **P6 — Web UI: per-subagent visibility + warning banner + toggle telemetry** *(reqs 3+4)*
 Owns: `web/src/` only — `StatusBlocks.tsx`, `Sidebar.tsx`,

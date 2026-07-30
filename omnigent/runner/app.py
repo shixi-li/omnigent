@@ -9789,7 +9789,6 @@ async def _ensure_session_subagent_router(
         ensure_session_router,
         router_dir_for_session,
     )
-    from omnigent.runtime.telemetry import ROUTING_EVENT_ENABLED, emit_routing_event
 
     if server_client is None or is_native_harness(harness):
         return
@@ -9801,13 +9800,12 @@ async def _ensure_session_subagent_router(
         )
     except OSError:
         _logger.warning(
-            "subagent router could not start for session=%s", session_id, exc_info=True
+            "subagent router could not start for session=%s harness=%s",
+            session_id,
+            harness,
+            exc_info=True,
         )
         return
-    emit_routing_event(
-        ROUTING_EVENT_ENABLED,
-        {"routing.session_id": session_id, "routing.harness": harness},
-    )
 
 
 def _build_spawn_env_from_spec(

@@ -432,13 +432,13 @@ def _start_subagent_router_for_native_session(
 
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory the hooks discover.
-    :param harness: Harness label for the enablement telemetry event.
+    :param harness: Harness the router is being installed for; logged on
+        failure.
     :param server_client: Runner→server client the relay forwards on.
     :returns: The advertisement directory to point hooks at, or ``None``
         when the endpoint could not start.
     """
     from omnigent.runner.subagent_routing import ensure_session_router
-    from omnigent.runtime.telemetry import ROUTING_EVENT_ENABLED, emit_routing_event
 
     if server_client is None:
         return None
@@ -450,13 +450,12 @@ def _start_subagent_router_for_native_session(
         )
     except OSError:
         _logger.warning(
-            "subagent router could not start for session=%s", session_id, exc_info=True
+            "subagent router could not start for session=%s harness=%s",
+            session_id,
+            harness,
+            exc_info=True,
         )
         return None
-    emit_routing_event(
-        ROUTING_EVENT_ENABLED,
-        {"routing.session_id": session_id, "routing.harness": harness},
-    )
     return bridge_dir
 
 

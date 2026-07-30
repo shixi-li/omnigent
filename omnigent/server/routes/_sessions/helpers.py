@@ -5465,8 +5465,10 @@ async def _emit_server_routing_decision(
     Called by the server-side routing path before the turn is forwarded
     to the runner.  The chip shows the judge's model pick at turn start
     — the same UX the runner-side advisor produced, but driven entirely
-    by the server. Also emits the decision telemetry event, so every
-    server-side routing decision is recorded in exactly one place.
+    by the server. Also records the decision in usage telemetry
+    (:mod:`omnigent.telemetry.routing`), so every server-side routing
+    decision is reported in exactly one place; parent-transcript mirrors
+    (``agent`` set) restate a decision and are not counted again.
 
     :param agent: Sub-agent name to include when mirroring a child
         session's routing decision into the parent's transcript.
@@ -5480,8 +5482,6 @@ async def _emit_server_routing_decision(
         row; ``None`` is never returned (kept for typing symmetry).
     """
     import uuid
-
-    from omnigent.runtime.telemetry import ROUTING_EVENT_DECISION, emit_routing_event
 
     rationale = verdict.get("rationale", "")
     applied = verdict.get("applied", True)
@@ -5499,19 +5499,24 @@ async def _emit_server_routing_decision(
     }
     if agent is not None:
         item_data["agent"] = agent
-    emit_routing_event(
-        ROUTING_EVENT_DECISION,
-        {
-            "routing.scope": scope,
-            "routing.session_id": session_id,
-            "routing.harness": harness,
-            "routing.model": model,
-            "routing.raw_model": item_data["raw_model"],
-            "routing.applied": bool(applied),
-            "routing.decision_id": resolved_decision_id,
-            "routing.attempted_override": attempted_override,
-        },
-    )
+    # A mirror copy into the parent's transcript (``agent`` set) restates a
+    # decision already recorded, so only the primary emission is counted.
+    if agent is None:
+        from omnigent.telemetry import record_routing_decision
+
+        record_routing_decision(
+            session_id,
+            scope=scope,
+            harness=harness,
+            # The server-side path has no allow/deny vocabulary: it either
+            # installed the router's pick or left the turn alone.
+            action="rewrite" if applied else "allow",
+            applied=bool(applied),
+            model=model,
+            raw_model=item_data["raw_model"],
+            overrode_agent_model=attempted_override is not None,
+            decision_id=resolved_decision_id,
+        )
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
