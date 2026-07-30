@@ -798,7 +798,14 @@ async def create_response(
         sse_body = sse_text_response(qr.text)
 
     async def _generate() -> AsyncIterator[str]:
-        yield sse_body
+        # Chunk with a small inter-event delay so mid-turn steering
+        # messages can arrive while the harness turn is still in-flight.
+        # Without this, a warm (shared) harness subprocess completes the
+        # response before steering reaches it.
+        for chunk in sse_body.split("\n\n"):
+            if chunk:
+                yield chunk + "\n\n"
+                await asyncio.sleep(0.02)
 
     return StreamingResponse(
         _generate(),
@@ -848,7 +855,10 @@ async def create_message(
         sse_body = anthropic_sse_text_response(qr.text)
 
     async def _generate() -> AsyncIterator[str]:
-        yield sse_body
+        for chunk in sse_body.split("\n\n"):
+            if chunk:
+                yield chunk + "\n\n"
+                await asyncio.sleep(0.02)
 
     return StreamingResponse(
         _generate(),
