@@ -3514,6 +3514,93 @@ async def _persist_session_event(
     return item_id
 
 
+def _native_turn_catalog(session_id: str, conv: Conversation) -> list[str] | None:
+    """
+    Return the models a native session's terminal can switch onto.
+
+    A claude-native pane switches by ``/model``, which takes its own picker
+    vocabulary and nothing else — while the gateway behind it serves far
+    more, including generations the pane cannot name. Routing a turn onto
+    one of those would be dropped by the executor, so the picker rows are
+    the candidate list for this session.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param conv: Conversation row, read for the wrapper label.
+    :returns: Model ids, or ``None`` when the session is not a native
+        terminal with a known vocabulary (the caller keeps its own
+        candidate resolution).
+    """
+    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+        return None
+    options = _model_options_cache.get(session_id)
+    if not options:
+        return None
+    models = [
+        option["model"]
+        for option in options
+        if isinstance(option, dict) and isinstance(option.get("model"), str) and option["model"]
+    ]
+    return models or None
+
+
+def _mark_unapplied_native_turn_decision(
+    session_id: str,
+    conv: Conversation,
+    model: str,
+    verdict: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Downgrade a claude-native turn verdict the terminal cannot apply.
+
+    A mid-session switch on a Claude Code pane is typed as ``/model``,
+    which only takes this session's own picker vocabulary — its family
+    aliases and its one custom slot. A routed id outside that vocabulary
+    is skipped by the executor (fail open, turn runs on the current
+    model), so recording ``applied=true`` would put a model in the
+    transcript that the process never ran. The session's picker rows are
+    that vocabulary read back out, so the same translation the executor
+    will run decides the flag here, before the chip is persisted.
+
+    Unknown vocabulary (no picker rows cached yet) leaves the verdict
+    alone: the launch env is the only authority and guessing either way
+    would be its own inaccuracy.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param conv: Conversation row, read for the wrapper label.
+    :param model: The routed model id, e.g. ``"databricks-claude-opus-4-8"``.
+    :param verdict: Router verdict about to be recorded as a chip.
+    :returns: The verdict, with ``applied`` cleared and the reason noted
+        when the terminal has no spelling for ``model``.
+    """
+    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+        return verdict
+    options = _model_options_cache.get(session_id)
+    if not options:
+        return verdict
+    from omnigent.claude_model_vocabulary import (
+        claude_model_command_arg,
+        model_vocabulary_env,
+    )
+
+    env = model_vocabulary_env(options)
+    if not env or claude_model_command_arg(model, env) is not None:
+        return verdict
+    _logger.warning(
+        "smart_routing: routed model %s has no spelling the claude-native pane "
+        "for session=%s accepts (vocabulary=%s); recording the decision as not applied",
+        model,
+        session_id,
+        sorted(env.values()),
+    )
+    rationale = verdict.get("rationale")
+    note = f"Not applied: this Claude terminal cannot switch to {model}."
+    return {
+        **verdict,
+        "applied": False,
+        "rationale": f"{rationale} {note}" if isinstance(rationale, str) and rationale else note,
+    }
+
+
 def _publish_routed_model(session_id: str, model: str) -> None:
     """
     Publish a ``session.model`` SSE for a router-selected model.
@@ -3864,6 +3951,7 @@ async def _forward_event_to_runner(
                     _user_text,
                     session_id=session_id,
                     runner_client=runner_client,
+                    catalog=_native_turn_catalog(session_id, conv),
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -3934,6 +4022,12 @@ async def _forward_event_to_runner(
                 )
         if _routed_model is not None and _verdict is not None:
             _decision_scope = "child_session" if _parent_routing_on else "turn"
+            if _decision_scope == "turn":
+                # A turn switches an already-running terminal, so record
+                # what the pane can actually be switched to.
+                _verdict = _mark_unapplied_native_turn_decision(
+                    session_id, conv, _routed_model, _verdict
+                )
             # The router wins over the orchestrator's own pick; the attempt
             # is recorded so the UI can show what it overrode.
             _overridden = (
@@ -4194,6 +4288,7 @@ async def _dispatch_session_event_to_runner_impl(
                     _user_text,
                     session_id=session_id,
                     runner_client=_native_runner_client,
+                    catalog=_native_turn_catalog(session_id, conv),
                 )
                 if _native_routed_model is not None:
                     try:
@@ -4236,6 +4331,12 @@ async def _dispatch_session_event_to_runner_impl(
         # (echoed back by the CLI) before the chip.
         if _native_routed_model is not None and _native_verdict is not None:
             _native_scope = "child_session" if _native_parent_routing_on else "turn"
+            if _native_scope == "turn":
+                # The pane is already running, so the switch is a ``/model``
+                # the terminal may not accept — record what it can apply.
+                _native_verdict = _mark_unapplied_native_turn_decision(
+                    session_id, conv, _native_routed_model, _native_verdict
+                )
             _native_decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
@@ -5463,14 +5564,19 @@ async def _host_model_options(
     """Ask a host which models *harness* could launch with right now.
 
     The pre-launch preview the landing screen's model picker already reads,
-    reused as a routing candidate list. Hosts answer for the harnesses that can
-    resolve a catalog without a running CLI and reject the rest, so a failure
-    here is expected and yields no candidates.
+    reused as a routing candidate list, plus every other id the harness's
+    endpoint serves. The picker names only the newest model of each family, so
+    on its own it would drop a frozen arm the workspace still serves
+    (``claude-opus-4-8`` once ``claude-opus-5`` ships) and the router's pick
+    would substitute onto a generation nobody asked for; a launch takes an
+    exact id, so the wider set is genuinely launchable. Hosts answer for the
+    harnesses that can resolve a catalog without a running CLI and reject the
+    rest, so a failure here is expected and yields no candidates.
 
     :param host_conn: Live host connection to query.
     :param host_registry: Registry used to enqueue the outbound frame.
     :param harness: Native harness id, e.g. ``"claude-native"``.
-    :returns: Model ids the host reported, or an empty list.
+    :returns: Model ids the host reported, picker rows first, or an empty list.
     """
     from omnigent.host.frames import HostModelOptionsFrame, encode_host_frame
 
@@ -5492,14 +5598,18 @@ async def _host_model_options(
     if result.get("status") != "ok":
         return []
     options = result.get("models")
-    if not isinstance(options, list):
-        return []
     models: list[str] = []
-    for option in options:
-        # Picker rows carry the launchable id in ``model``; ``id`` is the row key.
-        raw = option.get("model") or option.get("id") if isinstance(option, dict) else None
-        if isinstance(raw, str) and raw and raw not in models:
-            models.append(raw)
+    if isinstance(options, list):
+        for option in options:
+            # Picker rows carry the launchable id in ``model``; ``id`` is the row key.
+            raw = option.get("model") or option.get("id") if isinstance(option, dict) else None
+            if isinstance(raw, str) and raw and raw not in models:
+                models.append(raw)
+    routable = result.get("routable_models")
+    if isinstance(routable, list):
+        for raw in routable:
+            if isinstance(raw, str) and raw and raw not in models:
+                models.append(raw)
     return models
 
 

@@ -968,3 +968,157 @@ async def test_unrelated_warning_codes_are_never_filtered(
     )
     assert posted.status_code in (200, 201, 202), posted.text
     assert await _snapshot_warning_codes(client, session_id) == ["some_other_condition"]
+
+
+# ── 8. Truthful record on a claude-native turn ─────────────────────
+
+
+async def _claude_native_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    *,
+    agent_name: str,
+) -> tuple[Any, SqlAlchemyConversationStore]:
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    agent = await create_test_agent(client, name=agent_name)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "labels": {"omnigent.wrapper": CLAUDE_NATIVE_CODING_AGENT.wrapper_label},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    return conv, conv_store
+
+
+async def _route_one_turn(conv: Any, conv_store: SqlAlchemyConversationStore) -> Any:
+    caps = _FakeCaps(
+        routing_client=_FakeRoutingClient(
+            RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+        )
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        async with _echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+            )
+    decisions = _routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    return decisions[0].data
+
+
+async def test_turn_decision_is_not_applied_when_the_pane_cannot_speak_the_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The pane's picker has no entry for the routed id, so the record says so."""
+    conv, conv_store = await _claude_native_session(
+        client, db_uri, agent_name="routing-honest-record"
+    )
+    # The workspace moved ``opus`` on to the next generation, so ``/model``
+    # would land on opus-5 while the record claimed opus-4-8.
+    orchestration_module._model_options_cache[conv.id] = [
+        {"id": "opus", "model": "databricks-claude-opus-5"},
+        {"id": "sonnet", "model": "databricks-claude-sonnet-5"},
+    ]
+    try:
+        data = await _route_one_turn(conv, conv_store)
+    finally:
+        orchestration_module._model_options_cache.pop(conv.id, None)
+
+    assert data.model == ROUTED_MODEL
+    assert data.applied is False
+    assert "Not applied" in data.rationale
+    assert "deep refactor" in data.rationale
+
+
+async def test_turn_decision_stays_applied_when_the_pane_can_speak_the_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The launch pinned the routed id into the custom slot, so it applies."""
+    conv, conv_store = await _claude_native_session(
+        client, db_uri, agent_name="routing-honest-record-ok"
+    )
+    orchestration_module._model_options_cache[conv.id] = [
+        {"id": "opus", "model": "databricks-claude-opus-5"},
+        {"id": "sonnet_5", "model": ROUTED_MODEL},
+    ]
+    try:
+        data = await _route_one_turn(conv, conv_store)
+    finally:
+        orchestration_module._model_options_cache.pop(conv.id, None)
+
+    assert data.model == ROUTED_MODEL
+    assert data.applied is True
+    assert data.rationale == "deep refactor"
+
+
+async def test_turn_decision_is_left_alone_with_no_known_vocabulary(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """No picker rows cached yet: the launch env is the only authority."""
+    conv, conv_store = await _claude_native_session(
+        client, db_uri, agent_name="routing-honest-record-unknown"
+    )
+    orchestration_module._model_options_cache.pop(conv.id, None)
+
+    data = await _route_one_turn(conv, conv_store)
+
+    assert data.applied is True
+
+
+async def test_turn_candidates_come_from_the_panes_own_vocabulary(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The router is only offered models the terminal can be switched onto."""
+    conv, conv_store = await _claude_native_session(
+        client, db_uri, agent_name="routing-turn-vocabulary"
+    )
+    orchestration_module._model_options_cache[conv.id] = [
+        {"id": "opus", "model": "databricks-claude-opus-5"},
+        {"id": "sonnet_5", "model": ROUTED_MODEL},
+        {"id": "haiku"},
+    ]
+    routing_client = _FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    try:
+        with patch(
+            "omnigent.runtime._globals._caps",
+            new=_FakeCaps(routing_client=routing_client),
+        ):
+            async with _echo_runner_client() as runner_client:
+                await orchestration_module._forward_event_to_runner(
+                    conv.id,
+                    conv,
+                    body,
+                    conv_store,
+                    runner_client,
+                )
+    finally:
+        orchestration_module._model_options_cache.pop(conv.id, None)
+
+    assert [sorted(offer.values()) for offer in routing_client.offered] == [
+        [["databricks-claude-opus-5", ROUTED_MODEL]]
+    ]

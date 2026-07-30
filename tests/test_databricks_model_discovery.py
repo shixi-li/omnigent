@@ -5,7 +5,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.databricks_model_discovery import discover_databricks_claude_models
+from omnigent.databricks_model_discovery import (
+    discover_databricks_claude_catalog,
+    discover_databricks_claude_models,
+)
 
 
 def test_model_services_are_paginated_filtered_and_version_sorted() -> None:
@@ -235,3 +238,84 @@ def test_both_discovery_endpoints_malformed_raises() -> None:
             "token",
             transport=httpx.MockTransport(_handler),
         )
+
+
+def test_catalog_keeps_every_servable_claude_generation() -> None:
+    """The family picks drop older generations; the catalog keeps them."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    {"name": "model-services/system.ai.claude-opus-5"},
+                    {"name": "model-services/system.ai.claude-opus-4-8"},
+                    {"name": "model-services/system.ai.claude-sonnet-5"},
+                    {"name": "model-services/system.ai.gpt-5-5"},
+                ]
+            },
+        )
+
+    catalog = discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert catalog.families == {
+        "opus": "system.ai.claude-opus-5",
+        "sonnet": "system.ai.claude-sonnet-5",
+    }
+    assert catalog.model_ids == (
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
+    )
+
+
+def test_catalog_keeps_every_generation_on_the_legacy_gateway() -> None:
+    """The gateway fallback reports its whole Claude list too."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(200, json={"model_services": []})
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "databricks-claude-opus-5"},
+                    {"id": "databricks-claude-opus-4-8"},
+                    {"id": "databricks-gpt-5-5"},
+                ]
+            },
+        )
+
+    catalog = discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert catalog.families == {"opus": "databricks-claude-opus-5"}
+    assert catalog.model_ids == (
+        "databricks-claude-opus-5",
+        "databricks-claude-opus-4-8",
+    )
+
+
+def test_catalog_is_empty_when_no_claude_models_are_served() -> None:
+    """An authoritative empty listing yields an empty catalog, not an error."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(200, json={"model_services": []})
+        return httpx.Response(200, json={"data": [{"id": "databricks-gpt-5-5"}]})
+
+    catalog = discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert catalog.families == {}
+    assert catalog.model_ids == ()

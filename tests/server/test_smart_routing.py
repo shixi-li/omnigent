@@ -452,6 +452,47 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
 
 
 @pytest.mark.asyncio
+async def test_route_turn_prefers_the_callers_session_vocabulary() -> None:
+    """A pane can only switch onto its picker rows, so those win over the gateway."""
+    expected = RoutingResult(
+        model="databricks-claude-opus-5",
+        rationale="complex task",
+        harness="self",
+    )
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "self": {
+                "source": "catalog",
+                "verified": True,
+                "models": [{"id": "databricks-claude-opus-4-8"}],
+                "note": "",
+            }
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    routing_client = _FakeRoutingClient(expected)
+
+    caps = _FakeCaps(routing_client=routing_client)
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, _v = await route_turn(
+            "claude-native",
+            "complex task",
+            session_id="conv_123",
+            runner_client=mock_client,
+            catalog=["databricks-claude-opus-5", "databricks-gpt-5-5"],
+        )
+
+    assert model == "databricks-claude-opus-5"
+    # The wider runner catalog was never consulted, and the out-of-family id
+    # in the vocabulary was still dropped.
+    mock_client.get.assert_not_called()
+    assert routing_client.offered == [{"claude-native": ["databricks-claude-opus-5"]}]
+
+
+@pytest.mark.asyncio
 async def test_route_turn_drops_out_of_family_catalog_models() -> None:
     """A native terminal's catalog can list other families; they aren't offered."""
     mock_response = MagicMock()

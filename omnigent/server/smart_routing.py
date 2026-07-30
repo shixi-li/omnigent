@@ -1429,6 +1429,7 @@ async def route_turn(
     *,
     session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
+    catalog: Sequence[str] | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via :attr:`RuntimeCaps.routing_client`.
 
@@ -1436,6 +1437,12 @@ async def route_turn(
     availability from the runner's ``/v1/sessions/{id}/models`` endpoint.
     Falls back to the static :func:`infer_models` lookup table if the runner
     is unreachable or returns no data.
+
+    :param catalog: The models this session can actually be switched onto,
+        when the caller knows them exactly - a native terminal's own picker
+        vocabulary. Authoritative: its gateway serves more models than the
+        running CLI can be switched to, and offering those routes the turn
+        onto a model the switch would silently drop.
     """
     try:
         from omnigent.runtime._globals import _caps
@@ -1457,13 +1464,17 @@ async def route_turn(
     # Key the candidate map by the session's harness id (not the catalog's
     # "self" label) so the seam can infer the right single-harness scenario.
     available: dict[str, list[str]] | None = None
-    if session_id and runner_client is not None:
-        catalog = await fetch_runner_models(session_id, runner_client)
-        if catalog and "self" in catalog:
+    if catalog:
+        in_vocabulary = models_in_family(harness, catalog)
+        if in_vocabulary:
+            available = {harness or "self": in_vocabulary}
+    if available is None and session_id and runner_client is not None:
+        runner_catalog = await fetch_runner_models(session_id, runner_client)
+        if runner_catalog and "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
             # families (its gateway serves them all); offering those would
             # route the session onto a model its harness cannot run.
-            in_family = models_in_family(harness, catalog["self"])
+            in_family = models_in_family(harness, runner_catalog["self"])
             if in_family:
                 available = {harness or "self": in_family}
     if not available:

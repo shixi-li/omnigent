@@ -5656,6 +5656,7 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native import (
         augment_claude_args,
         build_native_claude_terminal_env,
+        claude_config_with_launch_model_pinned,
         resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
@@ -5871,23 +5872,28 @@ async def _auto_create_claude_terminal(
             "and that the secret resolves in this process.",
             exc_info=True,
         )
-    if record_launch_config is not None:
-        record_launch_config(session_id, claude_config)
-    _logger.info(
-        "Claude terminal provider config resolved: session=%s configured=%s "
-        "env_keys=%s api_key_helper_set=%s model_set=%s",
-        session_id,
-        claude_config is not None,
-        sorted(claude_config.env) if claude_config is not None else [],
-        bool(claude_config.api_key_helper) if claude_config is not None else False,
-        bool(claude_config.model) if claude_config is not None else False,
-    )
-
     launch_model = resolve_claude_native_model_selection(
         session_model_override
         or _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         claude_config,
+    )
+    # Give an exact launch model (a Smart Routing pick is resolved before the
+    # terminal exists) a spelling of its own in the picker, so a later
+    # ``/model`` can return to it instead of stepping onto whatever the family
+    # alias points at. Recorded below, so the picker and the launch agree.
+    claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
+    if record_launch_config is not None:
+        record_launch_config(session_id, claude_config)
+    _logger.info(
+        "Claude terminal provider config resolved: session=%s configured=%s "
+        "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s",
+        session_id,
+        claude_config is not None,
+        sorted(claude_config.env) if claude_config is not None else [],
+        bool(claude_config.api_key_helper) if claude_config is not None else False,
+        bool(claude_config.model) if claude_config is not None else False,
+        launch_model,
     )
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,

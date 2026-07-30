@@ -476,6 +476,48 @@ async def test_pre_session_catalog_reads_the_hosts_model_options() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_session_catalog_includes_servable_models_no_row_names() -> None:
+    """The frozen arm the workspace still serves must stay routable."""
+    from omnigent.host.frames import decode_host_frame
+
+    conn = SimpleNamespace(host_id="host_1", pending_model_options={})
+
+    def send_text(host_conn: Any, frame: str) -> None:  # type: ignore[explicit-any]
+        decoded = decode_host_frame(frame)
+        future = host_conn.pending_model_options[decoded.request_id]
+        if decoded.harness != "claude-native":
+            future.set_result({"status": "failed", "error": "unsupported"})
+            return
+        future.set_result(
+            {
+                "status": "ok",
+                # The picker names the newest of each family only.
+                "models": [{"id": "opus", "model": "databricks-claude-opus-5"}],
+                "routable_models": [
+                    "databricks-claude-opus-5",
+                    "databricks-claude-opus-4-8",
+                ],
+            }
+        )
+
+    registry = SimpleNamespace(get=lambda host_id: conn, send_text=send_text)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=registry)))
+
+    catalog = await _pre_session_model_catalog(
+        cast("Any", request),
+        _host(None),
+        AUTO_NATIVE_ROUTING_HARNESSES,
+    )
+
+    assert catalog == {
+        "claude-native": [
+            "databricks-claude-opus-5",
+            "databricks-claude-opus-4-8",
+        ]
+    }
+
+
+@pytest.mark.asyncio
 async def test_pre_session_catalog_is_empty_without_a_live_host() -> None:
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(host_registry=None)))
     assert (
@@ -486,3 +528,55 @@ async def test_pre_session_catalog_is_empty_without_a_live_host() -> None:
         )
         == {}
     )
+
+
+def _native_conv(session_id: str) -> Any:  # type: ignore[explicit-any]
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    return SimpleNamespace(
+        id=session_id,
+        labels={"omnigent.wrapper": CLAUDE_NATIVE_CODING_AGENT.wrapper_label},
+    )
+
+
+def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
+    """The picker rows bound both what a turn may pick and what it may claim."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _mark_unapplied_native_turn_decision,
+        _model_options_cache,
+        _native_turn_catalog,
+    )
+
+    conv = _native_conv("conv_vocab")
+    _model_options_cache["conv_vocab"] = [
+        {"id": "opus", "model": "databricks-claude-opus-5"},
+        {"id": "sonnet_5", "model": "databricks-claude-opus-4-8"},
+    ]
+    try:
+        assert _native_turn_catalog("conv_vocab", conv) == [
+            "databricks-claude-opus-5",
+            "databricks-claude-opus-4-8",
+        ]
+        verdict = {"rationale": "deep refactor", "applied": True}
+        assert (
+            _mark_unapplied_native_turn_decision(
+                "conv_vocab", conv, "databricks-claude-opus-4-8", verdict
+            )
+            is verdict
+        )
+        downgraded = _mark_unapplied_native_turn_decision(
+            "conv_vocab", conv, "databricks-claude-sonnet-5", verdict
+        )
+        assert downgraded["applied"] is False
+        assert "Not applied" in downgraded["rationale"]
+        # The caller's verdict is never mutated in place.
+        assert verdict == {"rationale": "deep refactor", "applied": True}
+    finally:
+        _model_options_cache.pop("conv_vocab", None)
+
+    # Not a claude-native session, and a native one with no rows cached: both
+    # leave the caller's own resolution and claim untouched.
+    plain = SimpleNamespace(id="conv_plain", labels={})
+    assert _native_turn_catalog("conv_plain", plain) is None
+    assert _native_turn_catalog("conv_vocab", conv) is None
+    assert _mark_unapplied_native_turn_decision("conv_vocab", conv, "databricks-gpt-5-5", {}) == {}

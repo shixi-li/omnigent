@@ -5,6 +5,7 @@ import pytest
 from omnigent.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
+    model_vocabulary_env,
     normalized_model_id,
 )
 
@@ -24,9 +25,10 @@ _PINNED_ENV = {
         ("databricks-claude-opus-4-8", "opus"),
         ("databricks-claude-sonnet-4-6", "sonnet"),
         ("databricks-claude-haiku-4-5", "haiku"),
-        # Pinned to the custom slot, but the Agent tool enum has no slot for
-        # it — its family alias is the closest accepted value.
-        ("databricks-claude-sonnet-5", "sonnet"),
+        # Pinned to the custom slot, and the Agent tool enum has no slot for
+        # it: "sonnet" resolves to the pinned 4-6, so stepping down would run
+        # a model nobody asked for.
+        ("databricks-claude-sonnet-5", None),
         ("claude-opus-4-8[1m]", "opus"),
         ("sonnet", "sonnet"),
         ("databricks-gpt-5-5", None),
@@ -47,6 +49,65 @@ def test_unpinned_family_is_untranslatable() -> None:
     env = {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"}
     assert claude_model_alias("databricks-claude-sonnet-5", env) is None
     assert claude_model_alias("databricks-claude-opus-4-8", env) == "opus"
+
+
+def test_alias_requires_the_pin_to_match_the_routed_id() -> None:
+    env = {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"}
+    assert claude_model_alias("databricks-claude-opus-4-8", env) is None
+    assert claude_model_alias("databricks-claude-opus-5", env) == "opus"
+
+
+def test_command_arg_needs_the_exact_id_in_the_custom_slot_on_drift() -> None:
+    drifted = {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+    }
+    assert claude_model_command_arg("databricks-claude-opus-4-8", drifted) is None
+    pinned = {**drifted, "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-opus-4-8"}
+    assert (
+        claude_model_command_arg("databricks-claude-opus-4-8", pinned)
+        == "databricks-claude-opus-4-8"
+    )
+    # ``/model`` compares the custom slot byte-exactly, so the arg is the env's
+    # own spelling even when the routed id differs in prefix or case.
+    assert (
+        claude_model_command_arg("system.ai.claude-opus-4-8", pinned)
+        == "databricks-claude-opus-4-8"
+    )
+
+
+def test_model_vocabulary_env_rebuilds_the_pinning_from_picker_rows() -> None:
+    env = model_vocabulary_env(
+        [
+            {"id": "opus", "model": "databricks-claude-opus-5"},
+            {"id": "sonnet", "model": "databricks-claude-sonnet-5"},
+            {"id": "sonnet_5", "model": "databricks-claude-opus-4-8"},
+            {"id": "haiku"},
+            "not-a-row",
+        ]
+    )
+    assert env == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-opus-4-8",
+    }
+    assert claude_model_command_arg("databricks-claude-opus-4-8", env) == (
+        "databricks-claude-opus-4-8"
+    )
+    assert model_vocabulary_env([]) == {}
+
+
+def test_model_vocabulary_env_ignores_rows_that_pin_nothing() -> None:
+    """A direct Claude login's curated rows restate their own key."""
+    assert (
+        model_vocabulary_env(
+            [
+                {"id": "opus", "model": "opus", "displayName": "Opus"},
+                {"id": "sonnet_5", "model": "sonnet_5", "displayName": "Sonnet 5"},
+            ]
+        )
+        == {}
+    )
 
 
 def test_command_arg_prefers_the_custom_slot_id() -> None:

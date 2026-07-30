@@ -29,7 +29,7 @@ if sys.platform != "win32":
     import termios
     import tty
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -308,11 +308,20 @@ class ClaudeNativeUcodeConfig:
         ``apiKeyHelper`` once ``CLAUDE_CODE_USE_BEDROCK=1``).
     :param model: Optional model id from ucode state, e.g.
         ``"databricks-claude-opus-4-7"``.
+    :param routable_models: Every Claude id this endpoint serves, newest
+        first, e.g. ``("databricks-claude-opus-5",
+        "databricks-claude-opus-4-8")``. A superset of the aliases in
+        ``env``, which only pin the newest of each family: an older
+        generation is still launchable (``--model`` takes an exact id),
+        so a router may pick it. Empty when the endpoint's catalog was
+        not enumerated (cached ucode state, managed settings, a
+        non-Databricks provider).
     """
 
     env: dict[str, str]
     api_key_helper: str | None = None
     model: str | None = None
+    routable_models: tuple[str, ...] = ()
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -374,6 +383,63 @@ def resolve_claude_native_model_selection(
         if claude_config.model:
             return claude_config.model
     return "claude-sonnet-5"
+
+
+def claude_config_with_launch_model_pinned(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    launch_model: str | None,
+) -> ClaudeNativeUcodeConfig | None:
+    """Pin an exact launch model into Claude Code's custom picker slot.
+
+    The four family aliases are pinned to the NEWEST model each family
+    serves, so a session launched on an older generation of a family it
+    still serves (Smart Routing picking ``claude-opus-4-8`` while
+    ``opus`` resolves to ``claude-opus-5``) has no spelling of its own
+    model: ``/model`` would take the alias and silently move the pane to
+    the newer one. Claude Code's one extra picker slot takes an exact id,
+    so parking the launch model there gives the session a spelling for
+    the model it actually runs — and a picker row the user can return to.
+
+    :param claude_config: Resolved provider config for the terminal, or
+        ``None`` (Claude's own login pins nothing).
+    :param launch_model: The model this terminal launches with, e.g.
+        ``"databricks-claude-opus-4-8"``. Family aliases and ids already
+        covered by a pin need no slot.
+    :returns: The config to launch with — ``claude_config`` itself when
+        no slot change is needed, otherwise a copy with the custom-option
+        env set.
+    """
+    from omnigent.claude_model_vocabulary import (
+        claude_model_command_arg,
+        normalized_model_id,
+    )
+
+    if claude_config is None or not launch_model or not launch_model.strip():
+        return claude_config
+    model = launch_model.strip()
+    if model in _UCODE_CLAUDE_TIER_TO_ENV or model == _UCODE_CLAUDE_CUSTOM_TIER:
+        return claude_config
+    if claude_model_command_arg(model, claude_config.env) is not None:
+        # Already speakable: an alias pinned to exactly this id, or the
+        # custom slot already holding it.
+        return claude_config
+    normalized = normalized_model_id(model)
+    tier = next(
+        (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
+        None,
+    )
+    env = dict(claude_config.env)
+    displaced = env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+    env[_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV] = model
+    env[_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV] = (
+        _claude_model_display_name(tier, model) if tier is not None else model
+    )
+    _logger.info(
+        "native-claude: pinned launch model %s into the custom picker slot%s",
+        model,
+        f" (displacing {displaced})" if displaced else "",
+    )
+    return replace(claude_config, env=env)
 
 
 def _claude_model_display_name(tier: str, model_id: str) -> str:
@@ -1652,18 +1718,21 @@ def _ucode_config_for_profile(
         agent_state.auth_refresh_interval_ms or _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS
     )
     claude_models = dict(workspace_state.claude_models)
+    routable_models: tuple[str, ...] = ()
     if refresh_models:
         live_models: dict[str, str] | None = None
         try:
             from omnigent.databricks_model_discovery import (
-                discover_databricks_claude_models,
+                discover_databricks_claude_catalog,
             )
             from omnigent.runtime.credentials.databricks import (
                 resolve_databricks_workspace,
             )
 
             creds = resolve_databricks_workspace(profile)
-            live_models = discover_databricks_claude_models(creds.host, creds.token)
+            live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
+            live_models = live_catalog.families
+            routable_models = live_catalog.model_ids
         except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
             _logger.warning(
                 "native-claude: live Databricks model discovery failed for profile %r; "
@@ -1674,6 +1743,9 @@ def _ucode_config_for_profile(
         if live_models is not None:
             if not workspace_state.fable_enabled:
                 live_models.pop("fable", None)
+                routable_models = tuple(
+                    model_id for model_id in routable_models if "fable" not in model_id.lower()
+                )
             if not live_models:
                 raise click.ClickException(
                     f"Databricks profile {profile!r} exposes no Claude model services. "
@@ -1740,6 +1812,7 @@ def _ucode_config_for_profile(
         env=env,
         api_key_helper=agent_state.auth_command,
         model=default_model or configured_default or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        routable_models=routable_models,
     )
 
 

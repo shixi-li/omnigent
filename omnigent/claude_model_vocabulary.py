@@ -6,15 +6,22 @@ but two Claude Code surfaces accept only the family *aliases*:
 * the ``Agent`` / ``Task`` tool's ``model`` parameter — a closed enum
   (``sonnet``, ``opus``, ``haiku``, ``fable``), so a catalog id fails
   schema validation and the spawn dies before it starts;
-* the ``/model`` slash command — an alias resolves with no validation,
-  while any other value is probed/allowlist-checked and a gateway id is
-  rejected, leaving the session silently on its old model.
+* the ``/model`` slash command — an alias (or the custom slot's exact id)
+  resolves offline with no validation; ANY other value, catalog id or
+  canonical vendor id alike, is accepted only if a live one-token request
+  to the configured endpoint succeeds, so it depends on the gateway
+  answering mid-turn and fails as a network error otherwise.
 
 Claude Code resolves each alias to a concrete id via the workspace's
 ``ANTHROPIC_DEFAULT_*_MODEL`` env (set by omnigent's launch config), so
-inverting that mapping is exact; the id's own family segment is the
-fallback. Both surfaces fail OPEN on an unknown id: skip the switch
-rather than send something that is rejected or silently ignored.
+inverting that mapping is exact — and only exact: a family segment alone
+is not enough, because a workspace serving two generations of a family
+pins the alias to the newer one, and speaking the alias would run a model
+nobody routed to. Both surfaces fail OPEN on an id with no accepted
+spelling: skip the switch rather than send something the CLI drops.
+
+``--model`` at launch is a different contract: it takes any string
+verbatim, so a session STARTS on an exact id without needing a pin.
 
 Stdlib-only so hook subprocesses can import it on the spawn path.
 """
@@ -23,7 +30,8 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 #: Family aliases both surfaces accept, longest-lived family first.
 CLAUDE_MODEL_ALIASES: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
@@ -37,8 +45,9 @@ ALIAS_MODEL_ENV_VARS: dict[str, str] = {
 }
 
 #: Extra picker slot pinned to one exact id. ``/model`` accepts that id
-#: verbatim (the manual picker path relies on it), but the Agent tool's
-#: enum does not, so only the slash-command translation uses it.
+#: offline, compared BYTE-EXACTLY (case included) against this value — so
+#: translation returns the env's own spelling, never the caller's. The
+#: Agent tool's enum has no such slot, so only ``/model`` uses it.
 CUSTOM_MODEL_OPTION_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 
 #: Launch-env keys that define this session's model vocabulary.
@@ -79,17 +88,58 @@ def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:
     return pins
 
 
+def model_vocabulary_env(options: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """Rebuild a session's model vocabulary from its picker rows.
+
+    The native model picker's rows ARE the launch env's pinning read back
+    out: a row keyed by a family alias is that alias's pin, and any other
+    row occupies the single custom slot. This lets a process that never
+    saw the terminal's env (the server) ask
+    :func:`claude_model_command_arg` the same question the executor will.
+
+    Rows that only restate their own key (a direct Claude login's curated
+    ``opus`` / ``sonnet`` rows) pin nothing — Claude resolves those
+    itself — so they are skipped rather than read as a pin onto an alias.
+
+    :param options: Picker rows, e.g.
+        ``[{"id": "opus", "model": "databricks-claude-opus-5"}]``.
+    :returns: A vocabulary env mapping, e.g.
+        ``{"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"}``.
+        Empty when the rows pin no concrete model ids.
+    """
+    env: dict[str, str] = {}
+    for option in options:
+        if not isinstance(option, Mapping):
+            continue
+        row_id = option.get("id")
+        model = option.get("model")
+        if not isinstance(model, str) or not model.strip():
+            continue
+        if model.strip().lower() in CLAUDE_MODEL_ALIASES or model == row_id:
+            continue
+        key = ALIAS_MODEL_ENV_VARS.get(row_id if isinstance(row_id, str) else "")
+        if key is None:
+            key = CUSTOM_MODEL_OPTION_ENV_VAR
+        env.setdefault(key, model.strip())
+    return env
+
+
 def claude_model_alias(
     model: str,
     env: Mapping[str, str] | None = None,
 ) -> str | None:
     """Translate a servable model id into Claude's alias vocabulary.
 
-    An exact hit on the pinning is authoritative. Otherwise the id's own
-    family segment names the alias — but only when that alias is itself
-    pinned (or nothing is pinned at all, i.e. a direct Anthropic login):
-    an unpinned alias resolves to a canonical vendor id, which a gateway
-    endpoint rejects on the next request.
+    An exact hit on the pinning is authoritative. The id's own family
+    segment names the alias only when NOTHING is pinned at all (a direct
+    Anthropic login, where the alias resolves to the vendor's own model
+    of that family). Once this session pins aliases, a family segment is
+    not enough: an unpinned alias resolves to a canonical vendor id the
+    gateway rejects, and a MISMATCHED pin is worse — the alias resolves
+    to the pinned id, so the pane runs a model nobody routed to while
+    the record claims the routed one (workspace serving both
+    ``claude-opus-4-8`` and ``claude-opus-5``, ``opus`` pinned to the
+    latter, ``claude-opus-4-8`` routed).
 
     :param model: Model id from a routing decision, or an alias already.
     :param env: Environment mapping holding the alias pinning. ``None``
@@ -107,10 +157,14 @@ def claude_model_alias(
     for alias, pinned in pins.items():
         if normalized_model_id(pinned) == normalized:
             return alias
+    if pins:
+        # Every pinned alias was compared exactly above, so reaching here
+        # means the routed id is not what any alias resolves to.
+        return None
     segments = set(_SEGMENT_RE.split(normalized))
     for alias in CLAUDE_MODEL_ALIASES:
         if alias in segments:
-            return alias if not pins or alias in pins else None
+            return alias
     return None
 
 

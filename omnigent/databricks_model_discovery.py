@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -32,18 +33,37 @@ def _natural_model_key(model_id: str) -> tuple[tuple[int, str | int], ...]:
     )
 
 
+def _claude_family_of(model_id: str, *, marker: str) -> str | None:
+    """Return the Claude family *model_id* belongs to, if any."""
+    _, separator, suffix = model_id.lower().partition(marker)
+    if not separator:
+        return None
+    segments = suffix.split("-")
+    return next((family for family in CLAUDE_MODEL_FAMILIES if family in segments), None)
+
+
 def _models_by_claude_family(model_ids: list[str], *, marker: str) -> dict[str, str]:
     """Select the newest model id for every Claude family in *model_ids*."""
     result: dict[str, str] = {}
     for family in CLAUDE_MODEL_FAMILIES:
-        candidates = []
-        for model_id in model_ids:
-            _, separator, suffix = model_id.lower().partition(marker)
-            if separator and family in suffix.split("-"):
-                candidates.append(model_id)
+        candidates = [
+            model_id
+            for model_id in model_ids
+            if _claude_family_of(model_id, marker=marker) == family
+        ]
         if candidates:
             result[family] = max(candidates, key=_natural_model_key)
     return result
+
+
+def _all_claude_models(model_ids: list[str], *, marker: str) -> tuple[str, ...]:
+    """Keep every Claude-family id in *model_ids*, newest first per family."""
+    claude_ids = [
+        model_id
+        for model_id in model_ids
+        if _claude_family_of(model_id, marker=marker) is not None
+    ]
+    return tuple(sorted(claude_ids, key=_natural_model_key, reverse=True))
 
 
 def _list_model_service_ids(
@@ -125,6 +145,82 @@ def _list_anthropic_gateway_ids(
         and model_id
         and not model_id.endswith("-anthropic")
     ]
+
+
+@dataclass(frozen=True)
+class DatabricksClaudeCatalog:
+    """Every Claude endpoint a workspace serves, plus the family picks.
+
+    :param families: Family alias → newest routable id, e.g.
+        ``{"opus": "system.ai.claude-opus-5"}``. What the launch env pins
+        each Claude Code alias to.
+    :param model_ids: Every Claude-family id the workspace serves, newest
+        first, e.g. ``("system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8")``. A superset of ``families``: an
+        older generation is still servable and still routable, it just
+        does not own an alias.
+    """
+
+    families: dict[str, str]
+    model_ids: tuple[str, ...]
+
+
+def discover_databricks_claude_catalog(
+    workspace_url: str,
+    token: str,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> DatabricksClaudeCatalog:
+    """Discover every Claude endpoint a Databricks workspace serves.
+
+    Same sources and precedence as
+    :func:`discover_databricks_claude_models`, which is this function's
+    family half.
+
+    :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
+    :param token: Workspace bearer token.
+    :param transport: Optional HTTP transport used by tests.
+    :returns: The workspace's Claude catalog. Empty ``families`` with
+        empty ``model_ids`` is authoritative (see
+        :func:`discover_databricks_claude_models`).
+    :raises httpx.HTTPError: Same contract as the family lookup.
+    :raises ValueError: Same contract as the family lookup.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    primary_error: Exception | None = None
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        try:
+            model_service_ids = _list_model_service_ids(client, workspace_url, headers)
+        except (httpx.HTTPError, ValueError) as exc:
+            primary_error = exc
+        else:
+            models = _models_by_claude_family(model_service_ids, marker="claude-")
+            if models:
+                return DatabricksClaudeCatalog(
+                    families=models,
+                    model_ids=_all_claude_models(model_service_ids, marker="claude-"),
+                )
+
+        try:
+            gateway_ids = _list_anthropic_gateway_ids(client, workspace_url, headers)
+        except (httpx.HTTPError, ValueError) as exc:
+            if primary_error is not None:
+                raise exc from primary_error
+            # A successful permission-aware UC listing is authoritative even
+            # when the compatibility endpoint is not enabled.
+            return DatabricksClaudeCatalog(families={}, model_ids=())
+    gateway_models = _models_by_claude_family(gateway_ids, marker="databricks-claude-")
+    if not gateway_models and primary_error is not None:
+        # The gateway answered but routes no Claude models, and the primary
+        # listing failed — an empty result here is NOT authoritative (e.g. a
+        # transient UC 503 plus an unused legacy gateway). Surface the primary
+        # failure so callers fall back to cached models instead of treating
+        # the workspace as having none.
+        raise primary_error
+    return DatabricksClaudeCatalog(
+        families=gateway_models,
+        model_ids=_all_claude_models(gateway_ids, marker="databricks-claude-"),
+    )
 
 
 def discover_databricks_claude_models(

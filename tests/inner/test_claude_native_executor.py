@@ -993,6 +993,56 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_skips_switch_when_the_family_pin_drifted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A mismatched family pin must not be spoken as its alias.
+
+    The workspace serves two opus generations and ``opus`` is pinned to the
+    newer one, so ``/model opus`` would move the pane off the routed model
+    while the transcript claimed it ran.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_slash_command",
+        lambda bridge_dir_arg, *, command, timeout_s=30.0, auto_confirm=False: slash_calls.append(
+            command
+        ),
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda bridge_dir_arg, *, content, timeout_s=30.0: msg_calls.append(content),
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-opus-4-8"),
+        )
+    ]
+
+    assert slash_calls == []
+    assert msg_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_without_model_override_injects_message_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
