@@ -1214,6 +1214,15 @@ class ExternalRoutingClient:
 # them. claude-sdk owns Claude models; pi is the last-resort multi-model home.
 _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "codex", "pi")
 
+# Native terminal harnesses offered when Smart Routing is picked as a top-level
+# harness (no bundle agent). Both families are on the menu, so the seam builds
+# the router's "both" scenario and the pick maps onto the matching native
+# wrapper agent (claude-native-ui / codex-native-ui). Native candidates come
+# from the static ``infer_models`` table — the live runner catalog only knows
+# the in-process SDK workers — and are intersected with the host's installed
+# CLIs by the caller, since a missing binary cannot launch a terminal.
+AUTO_NATIVE_ROUTING_HARNESSES: tuple[str, ...] = ("claude-native", "codex-native")
+
 # The live runner catalog (fetch_runner_models) keys rows by WORKER name — the
 # sub-agent names declared in the parent spec (e.g. "claude_code") plus "self"
 # for the session's own harness — NOT by harness id. Map the common worker
@@ -1235,6 +1244,7 @@ async def route_session_harness(
     catalog_session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
     allowed_family: str | None = None,
+    harness_candidates: Sequence[str] | None = None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -1257,6 +1267,11 @@ async def route_session_harness(
         (:func:`omnigent.runner.subagent_routing.harness_family`), e.g.
         ``"gpt"`` for a child of a codex session. ``None`` offers every
         auto-routing harness — only sessions in auto-harness mode.
+    :param harness_candidates: Replace the default SDK candidate set with an
+        explicit one, e.g. :data:`AUTO_NATIVE_ROUTING_HARNESSES` for a session
+        that must land on a native terminal. Callers narrow it to what the host
+        can actually run; an empty sequence yields the standard "no routable
+        harnesses" error. ``None`` uses :data:`_AUTO_ROUTING_HARNESSES`.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -1292,7 +1307,9 @@ async def route_session_harness(
     # router can pick the model but never the family.
     candidate_harnesses = tuple(
         h
-        for h in _AUTO_ROUTING_HARNESSES
+        for h in (
+            _AUTO_ROUTING_HARNESSES if harness_candidates is None else tuple(harness_candidates)
+        )
         if allowed_family is None or _HARNESS_FAMILY.get(h) == allowed_family
     )
     harness_models: dict[str, list[str]] = {}

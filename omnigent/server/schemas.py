@@ -1350,6 +1350,15 @@ class SessionCreateRequest(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param smart_routing_message: The user's first-message text, used to
+        route the harness at create time. Only read on the top-level
+        Smart Routing path (``harness_override: "auto"`` on a native
+        wrapper agent), where the terminal launches as soon as the
+        session row exists and so the harness must be decided before it.
+        Routing-only: not persisted or dispatched — the client sends the
+        real message after the create returns. ``None`` everywhere else,
+        including the bundle-agent auto path, which routes on the first
+        message event instead.
     """
 
     agent_id: str
@@ -1368,6 +1377,7 @@ class SessionCreateRequest(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    smart_routing_message: str | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> SessionCreateRequest:
